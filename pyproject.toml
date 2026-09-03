@@ -1,0 +1,28 @@
+[project]
+name = "ska-low-station-beam-simulator"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "astropy>=6.1.7",
+    "numba>=0.67.0",
+    "scipy>=1.15.3",
+    "ska-tango-base>=1.7.0",
+    "spead2>=4.4.1",
+]
+
+[[tool.uv.index]]
+name = "skao"
+url = "https://artefact.skao.int/repository/pypi-internal/simple"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "jupyter>=1.1.1",
+    "matplotlib>=3.10.9",
+    "ruff>=0.16.5",
+]

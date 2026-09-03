@@ -1,0 +1,13 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Session/machine-local Claude Code notes — see CLAUDE.md's Setup section
+CLAUDE.local.md
