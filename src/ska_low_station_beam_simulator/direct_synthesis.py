@@ -190,6 +190,25 @@ def synth_noise_all_channels(seed, std, sample_index_start, num_channels, n_samp
     return out_real + 1j * out_imag
 
 
+@njit(parallel=True, cache=True)
+def synth_noise_all_channels_into(out, seed, std, sample_index_start, num_channels, n_samples):
+    """Same statistics as synth_noise_all_channels, but WRITES directly
+    into a caller-provided (n_samples, num_channels) complex128 buffer
+    instead of allocating (and returning) fresh out_real/out_imag/complex
+    arrays. DirectSynthesisStreamer reuses one persistent buffer per pol
+    across ticks specifically to avoid this allocation: it turned out to
+    be the dominant per-tick cost at high channel counts, not the
+    Box-Muller math itself -- see CLAUDE.md's Benchmarking section. Writes
+    (not +=) every cell, so the caller does not need to zero the buffer
+    first as long as noise is always generated before tone is added on
+    top of it."""
+    for i in prange(n_samples):
+        for ch in range(num_channels):
+            flat_index = (sample_index_start + i) * num_channels + ch
+            g_real, g_imag = _gaussian_pair(seed, flat_index)
+            out[i, ch] = (g_real * std) + 1j * (g_imag * std)
+
+
 # ============================================================
 # DIRECT SYNTHESIS STREAMER
 #
@@ -249,6 +268,23 @@ class DirectSynthesisStreamer:
         self._current_poly: Optional[DelayPolynomial] = None
         self._delay_coeffs: Optional[np.ndarray] = None
 
+        # Reused across ticks (per pol) so generate_next_tick doesn't
+        # allocate a fresh (n_samples, num_channels) complex128 array every
+        # tick -- that allocation, not the noise math, turned out to be the
+        # dominant per-tick cost at high channel counts. Safe to mutate
+        # in place: ScanRunner._run calls generate_next_tick synchronously
+        # and HeapAccumulator.add copies the data out (np.concatenate)
+        # before the next tick can run -- nothing downstream ever holds a
+        # reference to this buffer across ticks.
+        self._out_bufs: dict[str, np.ndarray] = {}
+
+    def _get_output_buffer(self, pol: str, n_samples: int) -> np.ndarray:
+        buf = self._out_bufs.get(pol)
+        if buf is None or buf.shape != (n_samples, self.num_channels):
+            buf = np.empty((n_samples, self.num_channels), dtype=np.complex128)
+            self._out_bufs[pol] = buf
+        return buf
+
     @property
     def channel_id_map(self) -> np.ndarray:
         return np.arange(self.num_channels)
@@ -289,7 +325,29 @@ class DirectSynthesisStreamer:
             ("V", False, self._noise_seed_v),
             ("H", True, self._noise_seed_h),
         ):
-            out = np.zeros((n_samples, self.num_channels), dtype=np.complex128)
+            out = self._get_output_buffer(pol, n_samples)
+
+            # Noise first, written (not accumulated) so it covers every
+            # cell -- that's what lets tone below skip zeroing the buffer.
+            if self._noise_cfg is not None:
+                # Pure function of t, not an internal running counter — same
+                # determinism/seekability property the rest of this codebase's
+                # design relies on (see CLAUDE.md's sim_time discussion): any
+                # pod can compute this tick's noise from t alone.
+                sample_index_start = int(
+                    round(t_local_rel_start * self.channel_output_rate)
+                )
+                synth_noise_all_channels_into(
+                    out,
+                    noise_seed,
+                    self._noise_std,
+                    sample_index_start,
+                    self.num_channels,
+                    n_samples,
+                )
+            else:
+                out.fill(0)
+
             for cfg in self._tone_cfgs:
                 ch_idx, samples = synth_tone_channel(
                     cfg["freq_hz"],
@@ -314,22 +372,6 @@ class DirectSynthesisStreamer:
                     )
                     continue
                 out[:, ch_idx] += samples
-
-            if self._noise_cfg is not None:
-                # Pure function of t, not an internal running counter — same
-                # determinism/seekability property the rest of this codebase's
-                # design relies on (see CLAUDE.md's sim_time discussion): any
-                # pod can compute this tick's noise from t alone.
-                sample_index_start = int(
-                    round(t_local_rel_start * self.channel_output_rate)
-                )
-                out += synth_noise_all_channels(
-                    noise_seed,
-                    self._noise_std,
-                    sample_index_start,
-                    self.num_channels,
-                    n_samples,
-                )
 
             results[pol] = out
 
@@ -422,6 +464,16 @@ if __name__ == "__main__":
     n2 = synth_noise_all_channels(7, 1.0, 1000, 96, 500)
     assert np.array_equal(n1, n2)
     print("noise determinism/seekability: OK")
+
+    # in-place kernel (DirectSynthesisStreamer's hot path) must match the
+    # allocating kernel exactly, same seed/index -- guards against the two
+    # copies of this logic drifting apart. Pre-fill the buffer with garbage
+    # first, since the whole point is that it WRITES every cell rather
+    # than accumulating onto whatever was there.
+    into_buf = np.full((500, 96), 999.0 + 999.0j, dtype=np.complex128)
+    synth_noise_all_channels_into(into_buf, 7, 1.0, 1000, 96, 500)
+    assert np.array_equal(n1, into_buf)
+    print("noise in-place kernel matches allocating kernel: OK")
 
     print("\nAll correctness checks passed.\n")
 

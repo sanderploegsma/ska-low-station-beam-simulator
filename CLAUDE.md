@@ -218,6 +218,21 @@ assumes.
     `wideband_streamer.py` imports `scipy.fft` — the module couldn't even
     be imported. Fixed via `uv add scipy`; if you hit `ModuleNotFoundError:
     scipy` on a fresh checkout, run `uv sync`.
+14. **`DirectSynthesisStreamer.generate_next_tick` allocated a fresh
+    14.7MB complex128 array (`np.zeros`) plus another fresh array from
+    `synth_noise_all_channels` plus a separate full-array `+=`, twice per
+    tick (once per pol)** — this allocation/copy churn, not Box-Muller
+    math, was the dominant per-tick cost at high channel counts (~30ms of
+    a ~33ms tick at 448 channels). Misdiagnosed at first as a
+    compute/thread-dispatch problem — see "Target server results" below
+    for the full investigation trail. **Fixed**: `synth_noise_all_channels_into`
+    writes noise directly into a persistent, reused per-pol buffer
+    (`DirectSynthesisStreamer._get_output_buffer`); tone then adds on top.
+    Verified bit-identical to the old path for the same seed/index. Safe
+    to mutate in place because `ScanRunner._run` calls `generate_next_tick`
+    synchronously and `HeapAccumulator.add` copies the data out
+    (`np.concatenate`) before the next tick runs — nothing downstream
+    holds a reference across ticks.
 
 ## Benchmarking
 
@@ -260,6 +275,87 @@ Consistent with this path's earlier EPYC results below; not worth
 re-benchmarking at 448 channels given its known worse-than-linear
 scaling and its now-secondary (pulsed-fallback-only) role.
 
+### Target server results — 2-socket AMD EPYC 9254 (this session)
+
+The SSH move happened; this is real target-class K8s node hardware (2×
+EPYC 9254, 48c/96t total, 2 NUMA nodes of 48 logical CPUs each) — not the
+10-core laptop above. Ad hoc sweep script (channel count × thread count ×
+NUMA pinning, 3 repeats/config, 15s clock-ramp burn-in before each sweep —
+this machine idles at 1.5GHz and needs sustained load before schedutil
+ramps to boost clocks, which otherwise confounds thread-count comparisons)
+in scratchpad, not committed; raw CSVs + the sweep script itself were not
+kept in the repo — re-run if this needs reproducing. Interactive charts:
+https://claude.ai/code/artifact/e6212f17-5d39-48e0-9efb-79ff13264959
+
+**Initial diagnosis (WRONG — see fix below, kept for the record since the
+investigation trail matters):** first pass found 448 channels still not
+viable (best ≈33.0ms/tick, NUMA-pinned, 32 threads — ~12.6x over budget,
+worse relatively than the laptop's ~2x despite ~10x more logical CPUs),
+throughput saturating at ~24-32 threads and regressing beyond that, and
+concluded the bottleneck was Box-Muller's per-sample log/sqrt/sin/cos
+(`numba.config.USING_SVML` is `False` on AMD, so no vectorized-libm
+speedup) combined with numba parallel-dispatch fork-join overhead.
+
+**Actual root cause (found by isolating raw kernel cost from the full
+`generate_next_tick` call and finding a ~14ms unexplained gap): pure
+memory-allocation overhead, not compute.** `generate_next_tick` allocated
+a fresh 14.7MB `np.zeros((n_samples, num_channels), complex128)` array
+AND took a fresh array back from `synth_noise_all_channels` (itself
+allocating `out_real`, `out_imag`, then concatenating to complex) AND did
+a separate full-array `+=` — all of that twice per tick, once per
+polarization, none of it Box-Muller math. **Fixed**: added
+`synth_noise_all_channels_into` (writes directly into a caller-provided
+buffer, no allocation) and gave `DirectSynthesisStreamer` a persistent
+per-pol output buffer reused across ticks (`_get_output_buffer`); noise
+now writes first (covering every cell, so no zero-fill needed) and tone
+adds on top. Verified bit-identical to the old allocating path for the
+same seed/index (see the `__main__` correctness check added alongside
+this fix). **Confirmed safe to mutate in place**: `ScanRunner._run` calls
+`generate_next_tick` synchronously and `HeapAccumulator.add` immediately
+copies the data out via `np.concatenate` before the next tick can run —
+nothing downstream ever holds a reference to the buffer across ticks.
+
+**Result: 448 channels (350MHz, full band) is now comfortably viable.**
+Re-swept end-to-end after the fix:
+
+| channels | best (single NUMA node, 48 threads) | best (unpinned, 96 threads) |
+|---|---|---|
+| 96 | 0.54ms (20%) | 0.45ms (17%) |
+| 160 | 0.75ms (29%) | 0.65ms (25%) |
+| 224 | 0.97ms (37%) | 0.72ms (27%) |
+| 288 | 1.19ms (45%) | 0.78ms (30%) |
+| 352 | 1.42ms (54%) | 0.89ms (34%) |
+| 416 | 1.69ms (65%) | 1.04ms (40%) |
+| 448 | **1.84ms (70%)** | **1.10ms (42%)** |
+
+(% is of the 2.621ms budget.) Every channel count now clears the 80%
+comfort bar with just one socket's worth of threads (48) — down from
+33.0ms/1260% before the fix. Unpinned with all 96 threads is faster in
+isolation, but that hands a whole physical node to one station pod;
+NUMA-pinning to one node (48 threads) is the better default since it
+leaves the other socket free for a second station pod. This flips the
+earlier "more threads stop helping past 24-32" finding, too: with the
+allocation overhead gone, more threads help monotonically again (up to
+96), because the per-dispatch work is now large enough relative to
+fork-join overhead to actually benefit from more parallelism.
+
+**Lesson for future benchmarking here**: always isolate a suspiciously
+expensive method into its component kernel calls vs. its full
+Python-level body before trusting a "this kernel is the bottleneck"
+conclusion drawn only from thread-count/channel-count sweeps — the sweep
+methodology in this session was rigorous (burn-in, repeats, NUMA control)
+and still pointed at the wrong root cause, because it only ever measured
+the whole method, never separated allocation from compute.
+
+**Operational implication for the K8s deployment**: since the fix,
+throughput scales positively all the way to 96 threads — the earlier
+"give each pod ~24-32 threads" advice no longer holds. Give each station
+pod one NUMA node's worth of threads (48, pinned via `numactl
+--cpunodebind=N --membind=N` or Kubernetes' NUMA-aware Topology Manager)
+for a comfortable 70%-of-budget margin at full 448-channel band, fitting
+2 station pods per 96-thread physical node — a large improvement over the
+pre-fix outlook where 448 channels wasn't viable on any tested config.
+
 ### Historical hardware notes (legacy wideband path only, from earlier sessions)
 
 - **Apple M5** (4P+6E cores): `ThreadPoolExecutor` threading plateaus at
@@ -301,25 +397,35 @@ bug; backed-up queue/dropped heaps → simulator artifact.
 
 ## Immediate next steps, in priority order
 
-1. **Benchmark `DirectSynthesisStreamer` on real target server hardware**
-   (the point of this SSH session) — confirm whether more cores close the
-   96-channel comfort margin further and, more importantly, whether they
-   close the 448-channel gap (currently ~2x over budget on a 10-core
-   laptop). Use `benchmark_direct_synthesis.py` as-is; consider NUMA
-   pinning per the historical note above if the server is multi-socket.
-2. If 448 channels is still over budget on real hardware: optimize the
-   noise kernel specifically (it's now the dominant cost at scale) —
-   candidates include a cheaper RNG than Box-Muller, or restructuring to
-   avoid recomputing `_splitmix64_hash` twice per complex sample.
-3. **Verify `channel_info`/`antenna_info` bit-packing against the real
+1. ~~Benchmark `DirectSynthesisStreamer` on real target server hardware~~
+   **Done this session** on a 2-socket AMD EPYC 9254 — see "Target server
+   results" above.
+2. ~~Optimize the noise kernel~~ **Done this session, but not the way this
+   item originally predicted.** The dominant cost turned out to be
+   per-tick array allocation (bug #14), not Box-Muller math — fixing the
+   allocation (persistent reused buffer, `synth_noise_all_channels_into`)
+   made 448 channels viable (1.84ms/70% of budget, one NUMA node, 48
+   threads) without touching the RNG at all. The Ziggurat/cheaper-RNG
+   idea is no longer necessary; leave it as a future lever only if a
+   future channel-count increase reopens the budget gap.
+3. **Re-benchmark end-to-end under real Kubernetes pod co-scheduling**,
+   not just one workload at a time on a bare node — this session's
+   post-fix numbers (2 pods/node comfortably, or 1 pod/node unpinned
+   using all 96 threads for even more margin) assumed no other pod
+   contending for the same physical cores/memory bandwidth. Confirm this
+   holds when multiple station pods actually run concurrently on one
+   node, since noise generation is now memory-bandwidth-bound rather than
+   allocation-bound, and bandwidth is a shared resource across pods on
+   the same socket.
+4. **Verify `channel_info`/`antenna_info` bit-packing against the real
    ICD document** (not the screenshot) — see the ICD section above, this
    is the single highest-priority correctness gap regardless of
    benchmarking outcomes.
-4. Build the observability/telemetry addition described above.
-5. Derive (or explicitly decide to defer further) a direct per-channel
+5. Build the observability/telemetry addition described above.
+6. Derive (or explicitly decide to defer further) a direct per-channel
    representation for pulsed sources, to let `wideband_streamer.py` be
    deleted entirely.
-6. Confirm the exact CSP LMC command for pushing a delay model without
+7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
 
 ## Setup
