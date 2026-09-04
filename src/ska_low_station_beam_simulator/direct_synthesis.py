@@ -47,7 +47,7 @@ the tone's frequency residual relative to that channel's center. Cost is
 O(1) per tone — INDEPENDENT of total channel count. Delay is a
 CONTINUOUS PHASE TERM applied directly in the exponent — no ring buffer,
 no coarse/fine integer-sample split. This is EXACT for a truly
-monochromatic tone (verified in __main__ to ~1e-9), not an approximation.
+monochromatic tone (verified in tests/test_direct_synthesis.py to ~1e-9), not an approximation.
 
 ============================================================
 NOISE — pre-generated tile bank (adopted from tiled_noise_streamer.py)
@@ -195,10 +195,10 @@ from ska_low_station_beam_simulator.common import (
     BASE_FREQ_HZ,
     BLOCK_DURATION_S,
     CHANNEL_WIDTH_HZ,
+    DelayFeed,
     DelayPolynomial,
     NUM_CHANNELS,
     StationConfig,
-    fetch_delay_model_from_cbf,
     log,
 )
 
@@ -209,7 +209,7 @@ DEFAULT_N_TILES = 256
 
 # Dispersion constant D (Lorimer & Kramer 2004/2006, eq. 5.1/5.21):
 #   t_DM[s] = D * DM[pc cm^-3] / f[MHz]^2
-# Cross-validated in __main__ against PsrSigSim's DM_K = 1/2.41e-4 = 4149.38
+# Cross-validated in tests/test_direct_synthesis.py against PsrSigSim's DM_K = 1/2.41e-4 = 4149.38
 # (same standard constant, matches to within literature-typical precision).
 DISPERSION_CONST_S_MHZ2_PER_DM = 4148.808
 
@@ -455,7 +455,7 @@ def build_pulsar_template(
     Returns (template, n_period_samples): template is
     (num_channels, n_period_samples) complex128, in this project's
     EXTERNAL ascending-channel-id order -- verified against a known-tone
-    injection check in __main__, not assumed from reading the FFT-bin
+    injection check in tests/test_direct_synthesis.py, not assumed from reading the FFT-bin
     permutation logic.
     """
     wideband_rate = num_channels * channel_width_hz
@@ -564,6 +564,18 @@ class DirectSynthesisStreamer:
                     f"DirectSynthesisStreamer only supports kind in "
                     f"('tone', 'pulsed') in source_cfgs; got kind={cfg['kind']!r}."
                 )
+            if not isinstance(cfg.get("delay_feed"), DelayFeed):
+                raise ValueError(
+                    f"source_cfg kind={cfg['kind']!r} is missing a required "
+                    f"'delay_feed' (a common.DelayFeed instance). There is no "
+                    f"default/fallback delay for a source — a source with no "
+                    f"real delay path would silently produce content that's "
+                    f"trivially 'perfectly aligned', which could mask a real "
+                    f"CBF delay-tracking bug instead of exercising it. Attach "
+                    f"a DelayFeed to this source_cfg (e.g. via "
+                    f"simulator.py's Tango attribute subscription, or "
+                    f"directly in a test)."
+                )
 
         self._pulsed_cfgs = [c for c in source_cfgs if c["kind"] == "pulsed"]
         if self._pulsed_cfgs and base_freq_hz <= 0:
@@ -584,15 +596,22 @@ class DirectSynthesisStreamer:
         self.channel_output_rate = channel_width_hz
 
         self._obs_time_ref = obs_time_ref
-        self._tone_cfgs = [c for c in source_cfgs if c["kind"] == "tone"]
+
+        # Each tone/pulsar carries its OWN delay feed (validated required,
+        # above) — two sources at different sky directions genuinely have
+        # different geometric delay. Each source also gets its own (poly
+        # identity -> coeffs ndarray) cache so the coefficients array is
+        # only rebuilt when that source's poly actually changes, not every
+        # tick (see bug #13 in CLAUDE.md — per-tick allocation churn, not
+        # compute, was the historical bottleneck here).
+        self._tone_cfgs = [
+            (c, c["delay_feed"], {}) for c in source_cfgs if c["kind"] == "tone"
+        ]
 
         self._noise_cfg = noise_cfg
         self._noise_seed_v = noise_cfg["seed"] if noise_cfg else 0
         self._noise_seed_h = (noise_cfg["seed"] + 1_000_003) if noise_cfg else 0
         self._noise_std = noise_cfg["std"] if noise_cfg else 0.0
-
-        self._current_poly: Optional[DelayPolynomial] = None
-        self._delay_coeffs: Optional[np.ndarray] = None
 
         # --- noise tile bank (see module docstring for the tradeoff) ---
         self.n_tiles = n_tiles
@@ -634,7 +653,7 @@ class DirectSynthesisStreamer:
                 cfg["dm_pc_cm3"],
                 cfg.get("sky_seed", DEFAULT_SKY_SEED),
             )
-            self._pulsars.append((template, cfg["period_s"], n_period_samples))
+            self._pulsars.append((template, cfg["period_s"], n_period_samples, cfg["delay_feed"], {}))
 
         # Reused across ticks (per pol) so generate_next_tick doesn't
         # allocate a fresh (n_samples, num_channels) complex128 array
@@ -665,30 +684,30 @@ class DirectSynthesisStreamer:
             return 0
         return bank_memory_bytes(self.n_tiles, self.tile_n_samples, self.num_channels, len(self._banks))
 
-    def _refresh_delay_poly_if_needed(self, t: float):
-        if self._current_poly is None or t >= self._current_poly.valid_until:
-            self._current_poly = fetch_delay_model_from_cbf(self.station.station_id, t)
-            # Cache as a float64 array once per poly refresh, not once per
-            # tick — the poly only changes when its validity window expires.
-            self._delay_coeffs = np.asarray(
-                self._current_poly.xypol_coeffs_ns, dtype=np.float64
-            )
+    @staticmethod
+    def _coeffs_for(cache: dict, poly: DelayPolynomial) -> np.ndarray:
+        """Returns poly's coefficients as a float64 array, only rebuilding
+        it when `poly` (identity, not equality) actually changed since the
+        last call — same per-source cache backing every tone/pulsar entry,
+        so a source whose feed keeps returning the same poly object tick
+        after tick (the common case) pays no per-tick allocation for this."""
+        if cache.get("poly") is not poly:
+            cache["poly"] = poly
+            cache["coeffs"] = np.asarray(poly.xypol_coeffs_ns, dtype=np.float64)
+        return cache["coeffs"]
 
     def generate_next_tick(self, t: float, n_samples: int) -> dict[str, np.ndarray]:
         """n_samples is PER-CHANNEL time samples for this tick (at
         channel_output_rate). See common.ScanRunner, which sizes this via
         tick_n_samples() so it lines up with HeapAccumulator's HEAP_LEN
         framing exactly."""
-        self._refresh_delay_poly_if_needed(t)
-        poly = self._current_poly
-
-        # Both t_local_rel_start (local clock for noise/tone/pulsar) and
-        # poly_t_rel_start (the delay poly's own validity-relative clock)
-        # must stay small-magnitude — same precision requirement as
-        # everywhere else in this codebase (see common.DelayPolynomial's
-        # docstring for why raw epoch-scale time breaks this).
+        # t_local_rel_start (local clock for noise/tone/pulsar) must stay
+        # small-magnitude — same precision requirement as everywhere else
+        # in this codebase (see common.DelayPolynomial's docstring for why
+        # raw epoch-scale time breaks this). Each source's own
+        # poly_t_rel_start (relative to THAT source's own poly validity
+        # window) is computed per-source below, once its feed is queried.
         t_local_rel_start = t - self._obs_time_ref
-        poly_t_rel_start = t - poly.start_validity_sec
 
         results: dict[str, np.ndarray] = {}
         for pol, is_h_pol, noise_seed in (
@@ -713,23 +732,31 @@ class DirectSynthesisStreamer:
             else:
                 out.fill(0)
 
-            for template, period_s, n_period_samples in self._pulsars:
+            for template, period_s, n_period_samples, delay_feed, coeffs_cache in self._pulsars:
+                poly = delay_feed.get(t)
+                delay_coeffs = self._coeffs_for(coeffs_cache, poly)
+                poly_t_rel_start = t - poly.start_validity_sec
+
                 phase_in_period = t_local_rel_start % period_s
                 start_idx = int(round(phase_in_period * self.channel_output_rate)) % n_period_samples
                 add_pulsar_tick(
                     out, template, start_idx, n_period_samples,
-                    self._delay_coeffs, poly_t_rel_start, poly.ypol_offset_ns, is_h_pol,
+                    delay_coeffs, poly_t_rel_start, poly.ypol_offset_ns, is_h_pol,
                     self.base_freq_hz, self.channel_width_hz, self.channel_output_rate,
                     n_samples, self.num_channels,
                 )
 
-            for cfg in self._tone_cfgs:
+            for cfg, delay_feed, coeffs_cache in self._tone_cfgs:
+                poly = delay_feed.get(t)
+                delay_coeffs = self._coeffs_for(coeffs_cache, poly)
+                poly_t_rel_start = t - poly.start_validity_sec
+
                 ch_idx, samples = synth_tone_channel(
                     cfg["freq_hz"],
                     cfg.get("amplitude", 1.0),
                     self.base_freq_hz,
                     self.channel_width_hz,
-                    self._delay_coeffs,
+                    delay_coeffs,
                     poly_t_rel_start,
                     poly.ypol_offset_ns,
                     is_h_pol,
@@ -751,199 +778,3 @@ class DirectSynthesisStreamer:
             results[pol] = out
 
         return results
-
-
-if __name__ == "__main__":
-    # ============================================================
-    # CORRECTNESS CHECKS — covers tone, noise (kernel + tile bank), and
-    # pulsar (dispersion + coherence), merged from the three modules this
-    # one converges.
-    # ============================================================
-
-    def _fake_fetch(station_id, at_time):
-        return DelayPolynomial(
-            station_id=station_id,
-            start_validity_sec=at_time,
-            validity_period_sec=600.0,
-            xypol_coeffs_ns=[750.0, 0.0046, 0.0, 0.0, 0.0, 0.0],
-            ypol_offset_ns=2.0,
-        )
-
-    globals()["fetch_delay_model_from_cbf"] = _fake_fetch
-
-    SAMPLE_RATE_PER_CHANNEL = CHANNEL_WIDTH_HZ  # critically sampled
-
-    # ---------------- TONE ----------------
-    test_freq = 42 * CHANNEL_WIDTH_HZ + 150_000.0  # off-center within channel 42
-    zero_coeffs = np.array([0.0], dtype=np.float64)
-    ch_idx, samples = synth_tone_channel(
-        test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, zero_coeffs,
-        0.0, 0.0, False, 0.0, SAMPLE_RATE_PER_CHANNEL, 2048,
-    )
-    assert ch_idx == 42, f"expected channel 42, got {ch_idx}"
-    print(f"tone channel placement: OK (channel {ch_idx})")
-
-    residual = test_freq - (BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ)
-    t = np.arange(2048) / SAMPLE_RATE_PER_CHANNEL
-    expected = np.exp(1j * 2 * np.pi * residual * t)
-    err = np.max(np.abs(samples - expected))
-    print(f"tone residual-frequency phase error (zero delay): {err:.3e} (expect ~0)")
-    assert err < 1e-9
-    print("tone zero-delay accuracy: OK")
-
-    known_tau_ns = 750.0
-    coeffs = np.array([known_tau_ns], dtype=np.float64)
-    _, samples_delayed = synth_tone_channel(
-        test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, coeffs,
-        0.0, 0.0, False, 0.0, SAMPLE_RATE_PER_CHANNEL, 2048,
-    )
-    expected_delayed = expected * np.exp(-1j * 2 * np.pi * test_freq * known_tau_ns * 1e-9)
-    err2 = np.max(np.abs(samples_delayed - expected_delayed))
-    print(f"tone known-delay phase error: {err2:.3e} (expect ~0)")
-    assert err2 < 1e-9
-    print("tone delay-as-phase accuracy: OK (no ring buffer needed, confirmed)")
-
-    # ---------------- NOISE KERNEL ----------------
-    noise = synth_noise_all_channels(seed=7, std=1.0, sample_index_start=0, num_channels=96, n_samples=200_000)
-    print(f"noise mean: {np.mean(noise):.4f} (expect ~0)")
-    print(f"noise std (real, channel 0): {np.std(noise[:, 0].real):.4f} (expect ~1.0)")
-    assert abs(np.mean(noise)) < 0.01
-    assert abs(np.std(noise[:, 0].real) - 1.0) < 0.01
-    corr = np.corrcoef(noise[:, 0].real, noise[:, 1].real)[0, 1]
-    print(f"cross-channel correlation (ch0 vs ch1 real): {corr:.4f} (expect ~0)")
-    assert abs(corr) < 0.02
-    print("noise statistics + independence: OK")
-
-    n1 = synth_noise_all_channels(7, 1.0, 1000, 96, 500)
-    n2 = synth_noise_all_channels(7, 1.0, 1000, 96, 500)
-    assert np.array_equal(n1, n2)
-    print("noise determinism/seekability: OK")
-
-    into_buf = np.full((500, 96), 999.0 + 999.0j, dtype=np.complex128)
-    synth_noise_all_channels_into(into_buf, 7, 1.0, 1000, 96, 500)
-    assert np.array_equal(n1, into_buf)
-    print("noise in-place kernel matches allocating kernel: OK")
-
-    # ---------------- NOISE TILE BANK (via the full streamer) ----------------
-    station = StationConfig(station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1)
-    tile_streamer = DirectSynthesisStreamer(
-        station=station, source_cfgs=[], noise_cfg={"std": 1.0, "seed": 7},
-        obs_time_ref=1_800_000_000.0, num_channels=96, n_tiles=8,
-    )
-    n_samples_tile = tile_streamer.tick_n_samples()
-    tick_dt_tile = n_samples_tile / tile_streamer.channel_output_rate
-    obs_time = 1_800_000_000.0
-
-    r1 = tile_streamer.generate_next_tick(obs_time, n_samples_tile)["V"].copy()
-    r2 = tile_streamer.generate_next_tick(obs_time, n_samples_tile)["V"].copy()
-    assert np.array_equal(r1, r2), "same t must give identical content"
-    print("tile-bank determinism/seekability: OK")
-
-    seen = {}
-    first_repeat_at = None
-    for i in range(200):
-        out = tile_streamer.generate_next_tick(obs_time + i * tick_dt_tile, n_samples_tile)["V"]
-        key = out[0, 0]
-        if key in seen and first_repeat_at is None:
-            first_repeat_at = i
-        seen[key] = i
-    print(f"tile-bank first exact repeat (n_tiles=8): tick {first_repeat_at} (expect early, ~dozens)")
-
-    tile_streamer_b = DirectSynthesisStreamer(
-        station=StationConfig(station_id=2, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1),
-        source_cfgs=[], noise_cfg={"std": 1.0, "seed": 99},
-        obs_time_ref=1_800_000_000.0, num_channels=96, n_tiles=8,
-    )
-    out_a = tile_streamer.generate_next_tick(obs_time, n_samples_tile)["V"]
-    out_b = tile_streamer_b.generate_next_tick(obs_time, n_samples_tile)["V"]
-    assert not np.array_equal(out_a, out_b), "different stations must not emit identical noise"
-    print("tile-bank cross-station independence (different seeds -> different content): OK")
-
-    # ---------------- PULSAR: channel-mapping ground truth ----------------
-    NUM_CHANNELS_TEST = 32
-    CHW = CHANNEL_WIDTH_HZ
-    BASE_F = DEFAULT_PULSAR_BASE_FREQ_HZ
-    wideband_rate = NUM_CHANNELS_TEST * CHW
-    n_wide_test = 256 * NUM_CHANNELS_TEST
-    test_channel = 7
-    band_center_hz_test = BASE_F + wideband_rate / 2.0
-    test_freq_p = BASE_F + test_channel * CHW + 0.15 * CHW  # off-center within the channel
-    f_offset_test = test_freq_p - band_center_hz_test
-    t_wide = np.arange(n_wide_test) / wideband_rate
-    v_tone = np.exp(1j * 2 * np.pi * f_offset_test * t_wide)
-    channelized = _channelize_once(v_tone, NUM_CHANNELS_TEST)
-    power_per_channel = np.mean(np.abs(channelized) ** 2, axis=0)
-    detected_channel = int(np.argmax(power_per_channel))
-    print(
-        f"pulsar channel-mapping: tone injected at external channel {test_channel} "
-        f"(freq={test_freq_p/1e6:.4f} MHz) -> detected at external channel {detected_channel}: "
-        f"{'OK' if detected_channel == test_channel else 'MISMATCH -- relabeling logic is wrong'}"
-    )
-    assert detected_channel == test_channel
-
-    # ---------------- PULSAR: dispersion constant cross-check ----------------
-    psrsigsim_dm_k = 1.0 / 2.41e-4
-    rel_diff = abs(DISPERSION_CONST_S_MHZ2_PER_DM - psrsigsim_dm_k) / psrsigsim_dm_k
-    print(
-        f"dispersion constant: this module={DISPERSION_CONST_S_MHZ2_PER_DM}  "
-        f"PsrSigSim DM_K={psrsigsim_dm_k:.3f}  relative diff={rel_diff*100:.3f}% "
-        f"(expected: small, standard literature-precision variation)"
-    )
-
-    # ---------------- PULSAR: full pipeline + coherence ----------------
-    NUM_CHANNELS_TEST2 = 448
-    DM_TEST = 2.0
-    PERIOD_S = 0.1
-    WIDTH_S = 0.005
-
-    pulsar_streamer = DirectSynthesisStreamer(
-        station=station,
-        source_cfgs=[{"kind": "pulsed", "period_s": PERIOD_S, "width_s": WIDTH_S, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
-        obs_time_ref=1_800_000_000.0,
-        num_channels=NUM_CHANNELS_TEST2,
-        base_freq_hz=DEFAULT_PULSAR_BASE_FREQ_HZ,
-    )
-    n_samples_p = pulsar_streamer.tick_n_samples()
-
-    rp1 = pulsar_streamer.generate_next_tick(obs_time, n_samples_p)["V"].copy()
-    rp2 = pulsar_streamer.generate_next_tick(obs_time, n_samples_p)["V"].copy()
-    assert np.array_equal(rp1, rp2), "same t must give identical content"
-    print("pulsar determinism/seekability: OK")
-    print(f"pulsar content is complex (not real-only): max |imag part| = {np.max(np.abs(rp1.imag)):.4f}")
-
-    def _fake_fetch_b(station_id, at_time):
-        return DelayPolynomial(
-            station_id=station_id, start_validity_sec=at_time, validity_period_sec=600.0,
-            xypol_coeffs_ns=[300.0, 0.002, 0.0, 0.0, 0.0, 0.0], ypol_offset_ns=1.0,
-        )
-
-    station_b = StationConfig(station_id=2, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1)
-    pulsar_streamer_b = DirectSynthesisStreamer(
-        station=station_b,
-        source_cfgs=[{"kind": "pulsed", "period_s": PERIOD_S, "width_s": WIDTH_S, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
-        obs_time_ref=1_800_000_000.0,
-        num_channels=NUM_CHANNELS_TEST2,
-        base_freq_hz=DEFAULT_PULSAR_BASE_FREQ_HZ,
-    )
-    globals()["fetch_delay_model_from_cbf"] = _fake_fetch_b
-    pulsar_streamer_b._refresh_delay_poly_if_needed(obs_time)
-    globals()["fetch_delay_model_from_cbf"] = _fake_fetch
-    out_b = pulsar_streamer_b.generate_next_tick(obs_time, n_samples_p)["V"]
-    out_a = pulsar_streamer.generate_next_tick(obs_time, n_samples_p)["V"]
-
-    test_ch = 200
-    tau_a_ns = eval_delay_poly_ns(pulsar_streamer._delay_coeffs, obs_time - pulsar_streamer._current_poly.start_validity_sec)
-    tau_b_ns = eval_delay_poly_ns(pulsar_streamer_b._delay_coeffs, obs_time - pulsar_streamer_b._current_poly.start_validity_sec)
-    f_c = pulsar_streamer.base_freq_hz + test_ch * pulsar_streamer.channel_width_hz
-    correction_a = np.exp(1j * 2 * np.pi * f_c * tau_a_ns * 1e-9)
-    correction_b = np.exp(1j * 2 * np.pi * f_c * tau_b_ns * 1e-9)
-    aligned_a = out_a[:, test_ch] * correction_a
-    aligned_b = out_b[:, test_ch] * correction_b
-    coh = np.abs(np.vdot(aligned_a, aligned_b)) / np.sqrt(np.vdot(aligned_a, aligned_a).real * np.vdot(aligned_b, aligned_b).real)
-    print(
-        f"pulsar cross-station coherence after delay-compensating phase rotation: "
-        f"normalized correlation={coh:.4f} (expect close to 1.0)"
-    )
-    assert coh > 0.999
-
-    print("\nAll correctness checks passed.")

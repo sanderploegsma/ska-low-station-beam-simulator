@@ -327,6 +327,74 @@ pulsar as a candidate (not just exercising delay-tracking), since
 detection significance depends on signal-to-noise, not just having the
 right shape.
 
+### Per-source delay (each tone/pulsar gets its own DelayPolynomial, required)
+
+Every source used to share ONE station-level `DelayPolynomial`
+(`DirectSynthesisStreamer._current_poly`, pulled from a CBF client and
+refreshed on expiry) — meaning two tones or two pulsars in the same
+streamer were implicitly the same point in the sky. Wrong the moment a
+test wants two sources at genuinely different directions in the same
+station. Fixed by giving every tone/pulsar its own `common.DelayFeed`
+instead: this needed no changes to the synthesis kernels at all —
+`synth_tone_channel` and `add_pulsar_tick` already took
+`delay_coeffs`/`poly_t_rel_start`/`ypol_offset_ns` as plain arguments,
+not something baked into the streamer, so per-source delay was a
+data-plumbing change, not a new numerical code path (confirmed by direct
+measurement: alternating between two different `delay_coeffs` arrays
+across calls costs the same as reusing one shared array, within noise).
+
+**`delay_feed` is REQUIRED on every tone/pulsed `source_cfg` — there is
+NO default/fallback delay.** `DirectSynthesisStreamer.__init__` raises
+`ValueError` immediately if one is missing. Deliberate, not an oversight:
+a source with no real delay path would silently apply zero delay, which
+produces content that's trivially "perfectly aligned" — precisely the
+kind of thing that could mask a real CBF delay-tracking bug instead of
+exercising it, given this simulator's whole reason for existing is
+generating true delay independently of CBF. An earlier version of this
+design had a `PolledDelayFeed` fallback for convenience; removed once it
+became clear a silent implicit zero-delay default fights the simulator's
+own purpose more than it helps.
+
+**`common.DelayFeed`** — `update(poly)` is called from whatever thread
+learns of a new polynomial (a Tango event callback in production, direct
+calls in tests); `get(t)` is called from the generation thread. A plain
+reference swap is safe across threads under the GIL since no field of the
+swapped-in `DelayPolynomial` is ever mutated in place. Two deliberate
+behaviours here too: no polynomial received yet → zero delay, warned once
+(not blocking scan start on an external device being up — this is a
+*startup-ordering* gap, not the same as a source having no delay path
+configured at all, which is rejected outright as above); polynomial
+expired with no replacement received → keep applying it as-is, warned
+once per staleness episode. **Recovering from a stalled upstream
+publisher is explicitly NOT this simulator's job** — it applies whatever
+delay it was actually given and logs when that delay is known to be
+stale, so the discrepancy is visible to whoever is debugging a test
+failure (the same "surface it, don't paper over it" principle as the
+Observability section below).
+
+`DirectSynthesisStreamer` caches each source's coefficients as a float64
+array keyed by poly *identity*, not recomputed every tick — same
+per-tick-allocation discipline as bug #13 below, just applied per source
+instead of once station-wide.
+
+**`simulator.py` wiring**: `StationSimulatorDevice.source_cfgs_json` (a
+device_property) describes the sources this station simulates; EVERY
+entry MUST include a `delay_attr_uri` naming a Tango attribute to
+subscribe — `StartScan` raises if one is missing, rather than silently
+omitting delay for that source. `StartScan` opens an `AttributeProxy` per
+named attribute, subscribes to its `CHANGE_EVENT`s, and feeds updates
+into a `DelayFeed` attached to that source's cfg before constructing the
+streamer; subscriptions are torn down in `StopScan`/`delete_device` (and
+before any new scan's subscriptions are created) so they never leak
+across scans. **UNVERIFIED, same category of risk as the ICD bit-packing
+below**: the exact attribute payload shape
+(`common.parse_delay_polynomial_from_attr_value` assumes a JSON
+string/mapping matching `DelayPolynomial`'s fields) and whether
+`AttributeProxy` delivers an immediate `CHANGE_EVENT` with the attribute's
+current value on subscribe (vs. only on the next actual change) both
+depend on how the real delay-poly emulator is configured — confirm
+against it once available, not just against this assumption.
+
 ## SPS-CBF ICD heap structure — HIGHEST-PRIORITY UNVERIFIED ITEM
 
 One heap = ONE CHANNEL = 2048 consecutive time-domain samples, both
@@ -705,10 +773,19 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    exercising delay-tracking, (c) confirm with whoever owns CBF's
    pulsed-source test cases whether this level of astrophysical
    approximation (achromatic profile, Gaussian shape, no pulse-to-pulse
-   jitter) is sufficient, (d) `StartScan` still hardcodes `source_cfgs`/
-   `noise_cfg` rather than accepting them as scan parameters — wiring
-   pulsed/noise-tile config through the actual Tango command interface is
-   unstarted.
+   jitter) is sufficient, (d) ~~`StartScan` still hardcodes `source_cfgs`/
+   `noise_cfg` rather than accepting them as scan parameters~~ **partially
+   done this session**: `source_cfgs` (including a required per-source
+   `delay_attr_uri`, see "Per-source delay" above) now comes from the
+   `source_cfgs_json` device_property, not a hardcoded literal — there is
+   no convenience default tone anymore either (an empty `source_cfgs_json`
+   means no tone/pulsar sources at all, since a fabricated default would
+   need a fabricated delay too, which is exactly what "delay is required"
+   is meant to rule out). `noise_cfg` is still hardcoded in `StartScan`,
+   and `source_cfgs_json` is a static per-instance property (set at
+   deployment), not a dynamic `StartScan` command argument — revisit if a
+   test needs to vary sources between scans on the same running device
+   without a restart.
 7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
 
@@ -721,9 +798,22 @@ it from wherever you're running this before `uv sync`.
 
 ```
 uv sync                                              # installs everything, incl. dev group
-python -m ska_low_station_beam_simulator.direct_synthesis   # ALL correctness checks: tone, noise (kernel + tile bank), pulsar
+uv run pytest                                        # ALL correctness checks: tone, noise (kernel + tile bank), pulsar, delay feeds
 python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real multi-core timing, 96 + 448 channels, tone+noise+pulsar combined
 ```
+
+Correctness checks used to live in `direct_synthesis.py`'s
+`if __name__ == "__main__":` block (`python -m
+ska_low_station_beam_simulator.direct_synthesis`) — converted to real
+`pytest` tests under `tests/` this session, one assertion-group per test
+instead of one long script, so a failure identifies exactly which
+property broke. `tests/test_direct_synthesis.py` covers tone/noise/pulsar
+(the old `__main__` checks); `tests/test_delay_feeds.py` covers
+`DelayFeed`/the required-delay_feed validation/the per-source-delay-divergence
+integration check; `tests/test_simulator_delay_wiring.py` covers the
+Tango attribute subscription plumbing in `simulator.py` (against a fake
+`AttributeProxy`, not a live Tango context — this codebase still doesn't
+unit test the actual Tango device server layer).
 
 `pytango` and `spead2` aren't required to run the above — `simulator.py`
 degrades to stub Tango classes if `pytango` isn't installed (importable,

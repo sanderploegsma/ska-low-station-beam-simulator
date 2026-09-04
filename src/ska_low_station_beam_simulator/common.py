@@ -138,11 +138,110 @@ class DelayPolynomial:
         return tau_ns * 1e-9
 
 
-def fetch_delay_model_from_cbf(station_id: int, at_time: float) -> DelayPolynomial:
-    """STUB — replace with your real Tango client call to CBF's delay-poly
-    device. Confirm its epoch convention matches TAI2000/obs_time here."""
-    raise NotImplementedError(
-        "Wire this up to your CBF delay-poly Tango device client."
+# ============================================================
+# PER-SOURCE DELAY FEEDS
+#
+# Every sky source (a tone, a pulsar) simulated by DirectSynthesisStreamer
+# needs its OWN delay polynomial — two sources at different directions
+# genuinely have different geometric delay, and treating them identically
+# would implicitly put every source at the same point in the sky. There is
+# deliberately NO default/fallback feed: a source with no real delay path
+# would silently produce content that's trivially "perfectly aligned" —
+# exactly the kind of thing that could mask a real CBF delay-tracking bug
+# rather than exercise it, given this simulator's whole reason for
+# existing is generating true delay independently of CBF. Every tone/
+# pulsed source_cfg MUST supply a `delay_feed`; DirectSynthesisStreamer
+# raises at construction time otherwise (see its __init__).
+# ============================================================
+
+_ZERO_DELAY_COEFFS_NS = [0.0]
+
+
+class DelayFeed:
+    """Answers "what delay polynomial applies at time t" for one source —
+    fed by a Tango CHANGE_EVENT subscription on one of CBF's delay-poly
+    emulator's per-direction attributes (RA/Dec, Az/El, or static — see
+    simulator.py), though nothing here is Tango-specific: update() just
+    needs calling from whatever thread learns of a new polynomial (tests
+    call it directly). get() is called from the generation thread. A
+    plain reference swap is safe across threads under the GIL without an
+    explicit lock — no field of the swapped-in DelayPolynomial is ever
+    mutated in place, only the `_poly` reference itself is replaced.
+
+    Two deliberate behaviours, not oversights:
+      - No polynomial received yet -> zero delay, warned ONCE (not every
+        tick). A reasonable default for "hasn't started publishing yet"
+        rather than blocking scan start on an external device being up.
+      - Polynomial expired (t >= valid_until) with no replacement having
+        arrived -> keep applying it as-is, warned once per staleness
+        episode. Detecting or recovering from a stalled upstream
+        publisher is explicitly NOT this simulator's job — it applies
+        whatever delay it was actually given and logs when that delay is
+        known to be stale, so the discrepancy is visible to whoever is
+        debugging a test failure (see CLAUDE.md's Observability section:
+        the same "surface it, don't paper over it" principle as the
+        dropped-heap/pacing counters there).
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._poly: Optional[DelayPolynomial] = None
+        self._warned_no_poly = False
+        self._warned_stale_valid_until: Optional[float] = None
+
+    def update(self, poly: DelayPolynomial) -> None:
+        self._poly = poly
+        self._warned_stale_valid_until = None
+
+    def get(self, t: float) -> DelayPolynomial:
+        if self._poly is None:
+            if not self._warned_no_poly:
+                log.warning(
+                    "delay source %r has not received a polynomial yet — "
+                    "applying zero delay until one arrives",
+                    self.name,
+                )
+                self._warned_no_poly = True
+            return DelayPolynomial(
+                station_id=-1,
+                start_validity_sec=t,
+                validity_period_sec=float("inf"),
+                xypol_coeffs_ns=_ZERO_DELAY_COEFFS_NS,
+                ypol_offset_ns=0.0,
+            )
+        if (
+            t >= self._poly.valid_until
+            and self._warned_stale_valid_until != self._poly.valid_until
+        ):
+            log.warning(
+                "delay source %r polynomial expired at t=%.3f "
+                "(valid_until=%.3f) with no replacement received yet — "
+                "continuing to apply the expired coefficients",
+                self.name,
+                t,
+                self._poly.valid_until,
+            )
+            self._warned_stale_valid_until = self._poly.valid_until
+        return self._poly
+
+
+def parse_delay_polynomial_from_attr_value(value, station_id: int) -> DelayPolynomial:
+    """UNVERIFIED WIRE FORMAT — same category of risk as this module's
+    ICD bit-packing functions below. ska-low-csp-delaymodel/1.0 is a
+    documented schema (ADR-88 in ska-telmodel) but the exact payload a
+    real delay-poly Tango attribute pushes hasn't been checked against it
+    here. Assumes `value` is a JSON string (or an already-parsed mapping)
+    with keys matching DelayPolynomial's fields. Confirm against the real
+    schema and the real CBF delay-poly emulator before deploying."""
+    import json
+
+    data = json.loads(value) if isinstance(value, str) else value
+    return DelayPolynomial(
+        station_id=station_id,
+        start_validity_sec=float(data["start_validity_sec"]),
+        validity_period_sec=float(data["validity_period_sec"]),
+        xypol_coeffs_ns=[float(c) for c in data["xypol_coeffs_ns"]],
+        ypol_offset_ns=float(data["ypol_offset_ns"]),
     )
 
 

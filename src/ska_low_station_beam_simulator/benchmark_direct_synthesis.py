@@ -15,9 +15,10 @@
 # (HEAP_LEN / CHANNEL_WIDTH_HZ ~= 2.621ms). n_samples per tick is always
 # HEAP_LEN, by construction (ScanRunner relies on this).
 #
-# Uses a fake delay polynomial (the real fetch_delay_model_from_cbf is a
-# stub that raises NotImplementedError) — benchmarks generation cost
-# only, not a real Tango delay-poly client's latency.
+# Every source needs its own DelayFeed (see common.py -- there is no
+# default/fallback delay). Uses fixed fake polynomials, applied once at
+# construction via .update(); benchmarks generation cost only, not a real
+# Tango delay-poly subscription's latency.
 
 # %%
 import statistics
@@ -26,20 +27,22 @@ import time
 import numba
 
 import ska_low_station_beam_simulator.direct_synthesis as sim
-from ska_low_station_beam_simulator.common import HEAP_LEN
+from ska_low_station_beam_simulator.common import DelayFeed, HEAP_LEN
 
 # %%
-def _fake_fetch_delay_model(station_id: int, at_time: float) -> sim.DelayPolynomial:
-    return sim.DelayPolynomial(
-        station_id=station_id,
-        start_validity_sec=at_time,
-        validity_period_sec=600.0,
-        xypol_coeffs_ns=[750.0, 0.0046, 0.0, 0.0, 0.0, 0.0],
-        ypol_offset_ns=2.0,
+def _fixed_delay_feed(name: str) -> DelayFeed:
+    feed = DelayFeed(name=name)
+    feed.update(
+        sim.DelayPolynomial(
+            station_id=1,
+            start_validity_sec=1_800_000_000.0,
+            validity_period_sec=600.0,
+            xypol_coeffs_ns=[750.0, 0.0046, 0.0, 0.0, 0.0, 0.0],
+            ypol_offset_ns=2.0,
+        )
     )
+    return feed
 
-
-sim.fetch_delay_model_from_cbf = _fake_fetch_delay_model
 
 # Modest pulsar/tile-bank settings so streamer CONSTRUCTION (rebuilt once
 # per sweep point below) stays fast -- period_s and n_tiles both trade
@@ -64,9 +67,11 @@ def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
     return sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "tone", "freq_hz": tone_freq, "amplitude": 1.0},
+            {"kind": "tone", "freq_hz": tone_freq, "amplitude": 1.0,
+             "delay_feed": _fixed_delay_feed("bench-tone")},
             {"kind": "pulsed", "period_s": PULSAR_PERIOD_S, "width_s": PULSAR_WIDTH_S,
-             "amplitude": 1.0, "dm_pc_cm3": PULSAR_DM},
+             "amplitude": 1.0, "dm_pc_cm3": PULSAR_DM,
+             "delay_feed": _fixed_delay_feed("bench-pulsar")},
         ],
         noise_cfg={"std": 0.05, "seed": 7},
         obs_time_ref=1_800_000_000.0,
