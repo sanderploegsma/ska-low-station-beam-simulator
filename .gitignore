@@ -11,3 +11,10 @@ wheels/
 
 # Session/machine-local Claude Code notes — see CLAUDE.md's Setup section
 CLAUDE.local.md
+
+# Generated pulsar catalog data (see generate_pulsar_catalog.py) --
+# hundreds of MB to low-GB, deliberately NOT committed to git (would
+# permanently bloat repo history). Generate locally with
+# `python -m ska_low_station_beam_simulator.generate_pulsar_catalog`, or
+# as an OCI image build step -- see CLAUDE.md's Pulsar catalog section.
+src/ska_low_station_beam_simulator/pulsar_catalog_data/

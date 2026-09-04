@@ -124,7 +124,12 @@ class StationSimulatorDevice(Device):
     # on CBF's delay-poly emulator to subscribe for that source's own
     # delay polynomial (there is no default delay -- see module
     # docstring). Empty ("[]", the default) means no tone/pulsar sources
-    # at all for this scan (noise, if noise_cfg is set, still plays).
+    # at all for this scan (noise, if noise_cfg is set, still plays). A
+    # "pulsed" entry may give either "pulsar_name" (loads a pre-generated
+    # catalog entry -- fast startup, fixed parameters, see
+    # pulsar_catalog.py) or "period_s"/"width_s"/"dm_pc_cm3" (builds a
+    # custom template at construction -- arbitrary parameters, slower
+    # startup), never both.
     source_cfgs_json = device_property(dtype=str, default_value="[]")
 
     def init_device(self):

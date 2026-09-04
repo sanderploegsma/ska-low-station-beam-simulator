@@ -301,3 +301,176 @@ def test_pulsar_cross_station_coherence_after_delay_compensation(pulsar_streamer
         np.vdot(aligned_a, aligned_a).real * np.vdot(aligned_b, aligned_b).real
     )
     assert coh > 0.999
+
+
+# ============================================================
+# num_channels validation (SPS-CBF ICD: 8-384 in steps of 8)
+# ============================================================
+
+
+def test_num_channels_above_max_rejected(station):
+    with pytest.raises(ValueError, match="not a valid SPS beam"):
+        sim.DirectSynthesisStreamer(
+            station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=448,
+        )
+
+
+def test_num_channels_not_a_multiple_of_step_rejected(station):
+    with pytest.raises(ValueError, match="not a valid SPS beam"):
+        sim.DirectSynthesisStreamer(
+            station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=100,
+        )
+
+
+def test_num_channels_at_max_accepted(station):
+    sim.DirectSynthesisStreamer(
+        station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=384,
+    )
+
+
+# ============================================================
+# PULSAR: loading a pre-generated catalog entry by name
+# ============================================================
+
+
+CATALOG_TEST_NUM_CHANNELS = 32
+CATALOG_TEST_PERIOD_S = 0.005
+CATALOG_TEST_WIDTH_S = 0.0005
+CATALOG_TEST_DM = 3.0
+
+
+@pytest.fixture(scope="module")
+def small_catalog(tmp_path_factory):
+    """A real (not synthetic) catalog entry, but at a small num_channels
+    and short period so it builds fast -- module-scoped so the (still
+    non-trivial) build cost is paid once for every test that needs it,
+    not once per test."""
+    from ska_low_station_beam_simulator.pulsar_catalog import save_pulsar_to_catalog
+
+    catalog_dir = tmp_path_factory.mktemp("pulsar_catalog")
+    template, n_period_samples = sim.build_pulsar_template(
+        CATALOG_TEST_NUM_CHANNELS,
+        CHANNEL_WIDTH_HZ,
+        BASE_FREQ_HZ,
+        CHANNEL_OUTPUT_RATE_HZ,
+        CATALOG_TEST_PERIOD_S,
+        CATALOG_TEST_WIDTH_S,
+        1.0,
+        CATALOG_TEST_DM,
+        sim.DEFAULT_SKY_SEED,
+    )
+    save_pulsar_to_catalog(
+        catalog_dir,
+        "test_catalog_pulsar",
+        template,
+        n_period_samples,
+        CATALOG_TEST_PERIOD_S,
+        CATALOG_TEST_WIDTH_S,
+        CATALOG_TEST_DM,
+        sim.DEFAULT_SKY_SEED,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+    return catalog_dir, template, n_period_samples
+
+
+def test_pulsed_source_cfg_rejects_both_name_and_params(station):
+    with pytest.raises(ValueError, match="both"):
+        sim.DirectSynthesisStreamer(
+            station=station,
+            source_cfgs=[
+                {"kind": "pulsed", "pulsar_name": "x", "period_s": 0.01, "width_s": 0.001,
+                 "dm_pc_cm3": 2.0, "delay_feed": _delay_feed("both")}
+            ],
+            obs_time_ref=OBS_TIME,
+        )
+
+
+def test_pulsed_source_cfg_rejects_neither_name_nor_params(station):
+    with pytest.raises(ValueError, match="neither"):
+        sim.DirectSynthesisStreamer(
+            station=station,
+            source_cfgs=[{"kind": "pulsed", "delay_feed": _delay_feed("neither")}],
+            obs_time_ref=OBS_TIME,
+        )
+
+
+def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
+    catalog_dir, _, _ = small_catalog
+    streamer = sim.DirectSynthesisStreamer(
+        station=station,
+        source_cfgs=[
+            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
+             "delay_feed": _delay_feed("catalog-pulsar")}
+        ],
+        obs_time_ref=OBS_TIME,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+    n = streamer.tick_n_samples()
+    out1 = streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
+    out2 = streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
+    assert np.array_equal(out1, out2), "same t must give identical content"
+    assert np.max(np.abs(out1.imag)) > 1e-6, "loaded template must still be genuinely complex"
+
+
+def test_pulsar_name_matches_directly_built_content(small_catalog, station):
+    """The by-name path must produce the SAME content a direct
+    period_s/width_s/dm_pc_cm3 build would (modulo complex64 round-trip
+    precision) -- this is the property that makes 'fast startup via a
+    catalog' a packaging optimization, not a different physical result."""
+    catalog_dir, _, _ = small_catalog
+
+    streamer_by_name = sim.DirectSynthesisStreamer(
+        station=station,
+        source_cfgs=[
+            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
+             "delay_feed": _delay_feed("by-name")}
+        ],
+        obs_time_ref=OBS_TIME,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+    streamer_direct = sim.DirectSynthesisStreamer(
+        station=station,
+        source_cfgs=[
+            {"kind": "pulsed", "period_s": CATALOG_TEST_PERIOD_S, "width_s": CATALOG_TEST_WIDTH_S,
+             "dm_pc_cm3": CATALOG_TEST_DM, "delay_feed": _delay_feed("direct")}
+        ],
+        obs_time_ref=OBS_TIME,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+
+    n = streamer_by_name.tick_n_samples()
+    out_by_name = streamer_by_name.generate_next_tick(OBS_TIME, n)["V"]
+    out_direct = streamer_direct.generate_next_tick(OBS_TIME, n)["V"]
+    assert np.allclose(out_by_name, out_direct, atol=1e-3)
+
+
+def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
+    catalog_dir, _, _ = small_catalog
+    streamer_default = sim.DirectSynthesisStreamer(
+        station=station,
+        source_cfgs=[
+            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
+             "delay_feed": _delay_feed("amp-default")}
+        ],
+        obs_time_ref=OBS_TIME,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+    streamer_scaled = sim.DirectSynthesisStreamer(
+        station=station,
+        source_cfgs=[
+            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
+             "amplitude": 2.5, "delay_feed": _delay_feed("amp-scaled")}
+        ],
+        obs_time_ref=OBS_TIME,
+        num_channels=CATALOG_TEST_NUM_CHANNELS,
+        base_freq_hz=BASE_FREQ_HZ,
+    )
+    n = streamer_default.tick_n_samples()
+    out_default = streamer_default.generate_next_tick(OBS_TIME, n)["V"]
+    out_scaled = streamer_scaled.generate_next_tick(OBS_TIME, n)["V"]
+    assert np.allclose(out_scaled, out_default * 2.5, atol=1e-3)

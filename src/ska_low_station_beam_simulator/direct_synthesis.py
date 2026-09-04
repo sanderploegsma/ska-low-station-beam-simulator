@@ -289,6 +289,7 @@ from ska_low_station_beam_simulator.common import (
     StationConfig,
     log,
 )
+from ska_low_station_beam_simulator.pulsar_catalog import load_pulsar_from_catalog
 
 MASK64 = np.uint64(0xFFFFFFFFFFFFFFFF)
 GOLDEN = np.uint64(0x9E3779B97F4A7C15)
@@ -741,6 +742,35 @@ class DirectSynthesisStreamer:
                     f"simulator.py's Tango attribute subscription, or "
                     f"directly in a test)."
                 )
+            if cfg["kind"] == "pulsed":
+                # Two mutually exclusive ways to configure a pulsar: load
+                # a pre-generated catalog entry by name (fast startup,
+                # fixed parameters -- see pulsar_catalog.py) or supply
+                # raw parameters to build a custom template at
+                # construction (arbitrary parameters, pays the one-time
+                # FFT construction cost -- see CLAUDE.md's Benchmarking
+                # section for how tight that budget now is).
+                param_keys = ("period_s", "width_s", "dm_pc_cm3")
+                has_name = "pulsar_name" in cfg
+                present_params = [k for k in param_keys if k in cfg]
+                if has_name and present_params:
+                    raise ValueError(
+                        f"pulsed source_cfg has both 'pulsar_name' and "
+                        f"{present_params} -- specify one or the other, "
+                        f"not both: 'pulsar_name' loads a pre-generated "
+                        f"catalog entry (see pulsar_catalog.py), "
+                        f"'period_s'/'width_s'/'dm_pc_cm3' builds a custom "
+                        f"template at construction."
+                    )
+                if not has_name and len(present_params) != len(param_keys):
+                    missing = [k for k in param_keys if k not in cfg]
+                    raise ValueError(
+                        f"pulsed source_cfg needs either 'pulsar_name' "
+                        f"(load a pre-generated catalog entry) or all of "
+                        f"'period_s'/'width_s'/'dm_pc_cm3' (build a custom "
+                        f"template at construction) -- got neither "
+                        f"'pulsar_name' nor {missing}."
+                    )
 
         self._pulsed_cfgs = [c for c in source_cfgs if c["kind"] == "pulsed"]
         if self._pulsed_cfgs and base_freq_hz <= 0:
@@ -795,25 +825,42 @@ class DirectSynthesisStreamer:
                 )
 
         # --- pulsar templates: one (template, period_s, n_period_samples)
-        # tuple per pulsed source cfg, built ONCE here. sky_seed is shared
-        # across all stations for the same pulsar cfg by default (see
-        # module docstring) -- override only for a deliberately DIFFERENT
-        # (uncorrelated) pulsar, never to "vary" the same pulsar per
-        # station. ---
+        # tuple per pulsed source cfg. Either LOADED from the catalog by
+        # name (fast -- see pulsar_catalog.py) or BUILT here from raw
+        # parameters, per source_cfg (validated mutually exclusive,
+        # above). sky_seed is shared across all stations for the same
+        # pulsar cfg by default (see module docstring) -- override only
+        # for a deliberately DIFFERENT (uncorrelated) pulsar, never to
+        # "vary" the same pulsar per station. ---
         self._pulsars = []
         for cfg in self._pulsed_cfgs:
-            template, n_period_samples = build_pulsar_template(
-                self.num_channels,
-                self.channel_width_hz,
-                self.base_freq_hz,
-                self.channel_output_rate,
-                cfg["period_s"],
-                cfg["width_s"],
-                cfg.get("amplitude", 1.0),
-                cfg["dm_pc_cm3"],
-                cfg.get("sky_seed", DEFAULT_SKY_SEED),
-            )
-            self._pulsars.append((template, cfg["period_s"], n_period_samples, cfg["delay_feed"], {}))
+            if "pulsar_name" in cfg:
+                loaded = load_pulsar_from_catalog(
+                    cfg["pulsar_name"],
+                    self.num_channels,
+                    self.base_freq_hz,
+                    catalog_dir=cfg.get("catalog_dir"),
+                )
+                template = loaded["template"]
+                amplitude = cfg.get("amplitude", 1.0)
+                if amplitude != 1.0:
+                    template = template * amplitude
+                period_s = loaded["period_s"]
+                n_period_samples = loaded["n_period_samples"]
+            else:
+                template, n_period_samples = build_pulsar_template(
+                    self.num_channels,
+                    self.channel_width_hz,
+                    self.base_freq_hz,
+                    self.channel_output_rate,
+                    cfg["period_s"],
+                    cfg["width_s"],
+                    cfg.get("amplitude", 1.0),
+                    cfg["dm_pc_cm3"],
+                    cfg.get("sky_seed", DEFAULT_SKY_SEED),
+                )
+                period_s = cfg["period_s"]
+            self._pulsars.append((template, period_s, n_period_samples, cfg["delay_feed"], {}))
 
         # Reused across ticks (per pol) so generate_next_tick doesn't
         # allocate a fresh (n_samples, num_channels) complex128 array

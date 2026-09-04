@@ -70,6 +70,12 @@ src/ska_low_station_beam_simulator/
                                 encoding path against an external unpacker (see common.py's
                                 hand-rolled SPEAD-64-48 encoder -- not spead2, see the ICD section
                                 below -- and bug #17)
+  pulsar_catalog.py             named pulsar catalog: save/load pre-generated templates by name
+                                (see "Pulsar catalog" below) -- no dependency on direct_synthesis.py,
+                                so DirectSynthesisStreamer can import it without a cycle
+  generate_pulsar_catalog.py   builds every entry in pulsar_catalog.CATALOG_ENTRIES and writes it
+                                to disk -- the only module that imports both direct_synthesis.py
+                                (build_pulsar_template) and pulsar_catalog.py (to save the result)
 ```
 
 **This used to be two backends plus three separate experimental
@@ -507,6 +513,69 @@ string/mapping matching `DelayPolynomial`'s fields) and whether
 current value on subscribe (vs. only on the next actual change) both
 depend on how the real delay-poly emulator is configured — confirm
 against it once available, not just against this assumption.
+
+### Pulsar catalog — pre-generated templates, loaded by name (new this session)
+
+`build_pulsar_template`'s one-time construction cost (see Benchmarking's
+"CORRECTED pulsar construction budget" — now tighter than ever, since
+the oversampling correction made essentially every period factor
+poorly) doesn't have to be paid at every scan start. `pulsar_catalog.py`
+adds a small catalog of pre-generated pulsar templates
+(`CATALOG_ENTRIES`), built once offline by `generate_pulsar_catalog.py`
+and loaded by name at `DirectSynthesisStreamer` construction instead —
+essentially free startup cost (an `np.load` plus a slice), no FFT.
+
+**Both configuration styles are supported side by side, not one instead
+of the other** — a `"pulsed"` `source_cfg` gives either `pulsar_name`
+(load a catalog entry) or `period_s`/`width_s`/`dm_pc_cm3` (build a
+custom template at construction), validated as mutually exclusive
+(`DirectSynthesisStreamer.__init__` raises if a cfg gives both or
+neither). This was a deliberate design choice, not the obvious
+default: it means clients can pick fast, fixed-parameter setup for
+routine tests while still keeping the ability to dial in an arbitrary
+period/DM for a test that specifically needs one, at the cost of the
+slower construction path.
+
+**Every catalog entry is generated at the FULL band width**
+(`common.MAX_NUM_CHANNELS` = 384 channels, starting at
+`common.BASE_FREQ_HZ` = channel 64) — a station simulating a narrower
+sub-band just slices the columns it needs out of the same array
+(`pulsar_catalog.load_pulsar_from_catalog`'s `station_num_channels`/
+`station_base_freq_hz` arguments handle this, validated for both
+channel-grid alignment and range). This means ONE `.npy` per named
+pulsar serves every valid station configuration, not one per
+`(num_channels, first_channel_id)` combination — consistent with this
+module's existing principle that a pulsar's "sky carrier" is shared
+across every station observing it.
+
+**Stored as complex64 on disk** (halves size vs. the complex128 used
+internally — no meaningful fidelity loss for this purpose, since content
+is quantized to int8 well downstream anyway), upcast back to complex128
+immediately on load so `add_pulsar_tick`'s numba kernel sees the exact
+same dtype regardless of which path built the template.
+`catalog.json` records the exact `channel_width_hz`/
+`channel_output_rate`/`num_channels`/`base_freq_hz` each entry was
+generated under, checked against the CURRENT constants on load — a
+catalog baked under since-corrected constants (this project has already
+been burned once by a wrong `channel_output_rate` assumption, see below)
+fails loudly instead of silently misapplying stale data.
+
+**A real, previously-unmeasured cost, discovered generating the actual
+default catalog**: `CATALOG_ENTRIES`'s three illustrative entries
+(10ms/89.3ms/300ms periods) came to **28MB / 254MB / 853MB respectively
+— ~1.1GB total** for just three examples. This scales roughly linearly
+with period (longer period → more samples per period → bigger array at
+fixed 384-channel width), so a real deployment's catalog size depends
+entirely on which periods it actually needs. **Deliberately NOT
+committed to git** (`pulsar_catalog_data/` is gitignored) — binary blobs
+this large would permanently bloat repository history for every future
+clone, with no way to shrink it back down short of a history rewrite.
+The recommended flow for actually getting these into an OCI image is to
+run `generate_pulsar_catalog.py` as an image BUILD step (after
+installing the package, before the image is finalized), not to bundle
+pre-generated `.npy` files into a wheel/sdist — this keeps large binaries
+out of both git and any package index the project might publish to.
+This project has no Dockerfile yet; wire this in when one exists.
 
 ## SPS-CBF ICD channelization — corrected this session
 
@@ -1343,6 +1412,19 @@ bug; backed-up queue/dropped heaps → simulator artifact.
     further on that basis, but explicitly flagged it as reasoned-not-
     verified. Revisit if a delay-tracking test ever shows a phase
     discontinuity at heap boundaries this reasoning didn't predict.
+12. ~~Pre-generate pulsar templates offline instead of building at scan
+    construction~~ **Done this session** — see "Pulsar catalog" above:
+    `pulsar_catalog.py`/`generate_pulsar_catalog.py`, both source_cfg
+    styles supported side by side. Open follow-ups: (a) decide the
+    ACTUAL set of named pulsars a real deployment needs (the three
+    shipped are illustrative, not curated for any specific test
+    campaign) — periods/DMs pulled from CBF's own pulsed-source test
+    requirements once known, (b) wire `generate_pulsar_catalog.py` into
+    an actual OCI image build step once a Dockerfile exists for this
+    project (none does yet), (c) the catalog data is ~1.1GB for just
+    three illustrative entries and scales with period length — budget
+    image size deliberately once the real named-pulsar set is decided,
+    not just build time.
 
 ## Setup
 
@@ -1355,6 +1437,7 @@ it from wherever you're running this before `uv sync`.
 uv sync                                              # installs everything, incl. dev group
 uv run pytest                                        # ALL correctness checks: tone, noise (kernel + tile bank), pulsar, delay feeds
 python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real multi-core timing, 96 + 384 (real ICD max) channels, tone+noise+pulsar combined
+python -m ska_low_station_beam_simulator.generate_pulsar_catalog     # writes pulsar_catalog_data/ (gitignored, ~1.1GB for the default 3 entries) -- see "Pulsar catalog"
 ```
 
 Correctness checks used to live in `direct_synthesis.py`'s
