@@ -57,6 +57,9 @@ src/ska_low_station_beam_simulator/
   direct_synthesis.py          the SOLE backend: DirectSynthesisStreamer (tone + tiled noise + pulsar)
   simulator.py                 Tango device server (StationSimulatorDevice)
   benchmark_direct_synthesis.py  benchmarks DirectSynthesisStreamer, incl. tone+noise+pulsar combined
+  generate_test_pcap.py        writes a real pcap of a few SPEAD-encoded heaps, for testing the
+                                encoding path against an external unpacker (spead2 has no pcap writer
+                                of its own -- see its module docstring and bug #17)
 ```
 
 **This used to be two backends plus three separate experimental
@@ -356,18 +359,62 @@ DM=2, 100ms period, 5ms FWHM:**
   n_period_samples`): 0.48s at a 10ms period, 4.4s at 100ms, **46.2s at
   1000ms**.
 - **The 1000ms-period figure ALREADY EXCEEDS this project's one-time
-  construction budget (target 10s, hard limit 30s) — a pre-existing cost,
-  newly relevant now that a hard budget exists, and NOT something the
-  numba→numpy replacement above fixes.** Isolating the wideband-generate
-  substep alone confirms it's cheap either way (numpy: 6.2s of the 46.2s
-  total, numba: 9.6s) — the dominant, ~37-40s cost is the FFT/dispersion
-  step itself (`build_pulsar_template`'s `np.fft.fft`/`ifft` calls on a
-  ~350M-element array at a 1s period), likely because that size doesn't
-  factor into small primes (plain `numpy.fft` has no control over this).
-  Not fixed in this pass — candidates if a real deployment needs
-  multi-second pulsar periods: padding the FFT length to a fast/composite
-  size, `scipy.fft` with `workers=`, or simply documenting a maximum
-  supported pulsar period. See "Immediate next steps."
+  construction budget (target 10s, hard limit 30s)** — a pre-existing
+  cost, newly relevant now that a hard budget exists, and NOT something
+  the numba→numpy replacement above fixes on its own. Isolating the
+  wideband-generate substep alone confirms it's cheap either way (numpy:
+  6.2s of the 46.2s total, numba: 9.6s) — the dominant cost is the
+  FFT/dispersion step itself.
+- **`scipy.fft` (with `workers=`), tried this session, adopted where it
+  helps — `_channelize_once`'s batched small FFTs are the clear win
+  (~4-5x faster, e.g. 0.14s→0.03s at a 100ms period: embarrassingly
+  parallel across independent rows), the two big 1D FFT/IFFT calls in
+  `build_pulsar_template` only ~15-20% (bandwidth-bound at these sizes —
+  more workers past 8 gave no further benefit, matching this project's
+  8-core/pod target). `scipy` is back in `pyproject.toml` for this
+  (it was dropped earlier this session when the legacy wideband path —
+  its only other user — was deleted; this is a new, independently
+  justified reason to bring it back).**
+- **The bigger, previously-undocumented finding: FFT SIZE matters far
+  more than the numba/numpy/scipy choice.** `n_wide` (the wideband array
+  length dispersion FFTs over) is `num_channels × round(period_s ×
+  channel_width_hz)` — for most periods this factors into small primes
+  (e.g. 100/200/300ms all reduce to `2^a × 5^7 × 7`, largest prime factor
+  7) and construction time scales cleanly, near-linearly, with period.
+  But some periods land on a size with a large prime factor — e.g. 50ms
+  gives `n_wide` with a largest prime factor of **19531** — and measured
+  **3-6x slower than neighboring, better-factored periods**, confirmed by
+  actually factoring `n_wide` (not guessed): `2^7 × 7 × 1` size at 10ms
+  (fine) vs. that one large prime at 50ms (bad), verified via direct
+  timing of every construction substep (gen/fft/H-transfer-function/
+  multiply/ifft/channelize) with a proper clock-ramp burn-in first (this
+  hardware needs one — see CLAUDE.local.md — an earlier pass without it
+  showed the same anomaly, ruling that out as the cause). `scipy.fft.
+  next_fast_len()` can find a nearby fast size (17,499,776 → 17,500,000
+  for the 50ms case, +224 samples) — a genuine, well-characterized
+  candidate fix, **not implemented**: it isn't a drop-in swap, since (a)
+  `next_fast_len`'s result isn't guaranteed to still be an exact multiple
+  of `num_channels`, which `_channelize_once`'s reshape requires (it
+  wasn't, for the 50ms case), and (b) padding the wideband array changes
+  what "one period" means to the FFT's implicit circular convolution,
+  which needs re-validating against the coherence/channel-mapping checks
+  before trusting it, not just assuming it's still correct. This is the
+  "needs real design work, not a one-line change" boundary — left for a
+  future session if multi-second pulsar periods become a real
+  requirement.
+- **Approximate period limits with scipy.fft as it stands (no
+  size-padding), 448 channels**: for a WELL-FACTORED period, roughly
+  **~300ms clears the 10s target**, **~900ms (0.9s) clears the 30s hard
+  limit** (near-linear fit through 100/200/300ms measurements: 3.21s/
+  6.53s/9.84s). For a period that happens to hit a poorly-factored size
+  (the 50ms case measured ~3x its linear-trend prediction), the SAME
+  nominal period could cost up to ~3x more — so to stay under budget
+  **regardless of which period a test picks**, without validating
+  size-padding, treat the safe limits as roughly a third of those:
+  **~100ms for the 10s target, ~300ms for the 30s hard limit**. Whether a
+  given period is "well-factored" is checkable cheaply in advance via
+  `scipy.fft.next_fast_len(n_wide) == n_wide` (exact match = already
+  fast).
 - **Steady-state per-tick cost clears the ~8-core target with room to
   spare**: 1.36ms/tick (51.8% of the 2.621ms budget) at 8 threads; even
   4 threads clears budget (1.93ms, 73.7%). This isolated the pulsar cost
@@ -466,9 +513,26 @@ in a way that may not even error, just silently misparse. **Verify
 against the real ICD table before this touches real hardware** — nothing
 else in this codebase should be prioritized above this.
 
-Also unverified: whether `spead2`'s Python send API actually supports an
-explicit `heap_counter`/`cnt` override the way `common.SpsPacketizer`
-assumes.
+**VERIFIED, no longer open**: `spead2`'s Python send API (checked
+directly against the installed `spead2==4.4.1`) does support an explicit
+`heap_counter`/`cnt` override exactly the way `common.SpsPacketizer`
+assumes — `send_heap(heap, cnt=..., substream_index=0, rate=-1.0)` on the
+concrete stream classes. See `common.py`'s module docstring for the full
+finding, including that `spead2.send.BytesStream` captures only raw
+SPEAD-protocol bytes (no pcap/UDP/IP framing) — not a pcap file on its
+own.
+
+**CONFIRMED**: the lowest valid frequency for the SKA-Low telescope is
+**50.78125 MHz**, which is **coarse channel ID 65** in the ICD's global
+channel numbering (65 × `CHANNEL_WIDTH_HZ` = 50,781,250 Hz exactly).
+`common.BASE_FREQ_HZ` and `StationConfig.first_channel_id`'s default (65)
+now reflect this — no longer placeholders. `direct_synthesis.py`'s
+`DEFAULT_PULSAR_BASE_FREQ_HZ` (an illustrative 50MHz stand-in) is deleted
+entirely now that `BASE_FREQ_HZ` itself is real and usable directly. This
+also fixes a real, previously-latent gap: `simulator.py`'s `StartScan`
+never overrode `base_freq_hz`, so any pulsed source configured through it
+would have hit `DirectSynthesisStreamer`'s `base_freq_hz > 0` check and
+failed outright while `BASE_FREQ_HZ` was still `0.0`.
 
 ## Known bugs — fixed (don't reintroduce), and their current status
 
@@ -608,6 +672,26 @@ reintroduce a regression into.
     final per-tile version relies on. Verified: peak RSS now matches the
     bank's own size almost exactly, confirmed via a `ulimit -v` safety
     net before trusting it on this shared node again.
+17. **`SpsPacketizer.send_channel_heap`'s `heap_counter` formula
+    multiplied `unix_to_tai2000_seconds(...)` by `CHANNEL_WIDTH_HZ` (the
+    SAMPLE rate) instead of dividing by `BLOCK_DURATION_S` (the correct
+    per-HEAP rate)** — inflated the value by `HEAP_LEN` (2048x). For any
+    current-era timestamp this overflows spead2's actual 40-bit `cnt`
+    limit (confirmed by directly probing the installed spead2==4.4.1:
+    `cnt` up to `2**40-1` is accepted, `2**48-1` and above raise
+    `OSError: Invalid argument`), meaning **every real
+    `send_channel_heap()` call would have failed outright** — this had
+    silently never been caught because `spead2` usage lived only in
+    `SpsPacketizer`/the actual device server, and neither was ever
+    exercised end-to-end by this project's test suite before
+    `generate_test_pcap.py` (see "Code layout") tried to actually send a
+    heap through it for the first time. Fixed: `heap_counter =
+    unix_to_tai2000_seconds(t) / BLOCK_DURATION_S`, which keeps the
+    counter comfortably within 40 bits until roughly year 2091 — see
+    `tests/test_spead_packetizer.py` for the regression coverage
+    (present-day and 30-years-out checks, plus an actual
+    `send_channel_heap()` call via a `BytesStream`, not just the
+    arithmetic in isolation).
 
 ## Benchmarking
 
@@ -781,21 +865,42 @@ feed setup is a dict lookup). Measured in isolation via
 | 512 | 1.29s |
 | 1024 | 2.54s |
 
-| pulsar period | build (wideband generate + FFT dispersion + channelize) |
-|---|---|
-| 10ms | 0.48s |
-| 100ms | 4.44s |
-| 1000ms | **46.17s — OVER the 30s hard limit** |
+| pulsar period | build, plain numpy.fft (pre-scipy) | build, scipy.fft workers=8 (current) |
+|---|---|---|
+| 10ms | 0.48s | 0.32s |
+| 100ms | 4.44s | 3.21s (well-factored `n_wide`) |
+| 200ms | — | 6.53s (well-factored) |
+| 300ms | — | 9.84s (well-factored) |
+| 50ms | — | 4.73s (POORLY-factored `n_wide` — see below; slower than 100ms despite a smaller array) |
+| 1000ms | 46.17s — OVER the 30s hard limit | not re-measured at this size after scipy (see Pulsed sources section for why: not the per-array-size cost, but memory — retesting at 1s risked node stability again) |
 
-Noise easily clears the 10s target at every tested size. **The
-1000ms-period pulsar does not** — see the Pulsed sources section above
-for why (FFT size, not the noise-kernel work this session was actually
-about) and candidate fixes, none applied yet. Not tested combined at
-their largest settings simultaneously (n_tiles=1024 + a 1s-period pulsar
-at once) — an earlier attempt at that combination used enough transient
-memory to threaten node stability on this shared host (see bug #16); if
-a real test scenario needs both large at once, budget memory as
-carefully as time before trying it.
+Noise easily clears the 10s target at every tested size, no change here.
+**Pulsar construction is a genuinely more complex story than "period vs.
+time"** — see the Pulsed sources section above for the full finding:
+`scipy.fft` gives a real but modest win (bigger on `_channelize_once`'s
+batched FFTs than the two big 1D transforms), but the DOMINANT effect is
+whether `n_wide` happens to factor into small primes — a poorly-factored
+period can cost 3-6x more than a well-factored neighbor at a similar
+nominal length. Run-to-run variance on this shared, contended host is
+real too, not just factorization: a clean isolated run measured
+300ms/well-factored at 9.84s (just under the 10s target); re-measured
+as part of the full `benchmark_direct_synthesis.py` sweep (same host,
+more going on around it) at 12.5s (over it) — roughly 25% higher,
+plausibly load/thermal/clock-state, not a code change. Treat any of
+these numbers as a band, not a precise threshold. Approximate limits,
+accounting for BOTH sources of variance: **~100-200ms to reliably clear
+the 10s target, up to perhaps ~0.5-0.9s for the 30s hard limit** if
+the period's factorization is lucky and the host isn't contended — check
+factorization luck cheaply via `scipy.fft.next_fast_len(n_wide) ==
+n_wide`, but budget real margin underneath the hard limit rather than
+trusting an exact number, and re-measure on the actual target host under
+load if a specific period near these boundaries matters. Not tested
+combined with a large noise bank at the largest settings simultaneously
+(n_tiles=1024 + a long-period pulsar at once) — an earlier attempt at
+that combination used enough transient memory to threaten node stability
+on this shared host (see bug #16); if a real test scenario needs both
+large at once, budget memory as carefully as time before trying it.
+
 ### Historical hardware notes (legacy wideband path only, from earlier sessions)
 
 - **Apple M5** (4P+6E cores): `ThreadPoolExecutor` threading plateaus at
@@ -877,10 +982,9 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    modules and their benchmarks were deleted (see "Code layout").
    Combined tone+noise+pulsar clears budget at 448 channels (see
    Benchmarking's "Combined tone + tiled-noise + pulsar" subsection).
-   Remaining open items: (a) decide on a real `base_freq_hz` (currently a
-   50MHz placeholder default passed explicitly to pulsed configs, same
-   unverified-ICD problem as `common.BASE_FREQ_HZ`) since dispersion
-   physics is highly sensitive to the true band edges, (b) flux/SNR
+   Remaining open items: (a) ~~decide on a real `base_freq_hz`~~ **done
+   this session**: confirmed as 50.78125 MHz (coarse channel 65) — see
+   the SPS-CBF ICD section above, (b) flux/SNR
    calibration against the noise floor if the goal extends to testing
    whether PSS/PST can actually detect the injected pulsar, not just
    exercising delay-tracking, (c) confirm with whoever owns CBF's
@@ -901,15 +1005,25 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    without a restart.
 7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
-8. **Long-period pulsars (≥~1s) violate the one-time construction budget
-   (target 10s, hard limit 30s)** — measured 46.2s at a 1s period, 448
-   channels, dominated by `build_pulsar_template`'s FFT dispersion step
-   (~37-40s of it), not the wideband-generate substep this session moved
-   off numba (that part alone is only ~6s, and is now numpy either way).
-   Candidates, untried: pad the wideband FFT length to a fast/composite
-   size, switch to `scipy.fft` with `workers=` for multi-threading, or
-   just document/enforce a maximum supported pulsar period if sub-second
-   periods cover every real test case CBF actually needs.
+8. ~~Long-period pulsars violate the one-time construction budget~~
+   **`scipy.fft` (with `workers=`) adopted this session** — real but
+   modest win (biggest on `_channelize_once`'s batched FFTs, ~4-5x;
+   ~15-20% on the two big 1D transforms, bandwidth-bound). **Bigger
+   finding along the way, not yet acted on**: construction time depends
+   far more on whether the wideband array length (`n_wide`) factors into
+   small primes than on period length itself — a poorly-factored period
+   measured 3-6x slower than a well-factored neighbor of similar size
+   (see the Pulsed sources section for the verified example: 50ms vs.
+   100ms). Approximate safe limits as of this session: ~100-300ms for the
+   10s target, ~300ms-0.9s for the 30s hard limit, depending on
+   factorization luck. `scipy.fft.next_fast_len()` is a promising,
+   already-identified candidate for fixing the factorization sensitivity
+   directly, but padding correctness (keeping `_channelize_once`'s
+   exact-multiple-of-`num_channels` requirement, and not silently
+   changing what "one period" means to the dispersion FFT's implicit
+   circular convolution) needs real validation — not implemented, left
+   for a future session if multi-second pulsar periods become a real
+   requirement.
 9. ~~Minimize custom numba/RNG code where the per-tick budget doesn't
    require it~~ **Done this session for noise and the pulsar's wideband
    carrier** (see the Noise and Pulsed sources sections, and bug #16 for

@@ -209,6 +209,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
+import scipy.fft
 from numba import njit, prange
 
 from ska_low_station_beam_simulator.common import (
@@ -227,19 +228,19 @@ GOLDEN = np.uint64(0x9E3779B97F4A7C15)
 
 DEFAULT_N_TILES = 256
 
+# Worker count for scipy.fft's multi-threaded FFT/IFFT calls in
+# build_pulsar_template/_channelize_once (ONE-TIME construction, not
+# per-tick). Benchmarked: no further benefit past 8 workers (bandwidth-
+# bound at these array sizes) -- also matches this project's ~8-core/pod
+# target, so this doesn't ask for more than a real deployment would have
+# free during startup anyway.
+PULSAR_FFT_WORKERS = 8
+
 # Dispersion constant D (Lorimer & Kramer 2004/2006, eq. 5.1/5.21):
 #   t_DM[s] = D * DM[pc cm^-3] / f[MHz]^2
 # Cross-validated in tests/test_direct_synthesis.py against PsrSigSim's DM_K = 1/2.41e-4 = 4149.38
 # (same standard constant, matches to within literature-typical precision).
 DISPERSION_CONST_S_MHZ2_PER_DM = 4148.808
-
-# common.py's BASE_FREQ_HZ is an explicit placeholder (0.0) pending ICD
-# confirmation — dispersion delay diverges as f -> 0, so a pulsed source
-# needs a real band-start frequency to be physically meaningful (enforced
-# in DirectSynthesisStreamer.__init__). Default to a plausible SKA-Low
-# value for pulsar-only standalone use (e.g. build_pulsar_template calls
-# in tests); override via base_freq_hz for real use.
-DEFAULT_PULSAR_BASE_FREQ_HZ = 50e6  # 50 MHz, illustrative SKA-Low low-band edge
 
 # The pulsar's intrinsic "sky carrier" seed -- shared by EVERY station
 # simulating this pulsar (see module docstring). NEVER derive this from
@@ -256,6 +257,53 @@ DEFAULT_SKY_SEED = 0x5AB1E5EED
 
 @njit(cache=True)
 def _splitmix64_hash(seed, index):
+    """Deterministic (seed, index) -> uint64 hash, used ONLY to pick each
+    tick's noise tile index (`generate_next_tick`: `_splitmix64_hash(seed,
+    tick_index) % n_tiles`) -- not a statistical distribution, just a
+    well-distributed integer.
+
+    WHY NOT JUST DRAW FROM A NUMPY RNG, e.g. `Generator(PCG64(seed))
+    .integers(0, n_tiles)`: a numpy Generator is STATEFUL and
+    SEQUENTIAL -- each call advances it, so the value you get for "tick
+    N" depends on how many times the generator has already been called,
+    not on N itself. That's fine for the noise tile BANK's own content
+    (fill_noise_bank generates it all in one sequential pass, once, and
+    never needs to reproduce a specific earlier draw in isolation) but
+    wrong for tile SELECTION, which must be a pure function of tick index
+    alone: `ScanRunner`/tests can and do call `generate_next_tick` with
+    the SAME `t` twice and require byte-identical output (see
+    test_tile_bank_determinism) -- a stateful sequential generator would
+    advance on the second call and pick a DIFFERENT tile. This function
+    gives that "pure function of an arbitrary index" property directly,
+    with no state to track across calls.
+
+    WHY NOT `numpy.random.Philox` specifically -- it's the one numpy
+    BitGenerator that actually supports exactly this via an explicit
+    `counter=` constructor argument, so it's the more obvious
+    off-the-shelf fit than PCG64. Two reasons it's still not used here:
+    (1) constructing a fresh `Philox(key=seed, counter=tick_index)` +
+    `Generator` PER TICK measured ~12.7us/call, vs. ~0.13us/call for this
+    numba-jitted hash -- ~100x slower for work this function reduces to
+    a handful of integer ops (Philox's per-call cost is Python/pybind11
+    object construction overhead, not the underlying algorithm). At 2
+    pols/tick that's a ~25us/tick difference either way is small against
+    the 2621us budget, but there's no correctness or simplicity upside to
+    spending it. (2) Philox is built to produce full statistical
+    distributions (uniform floats, normals, etc.) at cryptographic-ish
+    quality; picking one of `n_tiles` tiles doesn't need that rigor, just
+    a well-distributed integer -- confirmed statistically sound here via
+    a 200-seed sweep whose mean first-repeat-tick matches the
+    birthday-paradox prediction (~1.25*sqrt(n_tiles)) closely (see the
+    Noise section in CLAUDE.md).
+
+    Verified NOT worth removing the @njit here either, even though this
+    is called only from plain Python (`generate_next_tick`, not from
+    inside another numba kernel): benchmarked at ~25x faster than the
+    equivalent plain-Python/numpy-scalar version (0.13us vs. 3.3us/call)
+    -- numba compiles the whole function to one native routine, while
+    plain Python pays per-operation overhead for each `np.uint64(...)`
+    scalar op in the body.
+    """
     x = (np.uint64(seed) ^ (np.uint64(index) * GOLDEN)) & MASK64
     x = (x + GOLDEN) & MASK64
     z = x
@@ -422,7 +470,7 @@ def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_r
     return env * g
 
 
-def _channelize_once(v: np.ndarray, num_channels: int) -> np.ndarray:
+def _channelize_once(v: np.ndarray, num_channels: int, workers: int = PULSAR_FFT_WORKERS) -> np.ndarray:
     """One-shot FFT channelization of a complex 1D array of length
     n = k*num_channels into (k, num_channels), EXTERNAL ascending-
     channel-id order (channel c's center frequency is
@@ -437,11 +485,18 @@ def _channelize_once(v: np.ndarray, num_channels: int) -> np.ndarray:
     overlap=0 and step==fft_len, WidebandChannelizer's sliding-window
     approach is exactly equivalent to a reshape (no windows actually
     slide past each other), which is what this does directly.
+
+    Uses scipy.fft (not numpy.fft) with workers= -- this is the batched
+    FFT along axis=-1 over many independent (num_channels,)-length rows,
+    which is embarrassingly parallel across rows and benchmarked ~4-5x
+    faster with scipy.fft's multi-threading than numpy.fft's
+    single-threaded equivalent (e.g. 0.14s -> 0.03s at a 100ms pulsar
+    period, 448 channels) -- see CLAUDE.md's Benchmarking section.
     """
     n_out = v.shape[0] // num_channels
     v = v[: n_out * num_channels]
     windows = v.reshape(n_out, num_channels)
-    spectra = np.fft.fft(windows, axis=-1)  # natural FFT bin order
+    spectra = scipy.fft.fft(windows, axis=-1, workers=workers)  # natural FFT bin order
     natural_to_external = np.argsort(np.fft.fftshift(np.arange(num_channels)))
     external = np.empty_like(spectra)
     external[:, natural_to_external] = spectra
@@ -459,9 +514,10 @@ def build_pulsar_template(
     dm_pc_cm3: float,
     sky_seed: int = DEFAULT_SKY_SEED,
 ):
-    """ONE-TIME, offline construction (plain numpy -- no per-tick budget
-    applies here, so a real FFT is fine, unlike the hot path). Generates
-    the shared wideband pulse train, applies the coherent dispersion
+    """ONE-TIME, offline construction (numpy + scipy.fft -- no per-tick
+    budget applies here, so a real, multi-threaded FFT is fine, unlike
+    the hot path). Generates the shared wideband pulse train, applies the
+    coherent dispersion
     transfer function directly to its full complex FFT (capturing
     intra-channel smear as an emergent property of the full wideband
     frequency resolution), then channelizes via _channelize_once to
@@ -491,8 +547,15 @@ def build_pulsar_template(
     # complex after this (dispersion breaks the real signal's Hermitian
     # symmetry) -- expected, not a bug, and what gives the template real
     # carrier phase.
-    V = np.fft.fft(v)
-    u = np.fft.fftfreq(n_wide, d=1.0 / wideband_rate)  # natural bin order, [-wideband_rate/2, wideband_rate/2)
+    #
+    # scipy.fft (not numpy.fft), with workers=, for these two big 1D
+    # transforms -- benchmarked ~15-20% faster than numpy.fft here
+    # (bandwidth-bound at this size, so multi-threading helps less than
+    # for _channelize_once's batched small FFTs above, but it's free and
+    # numerically identical -- verified via np.allclose against
+    # numpy.fft's output before adopting this).
+    V = scipy.fft.fft(v, workers=PULSAR_FFT_WORKERS)
+    u = scipy.fft.fftfreq(n_wide, d=1.0 / wideband_rate)  # natural bin order, [-wideband_rate/2, wideband_rate/2)
     band_center_hz = base_freq_hz + wideband_rate / 2.0
     f_offset_mhz = u / 1e6
     f0_mhz = band_center_hz / 1e6
@@ -502,7 +565,7 @@ def build_pulsar_template(
         1j * 2 * np.pi * DISPERSION_CONST_S_MHZ2_PER_DM
         / ((f_offset_mhz + f0_mhz) * f0_mhz**2) * dm_pc_cm3 * f_offset_mhz**2
     )
-    v_dispersed = np.fft.ifft(V * H)
+    v_dispersed = scipy.fft.ifft(V * H, workers=PULSAR_FFT_WORKERS)
 
     channelized = _channelize_once(v_dispersed, num_channels)  # (n_period_samples, num_channels), external order
     template = np.ascontiguousarray(channelized.T)  # (num_channels, n_period_samples)
@@ -597,10 +660,12 @@ class DirectSynthesisStreamer:
             raise ValueError(
                 f"pulsed source configured but base_freq_hz={base_freq_hz} -- "
                 f"dispersion physics diverges as frequency -> 0 (see "
-                f"dispersion_delay_s). Pass a real, positive base_freq_hz "
-                f"explicitly (e.g. DEFAULT_PULSAR_BASE_FREQ_HZ) — common.py's "
-                f"own BASE_FREQ_HZ is an unverified ICD placeholder (0.0) and "
-                f"is not usable for pulsed sources as-is."
+                f"dispersion_delay_s). The default (common.BASE_FREQ_HZ, "
+                f"confirmed as 50.78125 MHz, the lowest valid SKA-Low "
+                f"frequency) is already real and positive, so this only "
+                f"happens if base_freq_hz was explicitly overridden to "
+                f"something invalid -- pass a real, positive band-start "
+                f"frequency instead."
             )
 
         self.station = station

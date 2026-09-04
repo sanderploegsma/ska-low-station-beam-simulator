@@ -31,9 +31,24 @@ ALSO UNVERIFIED:
       available, then emits one heap per channel.
     - TAI2000 heap_counter conversion (astropy-based, with a heavily
       caveated non-astropy fallback).
-    - Whether spead2's send_heap() actually lets you set an explicit
-      heap_counter/cnt matching "packet count since SKA epoch" the way
-      this code assumes — NOT verified against spead2's real API here.
+
+VERIFIED against the installed spead2==4.4.1 API directly (not assumed):
+`send_heap(heap, cnt=..., substream_index=0, rate=-1.0)` on the concrete
+stream classes (UdpStream, BytesStream, ...) DOES take an explicit `cnt`
+override matching what SpsPacketizer.send_channel_heap already does
+below — this was previously listed here as unverified; it checks out.
+spead2 also exposes `Stream.set_cnt_sequence(next, step)` for an
+auto-incrementing counter instead, not used here since heap_counter is
+derived from heap_start_time per heap, and `send_heaps`/`HeapReference`
+for batched sends (also not used here — heaps are sent one at a time via
+sender_loop). Note spead2.send.BytesStream captures only the raw
+SPEAD-protocol bytes (`getvalue() -> bytes`, no Ethernet/IP/UDP framing,
+no pcap headers) — it is NOT a pcap file on its own; spead2 has no pcap
+*writer* at all (only `recv.Stream.add_udp_pcap_file_reader` on the
+receive side, backed by the bundled libpcap). Producing an actual pcap
+for testing (e.g. against that reader, or an external unpacker) means
+wrapping BytesStream's output in real UDP/IP/(Ethernet) framing and pcap
+record headers yourself.
 """
 
 from __future__ import annotations
@@ -58,7 +73,19 @@ log = logging.getLogger("cbf_sim")
 
 CHANNEL_WIDTH_HZ = 781_250.0  # per SPS-CBF ICD coarse channel spacing — CONFIRM
 NUM_CHANNELS = 96  # 96 * 781.25kHz ≈ 75 MHz, per your requirement
-BASE_FREQ_HZ = 0.0  # PLACEHOLDER — real band start frequency, get from ICD
+
+# CONFIRMED: the lowest valid frequency for the SKA-Low telescope is
+# 50.78125 MHz, which is coarse channel ID 65 in the ICD's GLOBAL channel
+# numbering (65 * CHANNEL_WIDTH_HZ = 50,781,250 Hz exactly — no rounding).
+# This is the frequency of LOCAL channel 0 for a station simulating the
+# band's bottom edge; StationConfig.first_channel_id (65 by default, see
+# below) is what maps that local channel 0 onto the correct GLOBAL
+# channel ID 65 in the wire-packed channel_info. No longer a placeholder
+# -- was 0.0 pending this confirmation; that made any pulsed source
+# configured through simulator.py's StartScan (which never overrode
+# base_freq_hz) fail outright, since DirectSynthesisStreamer requires
+# base_freq_hz > 0 for pulsed sources (dispersion diverges as f -> 0).
+BASE_FREQ_HZ = 50.78125e6
 
 HEAP_LEN = 2048  # time samples per heap per channel, per ICD
 
@@ -256,7 +283,12 @@ class StationConfig:
     substation_id: int
     subarray_id: int
     beam_id: int
-    first_channel_id: int = 0
+    # 65 = the confirmed GLOBAL coarse channel ID of BASE_FREQ_HZ
+    # (50.78125 MHz, the lowest valid SKA-Low frequency) — the right
+    # default for a station simulating the band's bottom edge, whose
+    # local channel 0 corresponds to that global channel. Override for a
+    # station covering a different sub-band.
+    first_channel_id: int = 65
     scan_id: int = 0
 
 
@@ -384,22 +416,38 @@ def quantize_8bit(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 class SpsPacketizer:
-    def __init__(self, dest_ip: str, dest_port: int, station: StationConfig):
+    def __init__(
+        self,
+        station: StationConfig,
+        dest_ip: Optional[str] = None,
+        dest_port: Optional[int] = None,
+        stream=None,
+    ):
+        """`stream`, if given, is used directly instead of constructing a
+        live `UdpStream` from dest_ip/dest_port — lets a caller inject a
+        `spead2.send.BytesStream` to capture raw SPEAD bytes for a heap
+        instead of actually sending it (see generate_test_pcap.py, which
+        needs exactly this to produce a test pcap: spead2 has no pcap
+        writer of its own, so the raw bytes have to be captured here and
+        wrapped in real network/pcap framing separately)."""
         import spead2
         import spead2.send
 
         self.station = station
-        config = spead2.send.StreamConfig(rate=0)
-        self.stream = spead2.send.UdpStream(
-            spead2.ThreadPool(), [(dest_ip, dest_port)], config
-        )
+        if stream is not None:
+            self.stream = stream
+        else:
+            config = spead2.send.StreamConfig(rate=0)
+            self.stream = spead2.send.UdpStream(
+                spead2.ThreadPool(), [(dest_ip, dest_port)], config
+            )
         self.item_group = spead2.send.ItemGroup()
 
         # Standard SPEAD immediate items — IDs per the diagram (0x0001,
         # 0x0004 match SPEAD's own heap_cnt/payload_length convention).
-        # NOTE: whether spead2's Python API lets you set an explicit
-        # heap_counter/cnt value the way this assumes is NOT verified —
-        # check spead2.send documentation/source before trusting this.
+        # send_channel_heap's cnt=heap_counter override below is VERIFIED
+        # against spead2==4.4.1's actual API (see module docstring) — no
+        # longer an assumption.
         self.item_group.add_item(
             0x3010, "scan_id", "scan identifier", shape=(), format=[("u", 32)]
         )
@@ -433,10 +481,25 @@ class SpsPacketizer:
         h_i8, h_q8 = quantize_8bit(heap.h_samples)
         payload = build_heap_payload_bytes(v_i8, v_q8, h_i8, h_q8)
 
+        # "packet count since SKA epoch" -- count of HEAP_LEN-sample
+        # BLOCKS (BLOCK_DURATION_S each) since epoch, NOT a count of
+        # individual samples. A real, previously-undetected bug lived
+        # here: multiplying by CHANNEL_WIDTH_HZ (the SAMPLE rate) instead
+        # of dividing by BLOCK_DURATION_S (the correct HEAP rate) inflated
+        # this by a factor of HEAP_LEN (2048x) -- for any current-era
+        # timestamp that overflows spead2's actual 40-bit cnt limit
+        # (confirmed by probing spead2==4.4.1 directly: cnt values up to
+        # 2**40-1 are accepted, 2**48-1 and above raise OSError), making
+        # every real send_channel_heap() call fail outright. Caught only
+        # by actually exercising this path end-to-end for the first time
+        # (generate_test_pcap.py) -- spead2/SpsPacketizer are explicitly
+        # not required to run this project's test suite (see Setup in
+        # CLAUDE.md), so this had never been exercised before. Fixed
+        # formula keeps heap_counter comfortably within 40 bits until
+        # roughly year 2091.
         heap_counter = int(
-            round(unix_to_tai2000_seconds(heap.heap_start_time) * CHANNEL_WIDTH_HZ)
-        )  # "packet count since SKA epoch" — count of HEAP_LEN-sample
-        # intervals since epoch; verify this definition against the ICD
+            round(unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S)
+        )
 
         self.item_group["scan_id"].value = self.station.scan_id
         self.item_group["channel_info"].value = pack_channel_info(
@@ -450,10 +513,8 @@ class SpsPacketizer:
         self.item_group["payload_offset"].value = 0
         self.item_group["payload"].value = np.frombuffer(payload, dtype=np.uint8)
 
-        # heap_cnt override: API SHAPE ASSUMED, NOT VERIFIED — spead2 may
-        # require this differently (e.g. via a separate stream-level
-        # counter, or not support explicit override at all in the
-        # high-level send API).
+        # cnt= override VERIFIED against spead2==4.4.1's real send_heap
+        # signature (see module docstring) -- no longer an assumption.
         self.stream.send_heap(self.item_group.get_heap(), cnt=heap_counter)
 
 

@@ -134,7 +134,7 @@ def test_streamer_rejects_pulsed_without_delay_feed():
             ],
             obs_time_ref=0.0,
             num_channels=32,
-            base_freq_hz=sim.DEFAULT_PULSAR_BASE_FREQ_HZ,
+            base_freq_hz=sim.BASE_FREQ_HZ,
         )
     except ValueError as exc:
         assert "delay_feed" in str(exc)
@@ -196,8 +196,8 @@ def test_two_sources_with_different_delay_feeds_diverge():
     known_tau_ns = 5000.0
     feed_b.update(_poly(start_validity_sec=0.0, xypol_coeffs_ns=[known_tau_ns]))
 
-    freq_a = 10 * CHANNEL_WIDTH_HZ + 150_000.0
-    freq_b = 20 * CHANNEL_WIDTH_HZ + 150_000.0
+    freq_a = sim.BASE_FREQ_HZ + 10 * CHANNEL_WIDTH_HZ + 150_000.0
+    freq_b = sim.BASE_FREQ_HZ + 20 * CHANNEL_WIDTH_HZ + 150_000.0
 
     streamer = sim.DirectSynthesisStreamer(
         station=station,

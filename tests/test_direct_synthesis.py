@@ -53,7 +53,7 @@ def station():
 
 
 def test_tone_channel_placement():
-    test_freq = 42 * CHANNEL_WIDTH_HZ + 150_000.0  # off-center within channel 42
+    test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0  # off-center within channel 42
     zero_coeffs = np.array([0.0], dtype=np.float64)
     ch_idx, _ = sim.synth_tone_channel(
         test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, zero_coeffs,
@@ -63,7 +63,7 @@ def test_tone_channel_placement():
 
 
 def test_tone_zero_delay_accuracy():
-    test_freq = 42 * CHANNEL_WIDTH_HZ + 150_000.0
+    test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0
     zero_coeffs = np.array([0.0], dtype=np.float64)
     _, samples = sim.synth_tone_channel(
         test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, zero_coeffs,
@@ -79,7 +79,7 @@ def test_tone_delay_as_phase_accuracy():
     """Delay applied as a continuous phase term must be EXACT for a
     monochromatic tone -- not an approximation of a coarse/fine sample
     split (see direct_synthesis.py's TONE section)."""
-    test_freq = 42 * CHANNEL_WIDTH_HZ + 150_000.0
+    test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0
     residual = test_freq - (BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ)
     t = np.arange(2048) / SAMPLE_RATE_PER_CHANNEL
     expected = np.exp(1j * 2 * np.pi * residual * t)
@@ -187,7 +187,7 @@ def test_pulsar_channelize_once_channel_mapping():
     rather than trusting the FFT-bin relabeling logic by inspection."""
     num_channels = 32
     chw = CHANNEL_WIDTH_HZ
-    base_f = sim.DEFAULT_PULSAR_BASE_FREQ_HZ
+    base_f = sim.BASE_FREQ_HZ
     wideband_rate = num_channels * chw
     n_wide = 256 * num_channels
     test_channel = 7
@@ -236,7 +236,7 @@ def pulsar_streamer(station):
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
-        base_freq_hz=sim.DEFAULT_PULSAR_BASE_FREQ_HZ,
+        base_freq_hz=sim.BASE_FREQ_HZ,
     )
 
 
@@ -276,7 +276,7 @@ def test_pulsar_cross_station_coherence_after_delay_compensation(pulsar_streamer
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
-        base_freq_hz=sim.DEFAULT_PULSAR_BASE_FREQ_HZ,
+        base_freq_hz=sim.BASE_FREQ_HZ,
     )
 
     out_b = pulsar_streamer_b.generate_next_tick(OBS_TIME, n)["V"]

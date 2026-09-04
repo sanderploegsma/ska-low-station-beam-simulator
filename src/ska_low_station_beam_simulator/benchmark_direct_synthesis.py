@@ -61,9 +61,9 @@ def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
     )
     # Offset from base_freq_hz, NOT absolute -- the streamer's channel
     # mapping is round((freq_hz - base_freq_hz) / channel_width_hz), and
-    # this benchmark uses DEFAULT_PULSAR_BASE_FREQ_HZ (50MHz) as the band
-    # start, not 0, since pulsed sources require a nonzero base_freq_hz.
-    tone_freq = sim.DEFAULT_PULSAR_BASE_FREQ_HZ + 20 * sim.CHANNEL_WIDTH_HZ + 150_000.0
+    # this benchmark uses the default BASE_FREQ_HZ (the confirmed
+    # 50.78125MHz lowest valid SKA-Low frequency) as the band start.
+    tone_freq = sim.BASE_FREQ_HZ + 20 * sim.CHANNEL_WIDTH_HZ + 150_000.0
     return sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
@@ -76,7 +76,6 @@ def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
         noise_cfg={"std": 0.05, "seed": 7},
         obs_time_ref=1_800_000_000.0,
         num_channels=num_channels,
-        base_freq_hz=sim.DEFAULT_PULSAR_BASE_FREQ_HZ,  # required for pulsed sources
         n_tiles=N_TILES,
     )
 
@@ -184,12 +183,26 @@ print(f"noise tile-bank memory (both pols): {streamer.bank_memory_bytes()/1e9:.3
 #
 # Kept deliberately ISOLATED (noise-only sweep, then pulsar-only sweep)
 # rather than combined at the largest sizes of both at once: a combined
-# n_tiles=1024 + period_s=1.0 run was tried and used enough transient
-# memory (large retained noise banks + a large pulsar wideband/FFT
-# working set, concurrently) to threaten node stability on this shared
-# host -- caught by a 50GB `ulimit -v` safety net, not by reasoning about
-# it beforehand. Revisit together only under a memory budget, not just a
-# time budget, if a real deployment actually needs both large at once.
+# n_tiles=1024 + a long pulsar period run was tried and used enough
+# transient memory (large retained noise banks + a large pulsar wideband/
+# FFT working set, concurrently) to threaten node stability on this
+# shared host -- caught by a `ulimit -v` safety net, not by reasoning
+# about it beforehand. Revisit together only under a memory budget, not
+# just a time budget, if a real deployment actually needs both large at
+# once.
+#
+# The pulsar sweep below is deliberately capped at 300ms, NOT because
+# longer periods are uninteresting but because a period around 1s was
+# separately confirmed to risk node memory (see CLAUDE.md's Pulsed
+# sources section) -- re-test longer periods only under an explicit
+# `ulimit -v` safety net, never bare on a shared host. 50ms is included
+# ON PURPOSE, not swept past: `build_pulsar_template`'s cost depends far
+# more on whether the wideband array length happens to factor into small
+# primes than on period length itself -- 50ms's array has a large prime
+# factor (19531) and measures ~3-6x slower than the better-factored
+# 100/200/300ms points despite being the SMALLEST array here. This is a
+# permanent regression check for that finding, not an oversight if the
+# ordering below looks non-monotonic.
 print("=" * 70)
 print("ONE-TIME CONSTRUCTION BUDGET (target 10s, hard limit 30s), 448 channels")
 print("=" * 70)
@@ -205,14 +218,17 @@ for n_tiles_check in (256, 512, 1024):
     print(f"n_tiles={n_tiles_check:>4}  bank_mem={mem_gb:6.2f}GB  build={build_s:7.3f}s  [{flag}]")
 
 print("\n-- pulsar wideband sky-carrier + dispersion + channelize only (build_pulsar_template) --")
-for period_s in (0.01, 0.1, 1.0):
+for period_s in (0.01, 0.05, 0.1, 0.2, 0.3):
+    n_wide_check = 448 * int(round(period_s * sim.CHANNEL_WIDTH_HZ))
+    fast = sim.scipy.fft.next_fast_len(n_wide_check) == n_wide_check
     t0 = time.perf_counter()
     sim.build_pulsar_template(
-        448, sim.CHANNEL_WIDTH_HZ, sim.DEFAULT_PULSAR_BASE_FREQ_HZ, sim.CHANNEL_WIDTH_HZ,
+        448, sim.CHANNEL_WIDTH_HZ, sim.BASE_FREQ_HZ, sim.CHANNEL_WIDTH_HZ,
         period_s, period_s * 0.05, 1.0, PULSAR_DM,
     )
     build_s = time.perf_counter() - t0
     flag = "OK" if build_s <= 10.0 else ("OVER 10s TARGET" if build_s <= 30.0 else "OVER 30s HARD LIMIT")
+    print(f"  (n_wide={n_wide_check}, fast-factored={fast})", end="  ")
     print(f"period={period_s*1000:>6.0f}ms  build={build_s:7.3f}s  [{flag}]")
 
 # %%
