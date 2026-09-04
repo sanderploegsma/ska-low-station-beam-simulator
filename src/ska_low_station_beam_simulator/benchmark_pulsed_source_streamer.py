@@ -1,15 +1,17 @@
 # %% [markdown]
-# # Benchmark: `PulsedSourceStreamer` (pre-generated, dispersion-aware pulsar)
+# # Benchmark: `PulsedSourceStreamer` (coherent, dispersion-aware pulsar)
 #
 # Two costs to measure, same split as benchmark_tiled_noise_streamer.py:
-#   (a) ONE-TIME build cost: build_pulsar_template's cost scales with
-#       n_subfreq (the intra-channel-smear sub-sampling resolution) and
-#       channel count -- how expensive is getting this right?
-#   (b) STEADY-STATE per-tick cost: add_pulsar_tick does a per-sample
-#       delay-polynomial eval (like tone) plus a template lookup +
-#       multiply-add per channel -- more work than the noise tile bank's
-#       plain memcopy. How many threads does it need to clear budget at
-#       448 channels?
+#   (a) ONE-TIME build cost: build_pulsar_template is now plain numpy
+#       (wideband generate + FFT-based coherent dispersion +
+#       WidebandChannelizer) -- not numba, so thread count isn't the
+#       lever here; period_s and channel count are, since compute scales
+#       with the wideband FFT length (num_channels * n_period_samples).
+#   (b) STEADY-STATE per-tick cost: add_pulsar_tick is now simpler than
+#       the earlier Taylor-correction version -- a per-sample delay-poly
+#       eval (like tone) plus an EXACT phase-rotation multiply-add per
+#       channel, no derivative lookup. How many threads does it need to
+#       clear budget at 448 channels?
 
 # %%
 import statistics
@@ -45,13 +47,12 @@ def build_station(station_id=1):
     )
 
 
-def build_streamer(n_subfreq, num_channels=NUM_CHANNELS):
+def build_streamer(period_s=PERIOD_S, num_channels=NUM_CHANNELS):
     return pulsar.PulsedSourceStreamer(
         station=build_station(),
-        source_cfgs=[{"kind": "pulsed", "period_s": PERIOD_S, "width_s": WIDTH_S, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
+        source_cfgs=[{"kind": "pulsed", "period_s": period_s, "width_s": period_s * 0.05, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
         obs_time_ref=1_800_000_000.0,
         num_channels=num_channels,
-        n_subfreq=n_subfreq,
     )
 
 
@@ -75,37 +76,27 @@ def bench_ticks(streamer, n_warmup=5, n_measured=30):
 
 # %%
 print("=" * 70)
-print(f"ONE-TIME BUILD COST vs n_subfreq, {NUM_CHANNELS} channels, 8 threads")
-print("(8 threads = plausible per-pod steady-state budget)")
+print(f"ONE-TIME BUILD COST vs PERIOD, {NUM_CHANNELS} channels")
+print("(plain numpy: wideband generate + FFT dispersion + channelize --")
+print(" not numba, so thread count isn't the lever here; period is)")
 print("=" * 70)
-numba.set_num_threads(8)
-for n_subfreq in [1, 8, 16, 32, 64, 128, 256]:
+for period_s in [0.001, 0.01, 0.1, 1.0]:
     t0 = time.perf_counter()
-    streamer = build_streamer(n_subfreq)
+    streamer = build_streamer(period_s)
     build_s = time.perf_counter() - t0
-    print(f"n_subfreq={n_subfreq:>4}  build={build_s:7.3f}s")
-
-# %%
-print()
-print("=" * 70)
-print(f"ONE-TIME BUILD COST vs THREAD COUNT, {NUM_CHANNELS} channels, n_subfreq=64 fixed")
-print("=" * 70)
-for n_threads in [1, 2, 4, 8, 16, 24, 32, 48]:
-    numba.set_num_threads(n_threads)
-    t0 = time.perf_counter()
-    streamer = build_streamer(64)
-    build_s = time.perf_counter() - t0
-    print(f"threads={n_threads:>3}  build={build_s:7.3f}s")
+    template, _, n_period = streamer._pulsars[0]
+    mem_mb = template.nbytes / 1e6
+    print(f"period={period_s*1000:>7.1f}ms  n_period_samples={n_period:>8}  build={build_s:7.3f}s  template_mem={mem_mb:8.2f}MB")
 
 # %%
 print()
 print("=" * 70)
 print(f"STEADY-STATE PER-TICK COST vs THREAD COUNT, {NUM_CHANNELS} channels")
-print(f"budget={BUDGET_MS:.3f}ms/tick -- n_subfreq=64 (build cost excluded from this timing)")
+print(f"budget={BUDGET_MS:.3f}ms/tick -- period={PERIOD_S*1000:.0f}ms (build cost excluded from this timing)")
 print("=" * 70)
 for n_threads in [1, 2, 4, 8, 16, 24, 32, 48]:
     numba.set_num_threads(n_threads)
-    streamer = build_streamer(64)
+    streamer = build_streamer()
     stats = bench_ticks(streamer)
     pct = stats["mean_ms"] / BUDGET_MS * 100
     flag = "OK" if stats["mean_ms"] <= BUDGET_MS else "OVER"
@@ -120,10 +111,10 @@ print("=" * 70)
 print(f"TARGET CHECK: ~8 CPU cores/pod at {NUM_CHANNELS} channels")
 print("=" * 70)
 numba.set_num_threads(8)
-streamer = build_streamer(64)
+streamer = build_streamer()
 stats = bench_ticks(streamer, n_warmup=10, n_measured=50)
 pct = stats["mean_ms"] / BUDGET_MS * 100
 print(
-    f"8 threads, n_subfreq=64, steady state: mean={stats['mean_ms']:.4f}ms "
+    f"8 threads, steady state: mean={stats['mean_ms']:.4f}ms "
     f"({pct:.1f}% of budget), max={stats['max_ms']:.4f}ms"
 )

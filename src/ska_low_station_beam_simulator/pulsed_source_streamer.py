@@ -10,80 +10,80 @@ THE KEY DIFFERENCE FROM THE NOISE TILE BANK: a pulsar is genuinely
 periodic. Replaying one precomputed period isn't a fidelity compromise
 the way replaying a finite bank of "noise" tiles is (see
 tiled_noise_streamer.py) — a real pulsar's profile repeats, to the
-precision this simulator needs, exactly every rotation period. So there
-is no birthday-paradox tradeoff here, and no correctness caveat about
-long-integration statistics: periodicity is the ground truth, not an
-artifact.
+precision this simulator needs, exactly every rotation period. No
+birthday-paradox tradeoff, no long-integration correctness caveat:
+periodicity here is ground truth, not an artifact.
 
-WHAT STILL HAS TO BE HANDLED, and is the actual new content of this
-module: CBF's delay-tracking has to be exercised against a
-CONTINUOUSLY-CHANGING geometric delay, tick by tick (that's the point of
-this whole simulator). A single precomputed-and-replayed snapshot is
-frozen at whatever delay was baked in at generation time. So generation
-is split into two genuinely different pieces:
+THIS MODULE WENT THROUGH THREE DESIGNS before arriving at the current
+one, and the history matters for anyone tempted to "simplify" it back:
 
-  1. DISPERSION (DM) delay: a FIXED, static property of this simulated
-     pulsar (frequency-dependent, oc 1/f^2 — see dispersion_delay_s) —
-     baked into the per-channel template ONCE, at construction. This is
-     why each channel gets its OWN one-period template: channel c's
-     copy of the pulse is the same intrinsic (achromatic) profile,
-     shifted in time by that channel's own dispersion delay relative to
-     the top of the band.
-  2. GEOMETRIC (tracking) delay: changes every tick, and is what CBF's
-     delay-poly is actually being tested against. Applied per-tick on
-     top of the replayed template.
+  v1 (WRONG): each channel = one constant DM delay, evaluated at that
+  channel's center frequency, applied to a real-valued achromatic
+  envelope; per-tick geometric delay applied as a first-order Taylor
+  correction using a precomputed derivative. Two problems, both found by
+  actually building and numerically checking, not by reasoning about it:
 
-THE GEOMETRIC-DELAY CORRECTION IS AN APPROXIMATION, and unlike tone's
-"delay as phase" trick (exact for a monochromatic signal), it is NOT the
-same trick reused verbatim — an earlier version of this design assumed
-it would be, and that assumption was wrong on inspection. Pulses are
-represented here as real-valued, achromatic amplitude envelopes (no
-carrier/residual-frequency term at all — same convention
-wideband_streamer.py's rectangular PulsedSource already uses: pulse
-content is real, cast to complex with zero imaginary part). A phase
-multiply on a real, zero-frequency baseband signal does not correspond
-to a time shift — there is no carrier for the phase to act on. The
-correct per-tick correction for a REAL envelope is a first-order Taylor
-expansion in the (small) geometric delay:
+  v2 (fixed intra-channel smear, still broken for beamforming): a
+  channel isn't one frequency, it's a ~781kHz-wide passband, and at
+  SKA-Low frequencies even DM=2 pc/cm^3 smears the dispersion curve
+  across tens of thousands of channel-widths at the bottom of the band —
+  a real, well-known low-frequency effect, not a bug. v2 fixed this by
+  averaging many shifted copies of the profile across each channel's own
+  passband. But v2 was STILL real-valued (no carrier), which turns out
+  to break something bigger: CBF's beamformer coherently combines
+  stations by applying a complex phase rotation to already-channelized
+  data — physically valid only because a real channelizer inherently
+  produces complex baseband output with a genuine carrier phase tied to
+  the channel's true center frequency. A real-valued, carrier-free
+  representation has no phase for that rotation to act on, so v2's
+  content could not be coherently beamformed across stations at all —
+  tone doesn't have this problem (it has a genuine residual-frequency
+  carrier by construction); v2's pulses did.
 
-    envelope(t - tau) ~= envelope(t) - tau * envelope'(t)
+  v3 (this version): generate the wideband, undispersed pulse train as
+  one real time series covering the whole band, apply the STANDARD
+  coherent-dispersion transfer function (Lorimer & Kramer 2006, eq.
+  5.21) to its real FFT, then channelize via
+  wideband_streamer.WidebandChannelizer (reused here as a legitimate
+  ONE-TIME, offline call — not a hot-path FFT, so it doesn't violate this
+  codebase's "direct synthesis, no FFT per tick" philosophy). This fixes
+  BOTH v1/v2 problems at once: intra-channel smear falls out correctly
+  as an emergent property of dispersing at full wideband FFT resolution
+  before channelizing (no averaging hack needed), and channelizing a
+  real signal via FFT inherently produces genuinely complex per-channel
+  content with real carrier phase — which is exactly what lets the
+  per-tick geometric-delay correction use tone's EXACT phase trick
+  instead of v1's Taylor approximation. The dispersion constant and
+  transfer function here were cross-validated against the NANOGrav
+  PsrSigSim package's ISM.disperse implementation (its DM_K = 1/2.41e-4
+  = 4149.38, matching this module's own constant to within standard
+  literature precision) — see this module's __main__.
 
-so each per-channel template is built alongside its own derivative
-(closed-form for a Gaussian profile), and applying a tick's geometric
-delay is one multiply-add per sample using the precomputed derivative —
-still O(1) per sample, no re-synthesis. This is valid because realistic
-geometric delays in this codebase's own test data are sub-microsecond
-(see common.DelayPolynomial usage elsewhere), utterly small relative to
-a pulse profile's own millisecond-scale timescale — see this module's
-__main__ for a numerical check of the actual error at realistic
-magnitudes, not just an assertion that it's fine.
+WHY THE "SKY CARRIER" IS SHARED ACROSS STATIONS, NOT PER-STATION —
+opposite of the rule for noise, easy to get backwards: every station in
+a real array observes the literal SAME wavefront from the same source,
+just arriving at a different time because of geometry. That's the whole
+physical basis of interferometry — coherent combination only works
+because it's genuinely the same signal, differentially delayed. So the
+wideband pulse train's random "carrier" (physically: incoherent
+broadband emission, amplitude-modulated by the pulsar's rotation — same
+model PsrSigSim's _make_amp_pulses uses) is generated from a FIXED seed
+shared by every station simulating this pulsar, never from
+station.station_id. Receiver noise is the opposite: it must be
+independently seeded per station, because each station's receiver is a
+physically separate, uncorrelated noise source. Do not "fix" one to look
+like the other.
 
-INTRA-CHANNEL DISPERSION SMEAR — an earlier version of this module
-skipped this (treated each channel as seeing one constant DM delay,
-evaluated only at the channel center frequency) and that turned out to
-be badly wrong at this project's actual band: at SKA-Low frequencies
-(tens to a few hundred MHz) and 781.25kHz channels, even the smallest
-realistic pulsar DM (~1-2 pc/cm^3) smears the dispersion curve across
-many channel-widths within a SINGLE channel — this is a well-known real
-effect at low radio frequencies (it's why real low-frequency pulsar
-backends need much finer channelization or coherent dedispersion), not
-a bug in this simulator. See build_pulsar_template's docstring for the
-fix: each channel's template is built as the AVERAGE of many shifted
-copies of the intrinsic profile, sampled across that channel's own
-passband, which numerically converges to the same result a proper
-wideband-generate + apply-dispersion-in-frequency-domain +
-channelize-via-FFT pipeline would produce, for an idealized achromatic
-source. Done this way instead of literally reusing
-wideband_streamer.WidebandChannelizer specifically to avoid depending on
-that module's own FFT-bin/permutation conventions — this stays a
-self-contained, independently-verifiable calculation, matching this
-codebase's general preference for direct/closed-form approaches. See
-this module's __main__ for a convergence check (does the answer stop
-changing as the number of sub-samples grows) and a check that it reduces
-to the old single-delay approximation when smear is genuinely small.
+WHAT THIS DOES NOT MODEL: pulse-to-pulse jitter, scintillation, nulling,
+profile evolution with frequency, or realistic flux/SNR calibration
+against the receiver noise floor — the last of these matters if the
+downstream use case is testing whether PSS/PST can actually detect the
+injected pulsar as a candidate, not just testing delay-tracking. See
+CLAUDE.md.
 
-REUSES direct_synthesis.py's tone/noise kernels and eval_delay_poly_ns
-rather than re-deriving them, same rationale as tiled_noise_streamer.py.
+REUSES direct_synthesis.py's tone/noise kernels and
+wideband_streamer.WidebandChannelizer rather than re-deriving them, same
+rationale as tiled_noise_streamer.py.
 """
 
 from __future__ import annotations
@@ -103,13 +103,17 @@ from ska_low_station_beam_simulator.common import (
     log,
 )
 from ska_low_station_beam_simulator.direct_synthesis import (
+    _gaussian_pair,
     eval_delay_poly_ns,
     synth_noise_all_channels_into,
     synth_tone_channel,
 )
+from ska_low_station_beam_simulator.wideband_streamer import WidebandChannelizer
 
-# Dispersion constant D (Lorimer & Kramer 2004, eq. 5.1):
+# Dispersion constant D (Lorimer & Kramer 2004/2006, eq. 5.1/5.21):
 #   t_DM[s] = D * DM[pc cm^-3] / f[MHz]^2
+# Cross-validated in __main__ against PsrSigSim's DM_K = 1/2.41e-4 = 4149.38
+# (same standard constant, matches to within literature-typical precision).
 DISPERSION_CONST_S_MHZ2_PER_DM = 4148.808
 
 # common.py's BASE_FREQ_HZ is an explicit placeholder (0.0) pending ICD
@@ -118,6 +122,11 @@ DISPERSION_CONST_S_MHZ2_PER_DM = 4148.808
 # to a plausible SKA-Low-band value; override via base_freq_hz for real use.
 DEFAULT_PULSAR_BASE_FREQ_HZ = 50e6  # 50 MHz, illustrative SKA-Low low-band edge
 
+# The pulsar's intrinsic "sky carrier" seed -- shared by EVERY station
+# simulating this pulsar (see module docstring). NEVER derive this from
+# station.station_id.
+DEFAULT_SKY_SEED = 0x5AB1E5EED
+
 
 def dispersion_delay_s(freq_hz: float, dm_pc_cm3: float) -> float:
     freq_mhz = freq_hz / 1e6
@@ -125,85 +134,128 @@ def dispersion_delay_s(freq_hz: float, dm_pc_cm3: float) -> float:
 
 
 @njit(cache=True)
-def _gaussian_envelope_and_deriv(t, peak, period_s, sigma, amplitude):
+def _real_gaussian(seed, index):
+    g_real, _ = _gaussian_pair(seed, index)
+    return g_real
+
+
+@njit(cache=True)
+def _gaussian_envelope(t, peak, period_s, sigma, amplitude):
     d = t - peak
     d = d - period_s * np.floor(d / period_s + 0.5)  # wrap into [-period/2, period/2)
-    val = amplitude * np.exp(-0.5 * (d / sigma) ** 2)
-    deriv = -(d / (sigma * sigma)) * val
-    return val, deriv
+    return amplitude * np.exp(-0.5 * (d / sigma) ** 2)
 
 
-@njit(parallel=True, cache=True)
-def build_pulsar_template(
-    num_channels, channel_width_hz, base_freq_hz, channel_output_rate,
-    period_s, width_s, amplitude, dm_pc_cm3, n_period_samples, n_subfreq,
-):
-    """One period's worth of this pulsar's profile, per channel, WITH
-    intra-channel dispersion smear correctly captured.
-
-    A channel is not a single frequency, it's a passband
-    [f_c - channel_width/2, f_c + channel_width/2). An idealized
-    brick-wall channelizer's output is the (frequency-weighted) INTEGRAL
-    of the true dispersion-swept signal across that passband:
-
-        channel_c(t) = (1/W) * integral_{f in passband} env(t - tau_DM(f)) df
-
-    Approximated here by averaging n_subfreq shifted copies of the
-    intrinsic profile, at frequencies sampled uniformly across the
-    channel's own passband -- this converges to the same result a
-    proper wideband-generate + apply-dispersion + FFT-channelize
-    pipeline would give for an achromatic source (see this module's
-    __main__ for a convergence check), without needing to build that
-    full pipeline. n_subfreq=1 recovers the old (wrong, except when
-    smear is negligible) single-constant-delay approximation.
-
-    Real-valued (achromatic pulse, same convention as
-    wideband_streamer.PulsedSource). Returns (template, deriv), each
-    (num_channels, n_period_samples) float64 -- the derivative is the
-    average of the M sub-frequency derivatives, valid since
-    differentiation is linear.
-    """
-    template = np.empty((num_channels, n_period_samples), dtype=np.float64)
-    deriv = np.empty((num_channels, n_period_samples), dtype=np.float64)
+@njit(cache=True)
+def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_rate, n_wide):
+    """The shared 'sky carrier': one period of a real, wideband (spans
+    the WHOLE band as a single time series), UNDISPERSED pulse train.
+    Physically: incoherent broadband radio emission (noise-like),
+    power-modulated by the pulsar's rotation -- amplitude = envelope(t)
+    * a real Gaussian draw, same model PsrSigSim's _make_amp_pulses
+    uses. Deterministic/seekable from (seed, sample index) alone, same
+    property every other kernel in this codebase relies on."""
     sigma = width_s / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # width_s = FWHM
+    peak = period_s / 2.0
+    v = np.empty(n_wide, dtype=np.float64)
+    for i in range(n_wide):
+        t = i / wideband_rate
+        env = _gaussian_envelope(t, peak, period_s, sigma, amplitude)
+        v[i] = env * _real_gaussian(seed, i)
+    return v
 
-    f_top = base_freq_hz + (num_channels - 1) * channel_width_hz
-    tau_top = DISPERSION_CONST_S_MHZ2_PER_DM * dm_pc_cm3 / (f_top / 1e6) ** 2
 
-    for c in prange(num_channels):
-        f_center = base_freq_hz + c * channel_width_hz
-        f_lo = f_center - channel_width_hz / 2.0
-        # n_subfreq points spanning the channel's own passband
-        peaks = np.empty(n_subfreq, dtype=np.float64)
-        for m in range(n_subfreq):
-            f_sub = f_lo + (m + 0.5) * channel_width_hz / n_subfreq
-            tau_dm_sub = DISPERSION_CONST_S_MHZ2_PER_DM * dm_pc_cm3 / (f_sub / 1e6) ** 2 - tau_top
-            peaks[m] = period_s / 2.0 + tau_dm_sub
+def build_pulsar_template(
+    num_channels: int,
+    channel_width_hz: float,
+    base_freq_hz: float,
+    channel_output_rate: float,
+    period_s: float,
+    width_s: float,
+    amplitude: float,
+    dm_pc_cm3: float,
+    sky_seed: int = DEFAULT_SKY_SEED,
+):
+    """ONE-TIME, offline construction (plain numpy -- no per-tick budget
+    applies here, so a real FFT is fine, unlike the hot path). Generates
+    the shared wideband pulse train, applies the coherent dispersion
+    transfer function directly to its real FFT (capturing intra-channel
+    smear as an emergent property of the full wideband frequency
+    resolution), then channelizes via WidebandChannelizer to produce
+    genuinely complex per-channel content with real carrier phase.
 
-        for i in range(n_period_samples):
-            t = i / channel_output_rate
-            val_sum = 0.0
-            deriv_sum = 0.0
-            for m in range(n_subfreq):
-                val, dv = _gaussian_envelope_and_deriv(t, peaks[m], period_s, sigma, amplitude)
-                val_sum += val
-                deriv_sum += dv
-            template[c, i] = val_sum / n_subfreq
-            deriv[c, i] = deriv_sum / n_subfreq
-    return template, deriv
+    Returns (template, n_period_samples): template is
+    (num_channels, n_period_samples) complex64, in this project's
+    EXTERNAL ascending-channel-id order (channel c's center frequency is
+    base_freq_hz + c*channel_width_hz) -- verified against
+    WidebandChannelizer's natural-bin-order output via a known-tone
+    injection check in this module's __main__, not assumed from reading
+    its permutation logic.
+    """
+    wideband_rate = num_channels * channel_width_hz
+    n_period_samples = int(round(period_s * channel_output_rate))
+    n_wide = n_period_samples * num_channels  # exact multiple of num_channels,
+    # required so WidebandChannelizer (overlap=0) doesn't silently drop a
+    # partial trailing block.
+
+    v = generate_wideband_pulse_train(sky_seed, period_s, width_s, amplitude, wideband_rate, n_wide)
+
+    # Full complex FFT, NOT rfft -- this project's own convention (see
+    # WidebandChannelizer.channel_center_frequencies) treats negative
+    # fftfreq bins as meaningful, independent channels (an IF/baseband
+    # labeling convention where base_freq_hz is an additive offset, not
+    # a strict real-signal Nyquist argument). Using rfft here originally
+    # only covered half the intended band and shifted every channel by a
+    # constant amount -- caught by the known-tone injection check below,
+    # not by inspection. v_dispersed is genuinely complex after this
+    # (dispersion breaks the real signal's Hermitian symmetry) -- that's
+    # expected, not a bug, and is what gives the template real carrier
+    # phase.
+    V = np.fft.fft(v)
+    u = np.fft.fftfreq(n_wide, d=1.0 / wideband_rate)  # natural bin order, [-wideband_rate/2, wideband_rate/2)
+    band_center_hz = base_freq_hz + wideband_rate / 2.0
+    f_offset_mhz = u / 1e6
+    f0_mhz = band_center_hz / 1e6
+    # Lorimer & Kramer 2006, eq. 5.21 -- coherent dispersion transfer
+    # function, cross-validated against PsrSigSim's ISM._disperse_baseband.
+    H = np.exp(
+        1j * 2 * np.pi * DISPERSION_CONST_S_MHZ2_PER_DM
+        / ((f_offset_mhz + f0_mhz) * f0_mhz**2) * dm_pc_cm3 * f_offset_mhz**2
+    )
+    v_dispersed = np.fft.ifft(V * H)
+
+    channelizer = WidebandChannelizer(fft_len=num_channels, overlap=0)
+    natural = channelizer.process(v_dispersed)  # (n_period_samples, num_channels), natural bin order
+    template_by_natural = np.ascontiguousarray(natural.T)  # (num_channels, n_period_samples)
+    template = np.empty_like(template_by_natural)
+    template[channelizer._natural_to_external] = template_by_natural
+    return template, n_period_samples
 
 
 @njit(parallel=True, cache=True)
 def add_pulsar_tick(
-    out, template, deriv, start_idx, n_period_samples,
+    out, template, start_idx, n_period_samples,
     delay_coeffs, poly_t_rel_start, ypol_offset_ns, is_h_pol,
-    channel_output_rate, n_samples, num_channels,
+    base_freq_hz, channel_width_hz, channel_output_rate, n_samples, num_channels,
 ):
     """Adds this tick's contribution into `out` (n_samples, num_channels
     complex128), reading the precomputed template circularly and
-    applying the per-sample first-order geometric-delay correction. Adds
-    (not writes) so this composes with noise/tone the same way tone
-    composes on top of noise in the fixed DirectSynthesisStreamer."""
+    applying the EXACT per-channel geometric-delay phase correction --
+    valid because the template is now genuinely complex/narrowband per
+    channel (see module docstring), the same reasoning that makes
+    synth_tone_channel's delay-as-phase exact. Adds (not writes) so this
+    composes with noise/tone the same way tone composes on top of noise
+    in the fixed DirectSynthesisStreamer.
+
+    Uses a phase-accumulator (NCO-style) recurrence rather than calling
+    cos/sin per (sample, channel) -- phase(c) = phase(0) - c*dphase is
+    linear in c at fixed sample, so each channel's rotation is the
+    previous one times a single fixed per-sample step, computed via one
+    complex multiply instead of two fresh transcendental calls. An
+    earlier version called cos/sin per channel directly and needed 4x
+    the threads to clear budget for exactly the reason this codebase's
+    noise kernel work already established: per-element transcendental
+    calls are the expensive part, not the arithmetic around them."""
     for i in prange(n_samples):
         idx = (start_idx + i) % n_period_samples
         t_poly = poly_t_rel_start + i / channel_output_rate
@@ -211,8 +263,14 @@ def add_pulsar_tick(
         if is_h_pol:
             tau_ns += ypol_offset_ns
         tau_s = tau_ns * 1e-9
+
+        phase0 = -2.0 * np.pi * base_freq_hz * tau_s
+        dphase = 2.0 * np.pi * channel_width_hz * tau_s
+        rot = np.cos(phase0) + 1j * np.sin(phase0)
+        step = np.cos(dphase) - 1j * np.sin(dphase)
         for c in range(num_channels):
-            out[i, c] += template[c, idx] - tau_s * deriv[c, idx]
+            out[i, c] += template[c, idx] * rot
+            rot = rot * step
 
 
 class PulsedSourceStreamer:
@@ -230,7 +288,6 @@ class PulsedSourceStreamer:
         num_channels: int = NUM_CHANNELS,
         base_freq_hz: float = DEFAULT_PULSAR_BASE_FREQ_HZ,
         channel_width_hz: float = CHANNEL_WIDTH_HZ,
-        n_subfreq: int = 64,
     ):
         for cfg in source_cfgs:
             if cfg["kind"] not in ("tone", "pulsed"):
@@ -257,13 +314,15 @@ class PulsedSourceStreamer:
         self._current_poly: Optional[DelayPolynomial] = None
         self._delay_coeffs: Optional[np.ndarray] = None
 
-        # One (template, deriv, period_s, n_period_samples) tuple per
-        # pulsed source cfg, built ONCE here — the whole point.
+        # One (template, period_s, n_period_samples) tuple per pulsed
+        # source cfg, built ONCE here -- the whole point. sky_seed is
+        # shared across all stations for the same pulsar cfg by default
+        # (see module docstring) -- override only if you specifically
+        # want two DIFFERENT (uncorrelated) pulsars, never to "vary"
+        # the same pulsar per station.
         self._pulsars = []
-        self.n_subfreq = n_subfreq
         for cfg in self._pulsed_cfgs:
-            n_period_samples = int(round(cfg["period_s"] * self.channel_output_rate))
-            template, deriv = build_pulsar_template(
+            template, n_period_samples = build_pulsar_template(
                 self.num_channels,
                 self.channel_width_hz,
                 self.base_freq_hz,
@@ -272,10 +331,9 @@ class PulsedSourceStreamer:
                 cfg["width_s"],
                 cfg.get("amplitude", 1.0),
                 cfg["dm_pc_cm3"],
-                n_period_samples,
-                self.n_subfreq,
+                cfg.get("sky_seed", DEFAULT_SKY_SEED),
             )
-            self._pulsars.append((template, deriv, cfg["period_s"], n_period_samples))
+            self._pulsars.append((template, cfg["period_s"], n_period_samples))
 
         self._out_bufs: dict[str, np.ndarray] = {}
 
@@ -323,13 +381,14 @@ class PulsedSourceStreamer:
             else:
                 out.fill(0)
 
-            for template, deriv, period_s, n_period_samples in self._pulsars:
+            for template, period_s, n_period_samples in self._pulsars:
                 phase_in_period = t_local_rel_start % period_s
                 start_idx = int(round(phase_in_period * self.channel_output_rate)) % n_period_samples
                 add_pulsar_tick(
-                    out, template, deriv, start_idx, n_period_samples,
+                    out, template, start_idx, n_period_samples,
                     self._delay_coeffs, poly_t_rel_start, poly.ypol_offset_ns, is_h_pol,
-                    self.channel_output_rate, n_samples, self.num_channels,
+                    self.base_freq_hz, self.channel_width_hz, self.channel_output_rate,
+                    n_samples, self.num_channels,
                 )
 
             for cfg in self._tone_cfgs:
@@ -355,7 +414,7 @@ class PulsedSourceStreamer:
 
 if __name__ == "__main__":
     # ============================================================
-    # CORRECTNESS / APPROXIMATION-ERROR CHECKS
+    # CORRECTNESS CHECKS
     # ============================================================
     def _fake_fetch(station_id, at_time):
         return DelayPolynomial(
@@ -365,112 +424,115 @@ if __name__ == "__main__":
 
     globals()["fetch_delay_model_from_cbf"] = _fake_fetch
 
-    NUM_CHANNELS_TEST = 448
-    DM_TEST = 2.0  # pc/cm^3 -- a low, realistic DM (nearby pulsar); even this
-    # is enough to badly smear the bottom of the SKA-Low band, see below
-    PERIOD_S = 0.1  # 100ms -- "normal" (non-millisecond) pulsar
-    WIDTH_S = 0.005  # 5ms FWHM, 5% duty cycle
+    # --- Channel-mapping ground-truth check: inject a KNOWN tone into
+    # the wideband generation step (bypassing the pulse envelope/carrier
+    # entirely) and confirm its power lands in the EXTERNAL channel index
+    # this project's own convention predicts -- same style of check
+    # direct_synthesis.py uses for synth_tone_channel, applied here to
+    # verify the natural-to-external relabeling isn't silently wrong. ---
+    NUM_CHANNELS_TEST = 32
+    CHW = CHANNEL_WIDTH_HZ
+    BASE_F = DEFAULT_PULSAR_BASE_FREQ_HZ
+    wideband_rate = NUM_CHANNELS_TEST * CHW
+    n_period_samples_test = 256
+    n_wide_test = n_period_samples_test * NUM_CHANNELS_TEST
+    test_channel = 7
+    band_center_hz_test = BASE_F + wideband_rate / 2.0
+    test_freq = BASE_F + test_channel * CHW + 0.15 * CHW  # off-center within the channel
+    f_offset_test = test_freq - band_center_hz_test  # this project's own IF/baseband
+    # convention (see WidebandChannelizer.channel_center_frequencies): fftfreq's
+    # negative bins are meaningful distinct channels, not a real-signal-Nyquist
+    # constraint -- so the injected test tone must be COMPLEX at the offset
+    # frequency, not a real cosine (a real cosine's mirror-image negative
+    # frequency component made an earlier version of this check silently
+    # pass-or-fail on the wrong bin and is why the actual rfft/irfft bug
+    # below wasn't obvious from reasoning alone).
+    t_wide = np.arange(n_wide_test) / wideband_rate
+    v_tone = np.exp(1j * 2 * np.pi * f_offset_test * t_wide)
+
+    channelizer = WidebandChannelizer(fft_len=NUM_CHANNELS_TEST, overlap=0)
+    natural = channelizer.process(v_tone)
+    template_by_natural = natural.T
+    relabeled = np.empty_like(template_by_natural)
+    relabeled[channelizer._natural_to_external] = template_by_natural
+    power_per_channel = np.mean(np.abs(relabeled) ** 2, axis=1)
+    detected_channel = int(np.argmax(power_per_channel))
+    print(
+        f"tone injected at external channel {test_channel} (freq={test_freq/1e6:.4f} MHz) "
+        f"-> detected at external channel {detected_channel}: "
+        f"{'OK' if detected_channel == test_channel else 'MISMATCH -- relabeling logic is wrong'}"
+    )
+    assert detected_channel == test_channel
+
+    # --- dispersion constant cross-check against PsrSigSim's DM_K ---
+    psrsigsim_dm_k = 1.0 / 2.41e-4
+    rel_diff = abs(DISPERSION_CONST_S_MHZ2_PER_DM - psrsigsim_dm_k) / psrsigsim_dm_k
+    print(
+        f"dispersion constant: this module={DISPERSION_CONST_S_MHZ2_PER_DM}  "
+        f"PsrSigSim DM_K={psrsigsim_dm_k:.3f}  relative diff={rel_diff*100:.3f}% "
+        f"(expected: small, standard literature-precision variation)"
+    )
+
+    # --- full pipeline: build a real pulsar template, check determinism ---
+    NUM_CHANNELS_TEST2 = 448
+    DM_TEST = 2.0
+    PERIOD_S = 0.1
+    WIDTH_S = 0.005
 
     station = StationConfig(station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1)
     streamer = PulsedSourceStreamer(
         station=station,
         source_cfgs=[{"kind": "pulsed", "period_s": PERIOD_S, "width_s": WIDTH_S, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
         obs_time_ref=1_800_000_000.0,
-        num_channels=NUM_CHANNELS_TEST,
-        n_subfreq=64,
+        num_channels=NUM_CHANNELS_TEST2,
     )
     n_samples = streamer.tick_n_samples()
     tick_dt = n_samples / streamer.channel_output_rate
     obs_time = 1_800_000_000.0
 
-    # --- determinism/seekability ---
     r1 = streamer.generate_next_tick(obs_time, n_samples)["V"].copy()
     r2 = streamer.generate_next_tick(obs_time, n_samples)["V"].copy()
     assert np.array_equal(r1, r2), "same t must give identical content"
     print("determinism/seekability: OK")
+    print(f"content is complex (not real-only): max |imag part| = {np.max(np.abs(r1.imag)):.4f}")
 
-    # --- dispersion sanity: bottom-of-band delay relative to top ---
-    f_top = streamer.base_freq_hz + (NUM_CHANNELS_TEST - 1) * streamer.channel_width_hz
-    f_bot = streamer.base_freq_hz
-    tau_bot = dispersion_delay_s(f_bot, DM_TEST) - dispersion_delay_s(f_top, DM_TEST)
-    print(
-        f"dispersion delay, bottom channel ({f_bot/1e6:.1f} MHz) relative to "
-        f"top ({f_top/1e6:.1f} MHz), DM={DM_TEST}: {tau_bot*1000:.2f} ms "
-        f"({tau_bot/PERIOD_S:.2f} periods -- wrapping is expected and correct "
-        f"for a periodic source)"
+    # --- cross-station coherence check: two stations, same pulsar, same
+    # tick, but different geometric delay via their own DelayPolynomial
+    # -- confirm applying each station's OWN delay-compensating phase
+    # rotation brings them into close alignment (what a beamformer relies
+    # on), which v1/v2's real-only content could not do. ---
+    def _fake_fetch_b(station_id, at_time):
+        return DelayPolynomial(
+            station_id=station_id, start_validity_sec=at_time, validity_period_sec=600.0,
+            xypol_coeffs_ns=[300.0, 0.002, 0.0, 0.0, 0.0, 0.0], ypol_offset_ns=1.0,
+        )
+
+    station_b = StationConfig(station_id=2, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1)
+    streamer_b = PulsedSourceStreamer(
+        station=station_b,
+        source_cfgs=[{"kind": "pulsed", "period_s": PERIOD_S, "width_s": WIDTH_S, "amplitude": 1.0, "dm_pc_cm3": DM_TEST}],
+        obs_time_ref=1_800_000_000.0,
+        num_channels=NUM_CHANNELS_TEST2,
     )
+    globals()["fetch_delay_model_from_cbf"] = _fake_fetch_b
+    streamer_b._refresh_delay_poly_if_needed(obs_time)
+    globals()["fetch_delay_model_from_cbf"] = _fake_fetch
+    out_b = streamer_b.generate_next_tick(obs_time, n_samples)["V"]
+    out_a = streamer.generate_next_tick(obs_time, n_samples)["V"]
 
-    # --- intra-channel dispersion smear diagnostic: how big is it at
-    # each band edge, and does this module's sub-frequency averaging
-    # actually converge / capture it? ---
-    channel_sample_period = 1.0 / streamer.channel_width_hz
-    for label, f_edge in [("bottom (worst)", f_bot), ("top (best)", f_top)]:
-        d_tau_df = -2 * DISPERSION_CONST_S_MHZ2_PER_DM * DM_TEST / (f_edge / 1e6) ** 3 / 1e6  # per Hz
-        smear = abs(d_tau_df) * streamer.channel_width_hz
-        print(
-            f"intra-channel smear at {label} channel ({f_edge/1e6:.1f} MHz): "
-            f"{smear*1e6:.3f} us vs channel sample period {channel_sample_period*1e6:.3f} us "
-            f"(ratio={smear/channel_sample_period:.2f})"
-        )
-
-    print()
-    print("convergence check: does the averaged template stop changing as")
-    print("n_subfreq grows? (small scale build: 8 channels, 20ms period, for speed)")
-    conv_channels, conv_period = 8, 0.02
-    conv_n_period = int(round(conv_period * CHANNEL_WIDTH_HZ))
-    worst_channel = 0  # bottom of band -- largest smear
-    prev = None
-    for n_sf in [1, 4, 16, 64, 256]:
-        tmpl, _ = build_pulsar_template(
-            conv_channels, CHANNEL_WIDTH_HZ, DEFAULT_PULSAR_BASE_FREQ_HZ, CHANNEL_WIDTH_HZ,
-            conv_period, WIDTH_S, 1.0, DM_TEST, conv_n_period, n_sf,
-        )
-        peak = tmpl[worst_channel].max()
-        delta = "" if prev is None else f"  (change from previous: {abs(peak-prev):.3e})"
-        print(f"  n_subfreq={n_sf:>4}: peak value at worst channel = {peak:.6f}{delta}")
-        prev = peak
+    test_ch = 200
+    tau_a_ns = eval_delay_poly_ns(streamer._delay_coeffs, obs_time - streamer._current_poly.start_validity_sec)
+    tau_b_ns = eval_delay_poly_ns(streamer_b._delay_coeffs, obs_time - streamer_b._current_poly.start_validity_sec)
+    f_c = streamer.base_freq_hz + test_ch * streamer.channel_width_hz
+    correction_a = np.exp(1j * 2 * np.pi * f_c * tau_a_ns * 1e-9)
+    correction_b = np.exp(1j * 2 * np.pi * f_c * tau_b_ns * 1e-9)
+    aligned_a = out_a[:, test_ch] * correction_a
+    aligned_b = out_b[:, test_ch] * correction_b
+    corr = np.abs(np.vdot(aligned_a, aligned_b)) / np.sqrt(np.vdot(aligned_a, aligned_a).real * np.vdot(aligned_b, aligned_b).real)
     print(
-        "n_subfreq=1 (the old, wrong approximation) peak vs the converged "
-        "(n_subfreq=256) value directly shows how much smearing was being missed."
+        f"cross-station coherence after delay-compensating phase rotation: "
+        f"normalized correlation={corr:.4f} (expect close to 1.0 -- this is what "
+        f"v1/v2's real-only content could NOT achieve)"
     )
-
-    # --- geometric-delay Taylor-correction error, at a realistic delay
-    # magnitude (matches this codebase's example delay-poly coefficients,
-    # ~750ns). "exact" here must be built the SAME way the template is
-    # (averaged over n_subfreq shifted copies) so this isolates the
-    # error from the Taylor correction specifically, not from also
-    # switching between the single-delay and averaged smear models. ---
-    template, deriv, period_s, n_period = streamer._pulsars[0]
-    sigma = WIDTH_S / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-    test_channel = NUM_CHANNELS_TEST - 1  # top of band -- smallest smear, cleanest check
-    f_center = streamer.base_freq_hz + test_channel * streamer.channel_width_hz
-    f_lo = f_center - streamer.channel_width_hz / 2.0
-    peaks = [
-        period_s / 2.0
-        + dispersion_delay_s(f_lo + (m + 0.5) * streamer.channel_width_hz / streamer.n_subfreq, DM_TEST)
-        - dispersion_delay_s(f_top, DM_TEST)
-        for m in range(streamer.n_subfreq)
-    ]
-    t0 = period_s / 2.0 + (dispersion_delay_s(f_center, DM_TEST) - dispersion_delay_s(f_top, DM_TEST))
-    for tau_geom_ns in [750.0, 2000.0, 10_000.0]:
-        tau_geom_s = tau_geom_ns * 1e-9
-        idx0 = int(round((t0 % period_s) * streamer.channel_output_rate)) % n_period
-        approx = template[test_channel, idx0] - tau_geom_s * deriv[test_channel, idx0]
-        exact = 0.0
-        for peak in peaks:
-            d = (t0 - tau_geom_s) - peak
-            d = d - period_s * np.floor(d / period_s + 0.5)
-            exact += np.exp(-0.5 * (d / sigma) ** 2)
-        exact /= streamer.n_subfreq
-        err = abs(approx - exact)
-        print(
-            f"geometric delay {tau_geom_ns:>8.1f}ns: Taylor-approx={approx:.6f}  "
-            f"exact={exact:.6f}  abs err={err:.3e}"
-        )
-
-    # --- cross-station independence not applicable here (pulsar content
-    # is the same astrophysical source seen by every station -- unlike
-    # noise, stations SHOULD see the same intrinsic pulse, just arriving
-    # at each station's own geometric delay; this is correct, not a bug) ---
 
     print("\nAll checks completed.")

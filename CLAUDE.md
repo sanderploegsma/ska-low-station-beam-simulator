@@ -233,61 +233,122 @@ pulsar's profile repeats exactly, to the precision this simulator needs,
 every rotation period. No birthday-paradox tradeoff, no long-integration
 correctness caveat: periodicity here is ground truth, not an artifact.
 
-**What still needed solving**: CBF's delay-tracking has to be exercised
-against a continuously-changing GEOMETRIC delay every tick — a frozen
-replayed snapshot alone would stop exercising that. Split into two
-pieces: DM/dispersion delay (a fixed, static pulsar property, baked into
-the per-channel template once at construction) and geometric/tracking
-delay (applied per-tick on top).
+**This module went through three designs before arriving at the current
+one** — the history matters because each wrong version looked reasonable
+until it was actually built and checked, not just reasoned about:
 
-**The per-tick geometric-delay correction is NOT tone's "delay as phase"
-trick reused verbatim** — an earlier version of this assumed it would
-be, and that was wrong. Pulses are real-valued achromatic envelopes (no
-carrier, same convention `wideband_streamer.PulsedSource` already uses)
-— a phase multiply on a real, zero-frequency baseband signal doesn't
-correspond to a time shift; there's no carrier for the phase to act on.
-The correct per-tick correction is a first-order Taylor expansion,
-`envelope(t - tau) ≈ envelope(t) - tau*envelope'(t)`, using a
-precomputed derivative template alongside the profile template — still
-O(1) per sample. Verified against the exact closed form: error ~1e-7 at
-realistic (~750ns) geometric delays, ~1e-5 even at 10μs — comfortably
-valid at the delay magnitudes this codebase's example delay-polys use.
+- **v1 (wrong)**: each channel sees one constant DM delay (evaluated at
+  that channel's center frequency only), applied to a real-valued
+  achromatic envelope; per-tick geometric delay via a first-order Taylor
+  correction (`envelope(t-tau) ≈ envelope(t) - tau*envelope'(t)`).
+- **v2 (fixed intra-channel smear, still broken for beamforming)**: a
+  channel isn't one frequency, it's a ~781kHz passband — at SKA-Low
+  frequencies, even DM=2 pc/cm³ (a low, realistic value) smears the
+  dispersion curve across ~81,000 channel-widths at the bottom of the
+  band (50MHz) and ~159 at the top (400MHz), a real low-frequency-radio
+  effect, not a bug. v2 fixed this by averaging many shifted copies of
+  the profile across each channel's own passband (`n_subfreq=1`, the
+  broken version, predicted a channel peak of 1.0 with no smearing at
+  all; the converged answer was 0.288 — a 3.5x error). But v2 was still
+  real-valued (no carrier), which turned out to be a bigger problem:
+  CBF's beamformer coherently combines stations by phase-rotating
+  already-channelized complex data — physically valid only because a
+  real channelizer inherently produces complex output with genuine
+  carrier phase. Real-valued content has no phase for that rotation to
+  act on, so v2 could not be coherently beamformed across stations at
+  all (tone doesn't have this problem — it has a genuine
+  residual-frequency carrier by construction).
+- **v3 (current)**: generate the wideband, undispersed pulse train as
+  one real time series spanning the whole band (a shared "sky carrier" —
+  see below), apply the standard coherent-dispersion transfer function
+  (Lorimer & Kramer 2006, eq. 5.21) directly to its full complex FFT,
+  then channelize via `wideband_streamer.WidebandChannelizer` — reused
+  here as a legitimate ONE-TIME, offline call, not a hot-path FFT, so it
+  doesn't violate this codebase's "direct synthesis, no FFT per tick"
+  philosophy. This fixes both v1/v2 problems at once: intra-channel
+  smear falls out correctly as an emergent property of dispersing at
+  full wideband FFT resolution before channelizing (no averaging hack
+  needed), and channelizing a real signal via FFT inherently produces
+  genuinely complex per-channel content with real carrier phase — which
+  lets the per-tick geometric-delay correction use tone's EXACT phase
+  trick instead of v1's Taylor approximation.
 
-**Intra-channel dispersion smear — the real hazard, caught by building
-this and checking it, not by reasoning about it in the abstract.** A
-first implementation treated each channel as seeing one constant DM
-delay (evaluated at the channel center frequency only). At SKA-Low
-frequencies (tens–few hundred MHz) with 781.25kHz channels, this is
-badly wrong: **even DM=2 pc/cm³ (a low, realistic value) smears the
-dispersion curve across ~81,000 channel-widths within a single channel
-at the bottom of the band (50MHz), and ~159 channel-widths at the top
-(400MHz).** This is a real, well-known low-frequency-radio-astronomy
-effect (why real low-frequency pulsar backends need much finer
-channelization or coherent dedispersion), not a simulator bug. Fixed by
-building each channel's template as the AVERAGE of `n_subfreq` shifted
-copies of the intrinsic profile sampled across that channel's own
-passband — converges to what a proper wideband-generate +
-apply-dispersion-in-frequency-domain + FFT-channelize pipeline would
-produce, without needing to build that pipeline or depend on
-`WidebandChannelizer`'s specific FFT-bin conventions. Concretely:
-`n_subfreq=1` (the broken version) predicts a channel peak of 1.0
-(no smearing at all); the converged answer (`n_subfreq=256`) is 0.288 —
-a 3.5x error the naive version would have silently shipped.
+**Verified against an external, peer-reviewed reference, not just
+internal self-consistency**: investigated using NANOGrav's `PsrSigSim`
+package directly, but its dependency chain is heavy and partially broken
+for this purpose (pulls in PINT, `fitsio`, `emcee`, `nestle`, matplotlib
+just to import; its own `BasebandSignal.to_RF`/`to_FilterBank` conversion
+methods are unimplemented stubs) — so instead of depending on it, its
+`ISM._disperse_baseband` implementation was read directly and its
+physics reimplemented in this module. This paid off as a real check: its
+dispersion constant (`DM_K = 1/2.41e-4 = 4149.38`) matches this module's
+own (`4148.808`) to 0.014% — the same standard literature constant,
+cross-validated independently.
+
+**Two real bugs caught only by numerical verification, not by
+inspection** — worth internalizing as a general lesson for this module:
+1. The wideband dispersion step originally used `np.fft.rfft`/`irfft`
+   (correct for PsrSigSim's own real-ADC-sampled convention), but this
+   codebase's own convention (see `WidebandChannelizer.channel_center_frequencies`)
+   treats negative `fftfreq` bins as meaningful, independent channels —
+   using `rfft` silently covered only half the intended band and shifted
+   every channel's frequency. Caught by injecting a KNOWN tone at a
+   known external channel and checking where it actually landed (it was
+   off), not by reasoning about the convention. Fixed by using the full
+   complex `fft`/`ifft` throughout — see `__main__`'s channel-mapping
+   check, which is now a permanent regression test for this.
+2. The first version of the per-tick exact-phase correction called
+   `cos`/`sin` once per (sample, channel) pair — ~1.8M transcendental
+   calls per tick at 448 channels — needing 32+ threads to clear budget,
+   4x worse than expected. Since phase is linear in channel index at a
+   fixed sample, fixed with a phase-accumulator (NCO-style) recurrence:
+   two trig calls per SAMPLE, then one complex multiply per channel to
+   step the rotation forward — the same "per-element transcendental
+   calls are the expensive part" lesson this session's noise-kernel work
+   already established, reapplied here.
+
+**Cross-station coherence, verified numerically, not assumed**: two
+streamers with different `DelayPolynomial`s (simulating two stations),
+same pulsar, same tick — after each applies its OWN delay-compensating
+phase correction (what a beamformer does), their content's normalized
+correlation is 1.0000. This is the concrete confirmation that v3 (unlike
+v1/v2) actually supports coherent multi-station beamforming — see
+`__main__`.
+
+**Why the "sky carrier" is shared across all stations, not per-station —
+opposite of the rule for noise, easy to get backwards**: every station
+in a real array observes the literal same wavefront from the same
+source, just arriving at a different time because of geometry — that's
+the entire physical basis of interferometry. So the wideband pulse
+train's random carrier is generated from a single fixed seed shared by
+every station simulating this pulsar, never from `station.station_id`.
+Receiver noise is the opposite: independently seeded per station,
+because each station's receiver is a physically separate noise source.
 
 **Resource cost, benchmarked on the EPYC target hardware, 448 channels,
-DM=2, 100ms period, 5ms FWHM, `n_subfreq=64`:**
-- One-time build cost scales with `n_subfreq` (8 threads): 2.2s at
-  `n_subfreq=64`, 8.7s at `n_subfreq=256`. Scales with thread count too
-  (17.2s at 1 thread down to 0.76s at 48 threads for `n_subfreq=64`) —
-  a one-time per-scan-setup cost, not a steady-state one.
+DM=2, 100ms period, 5ms FWHM:**
+- One-time build cost is now plain numpy (wideband generate + FFT
+  dispersion + channelize), not numba — thread count isn't the lever,
+  period length is, since it scales with the wideband FFT length
+  (`num_channels × n_period_samples`): 0.16s at a 1ms period, 4.5s at
+  100ms, 46.7s at 1000ms (roughly 2x the older, wrong sub-frequency-averaging
+  approach's build cost at the same period — a fair trade for actually
+  being correct on two counts).
 - **Steady-state per-tick cost clears the ~8-core target with room to
-  spare**: 1.30ms/tick (49.6% of the 2.621ms budget) at 8 threads; even
-  2 threads clears budget (2.05ms, 78.3%). Only single-threaded goes
-  over (3.50ms, 133.5%). This benchmark isolated the pulsar cost alone
-  (no `noise_cfg`) — combining with live per-tick noise generation would
-  add back `DirectSynthesisStreamer`'s noise cost on top; combining with
-  the tiled noise bank instead would not, but that combination hasn't
-  been built or benchmarked yet.
+  spare**: 1.36ms/tick (51.8% of the 2.621ms budget) at 8 threads; even
+  4 threads clears budget (1.93ms, 73.7%). This benchmark isolated the
+  pulsar cost alone (no `noise_cfg`) — combining with live per-tick
+  noise generation would add back `DirectSynthesisStreamer`'s noise cost
+  on top; combining with the tiled noise bank instead would not, but
+  that combination hasn't been built or benchmarked yet.
+
+**Still not modeled**: pulse-to-pulse jitter, scintillation, nulling,
+profile evolution with frequency, or realistic flux/SNR calibration
+against the receiver noise floor — the last of these matters specifically
+if the goal is testing whether PSS/PST can actually detect the injected
+pulsar as a candidate (not just exercising delay-tracking), since
+detection significance depends on signal-to-noise, not just having the
+right shape.
 
 ## SPS-CBF ICD heap structure — HIGHEST-PRIORITY UNVERIFIED ITEM
 
@@ -573,11 +634,15 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    benchmarking outcomes.
 5. Build the observability/telemetry addition described above.
 6. ~~Derive a direct per-channel representation for pulsed sources~~
-   **Prototyped this session** (`pulsed_source_streamer.PulsedSourceStreamer`)
-   — see its section above. Verified correct (Taylor-correction error
-   and intra-channel-smear convergence both checked numerically, not
-   assumed) and benchmarked well within the ~8-core/pod target at 448
-   channels. Still needed before this can replace
+   **Prototyped this session** (`pulsed_source_streamer.PulsedSourceStreamer`,
+   now on its third design, v3 — see its section above). Verified against
+   an external reference (dispersion constant cross-validated against
+   NANOGrav's PsrSigSim to 0.014%), and against itself numerically:
+   known-tone channel-mapping check, and — the one that matters most —
+   cross-station coherence after delay compensation measured at 1.0000,
+   confirming this version (unlike v1/v2) actually supports coherent
+   multi-station beamforming. Benchmarked well within the ~8-core/pod
+   target at 448 channels. Still needed before this can replace
    `wideband_streamer.py`: (a) wire it into `simulator.py`'s backend
    selection, (b) decide on a real `base_freq_hz` (currently a
    50MHz placeholder default, same unverified-ICD problem as
@@ -585,7 +650,10 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    to the true band edges, (c) decide whether combining it with the
    tiled noise bank (instead of live per-tick noise) is wanted, to keep
    the whole thing under the CPU-core target when noise is also present,
-   (d) confirm with whoever owns CBF's pulsed-source test cases whether
+   (d) flux/SNR calibration against the noise floor if the goal extends
+   to testing whether PSS/PST can actually detect the injected pulsar,
+   not just exercising delay-tracking, (e) confirm with whoever owns
+   CBF's pulsed-source test cases whether
    this level of astrophysical approximation (achromatic profile,
    Gaussian shape, no pulse-to-pulse jitter) is sufficient.
 7. Confirm the exact CSP LMC command for pushing a delay model without
