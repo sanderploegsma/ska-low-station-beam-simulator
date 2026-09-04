@@ -59,6 +59,8 @@ src/ska_low_station_beam_simulator/
   benchmark_direct_synthesis.py  benchmarks direct_synthesis.DirectSynthesisStreamer
   tiled_noise_streamer.py       EXPERIMENTAL: pre-generated noise bank variant, not wired into simulator.py
   benchmark_tiled_noise_streamer.py  benchmarks tiled_noise_streamer.TiledNoiseStreamer
+  pulsed_source_streamer.py     EXPERIMENTAL: direct per-channel pulsar (tone+pulsed+noise), not wired into simulator.py
+  benchmark_pulsed_source_streamer.py  benchmarks pulsed_source_streamer.PulsedSourceStreamer
 resources/notebooks/benchmark.ipynb   STALE — predates the numba port, ignore/delete
 ```
 
@@ -213,6 +215,79 @@ from `DirectSynthesisStreamer`, which needs ~24-48 threads for headroom
 at 448 channels (see Benchmarking) but has no periodicity at all. Pick
 based on what the test suite actually needs, not on which one benchmarks
 better in isolation.
+
+### `pulsed_source_streamer.PulsedSourceStreamer` — EXPERIMENTAL, not wired into `simulator.py`
+
+Answers the "Immediate next steps" item this file has flagged for a
+while: a direct per-channel representation for pulsed sources, so
+`wideband_streamer.py` could eventually be deleted. Grew directly out of
+the tiled-noise-bank discussion — could "generate once, replay per tick"
+work for a pulsar too? Handles `kind='tone'` and `kind='pulsed'`
+together (plus per-pol noise), unlike `DirectSynthesisStreamer` which
+refuses `'pulsed'` outright.
+
+**Why this is a fundamentally better fit than the noise tile bank**: a
+pulsar is genuinely periodic. Replaying one precomputed period isn't a
+fidelity compromise the way replaying a finite noise bank is — a real
+pulsar's profile repeats exactly, to the precision this simulator needs,
+every rotation period. No birthday-paradox tradeoff, no long-integration
+correctness caveat: periodicity here is ground truth, not an artifact.
+
+**What still needed solving**: CBF's delay-tracking has to be exercised
+against a continuously-changing GEOMETRIC delay every tick — a frozen
+replayed snapshot alone would stop exercising that. Split into two
+pieces: DM/dispersion delay (a fixed, static pulsar property, baked into
+the per-channel template once at construction) and geometric/tracking
+delay (applied per-tick on top).
+
+**The per-tick geometric-delay correction is NOT tone's "delay as phase"
+trick reused verbatim** — an earlier version of this assumed it would
+be, and that was wrong. Pulses are real-valued achromatic envelopes (no
+carrier, same convention `wideband_streamer.PulsedSource` already uses)
+— a phase multiply on a real, zero-frequency baseband signal doesn't
+correspond to a time shift; there's no carrier for the phase to act on.
+The correct per-tick correction is a first-order Taylor expansion,
+`envelope(t - tau) ≈ envelope(t) - tau*envelope'(t)`, using a
+precomputed derivative template alongside the profile template — still
+O(1) per sample. Verified against the exact closed form: error ~1e-7 at
+realistic (~750ns) geometric delays, ~1e-5 even at 10μs — comfortably
+valid at the delay magnitudes this codebase's example delay-polys use.
+
+**Intra-channel dispersion smear — the real hazard, caught by building
+this and checking it, not by reasoning about it in the abstract.** A
+first implementation treated each channel as seeing one constant DM
+delay (evaluated at the channel center frequency only). At SKA-Low
+frequencies (tens–few hundred MHz) with 781.25kHz channels, this is
+badly wrong: **even DM=2 pc/cm³ (a low, realistic value) smears the
+dispersion curve across ~81,000 channel-widths within a single channel
+at the bottom of the band (50MHz), and ~159 channel-widths at the top
+(400MHz).** This is a real, well-known low-frequency-radio-astronomy
+effect (why real low-frequency pulsar backends need much finer
+channelization or coherent dedispersion), not a simulator bug. Fixed by
+building each channel's template as the AVERAGE of `n_subfreq` shifted
+copies of the intrinsic profile sampled across that channel's own
+passband — converges to what a proper wideband-generate +
+apply-dispersion-in-frequency-domain + FFT-channelize pipeline would
+produce, without needing to build that pipeline or depend on
+`WidebandChannelizer`'s specific FFT-bin conventions. Concretely:
+`n_subfreq=1` (the broken version) predicts a channel peak of 1.0
+(no smearing at all); the converged answer (`n_subfreq=256`) is 0.288 —
+a 3.5x error the naive version would have silently shipped.
+
+**Resource cost, benchmarked on the EPYC target hardware, 448 channels,
+DM=2, 100ms period, 5ms FWHM, `n_subfreq=64`:**
+- One-time build cost scales with `n_subfreq` (8 threads): 2.2s at
+  `n_subfreq=64`, 8.7s at `n_subfreq=256`. Scales with thread count too
+  (17.2s at 1 thread down to 0.76s at 48 threads for `n_subfreq=64`) —
+  a one-time per-scan-setup cost, not a steady-state one.
+- **Steady-state per-tick cost clears the ~8-core target with room to
+  spare**: 1.30ms/tick (49.6% of the 2.621ms budget) at 8 threads; even
+  2 threads clears budget (2.05ms, 78.3%). Only single-threaded goes
+  over (3.50ms, 133.5%). This benchmark isolated the pulsar cost alone
+  (no `noise_cfg`) — combining with live per-tick noise generation would
+  add back `DirectSynthesisStreamer`'s noise cost on top; combining with
+  the tiled noise bank instead would not, but that combination hasn't
+  been built or benchmarked yet.
 
 ## SPS-CBF ICD heap structure — HIGHEST-PRIORITY UNVERIFIED ITEM
 
@@ -497,9 +572,22 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    is the single highest-priority correctness gap regardless of
    benchmarking outcomes.
 5. Build the observability/telemetry addition described above.
-6. Derive (or explicitly decide to defer further) a direct per-channel
-   representation for pulsed sources, to let `wideband_streamer.py` be
-   deleted entirely.
+6. ~~Derive a direct per-channel representation for pulsed sources~~
+   **Prototyped this session** (`pulsed_source_streamer.PulsedSourceStreamer`)
+   — see its section above. Verified correct (Taylor-correction error
+   and intra-channel-smear convergence both checked numerically, not
+   assumed) and benchmarked well within the ~8-core/pod target at 448
+   channels. Still needed before this can replace
+   `wideband_streamer.py`: (a) wire it into `simulator.py`'s backend
+   selection, (b) decide on a real `base_freq_hz` (currently a
+   50MHz placeholder default, same unverified-ICD problem as
+   `common.BASE_FREQ_HZ`) since dispersion physics is highly sensitive
+   to the true band edges, (c) decide whether combining it with the
+   tiled noise bank (instead of live per-tick noise) is wanted, to keep
+   the whole thing under the CPU-core target when noise is also present,
+   (d) confirm with whoever owns CBF's pulsed-source test cases whether
+   this level of astrophysical approximation (achromatic profile,
+   Gaussian shape, no pulse-to-pulse jitter) is sufficient.
 7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
 
@@ -517,6 +605,8 @@ python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real mult
 python -m ska_low_station_beam_simulator.benchmark   # legacy wideband path timing, 96 channels
 python -m ska_low_station_beam_simulator.tiled_noise_streamer   # EXPERIMENTAL noise-bank variant: correctness checks
 python -m ska_low_station_beam_simulator.benchmark_tiled_noise_streamer  # EXPERIMENTAL: memory/startup/per-tick cost sweep, 448 channels
+python -m ska_low_station_beam_simulator.pulsed_source_streamer   # EXPERIMENTAL pulsar: correctness + approximation-error checks
+python -m ska_low_station_beam_simulator.benchmark_pulsed_source_streamer  # EXPERIMENTAL: build/per-tick cost, 448 channels
 ```
 
 `pytango` and `spead2` aren't required to run the above — `simulator.py`
