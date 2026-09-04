@@ -12,13 +12,14 @@ import pytest
 from ska_low_station_beam_simulator import direct_synthesis as sim
 from ska_low_station_beam_simulator.common import (
     BASE_FREQ_HZ,
+    CHANNEL_OUTPUT_RATE_HZ,
     CHANNEL_WIDTH_HZ,
     DelayFeed,
     DelayPolynomial,
     StationConfig,
 )
 
-SAMPLE_RATE_PER_CHANNEL = CHANNEL_WIDTH_HZ  # critically sampled
+SAMPLE_RATE_PER_CHANNEL = CHANNEL_OUTPUT_RATE_HZ  # real oversampled rate, not CHANNEL_WIDTH_HZ -- see common.py
 OBS_TIME = 1_800_000_000.0
 
 
@@ -220,7 +221,7 @@ def test_dispersion_constant_matches_psrsigsim():
 # PULSAR: full pipeline + coherence
 # ============================================================
 
-PULSAR_NUM_CHANNELS = 448
+PULSAR_NUM_CHANNELS = 384  # the real ICD maximum -- was 448 (an invalid config)
 PULSAR_DM = 2.0
 PULSAR_PERIOD_S = 0.1
 PULSAR_WIDTH_S = 0.005

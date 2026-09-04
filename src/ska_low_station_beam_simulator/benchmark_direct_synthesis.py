@@ -7,13 +7,19 @@
 # pulsar) plus deleting the legacy wideband+FFT StationStreamer entirely.
 # Each piece was benchmarked in isolation in earlier sessions (see
 # CLAUDE.md's Benchmarking section) and individually cleared an ~8-core
-# target at 448 channels -- this benchmark checks whether that still
-# holds when all three run TOGETHER in one streamer, which is the
-# combination a real scan is likely to actually use.
+# target at 448 channels (an invalid config -- the real ICD maximum is
+# 384 channels/300MHz, configurable 8-384 in steps of 8; see
+# common.MAX_NUM_CHANNELS) -- this benchmark checks whether that still
+# holds when all three run TOGETHER in one streamer, at the REAL max
+# channel count, which is the combination a real scan is likely to
+# actually use.
 #
 # Per-tick TIME BUDGET is fixed regardless of channel count
-# (HEAP_LEN / CHANNEL_WIDTH_HZ ~= 2.621ms). n_samples per tick is always
-# HEAP_LEN, by construction (ScanRunner relies on this).
+# (HEAP_LEN / CHANNEL_OUTPUT_RATE_HZ ~= 2.212ms -- the real OVERSAMPLED
+# per-channel sample rate per the ICD, NOT HEAP_LEN/CHANNEL_WIDTH_HZ
+# ~= 2.621ms, which would assume critical sampling; see common.py).
+# n_samples per tick is always HEAP_LEN, by construction (ScanRunner
+# relies on this).
 #
 # Every source needs its own DelayFeed (see common.py -- there is no
 # default/fallback delay). Uses fixed fake polynomials, applied once at
@@ -27,7 +33,14 @@ import time
 import numba
 
 import ska_low_station_beam_simulator.direct_synthesis as sim
-from ska_low_station_beam_simulator.common import DelayFeed, HEAP_LEN
+from ska_low_station_beam_simulator.common import (
+    BLOCK_DURATION_S,
+    CHANNEL_OUTPUT_RATE_HZ,
+    HEAP_LEN,
+    MAX_NUM_CHANNELS,
+    DelayFeed,
+)
+
 
 # %%
 def _fixed_delay_feed(name: str) -> DelayFeed:
@@ -61,8 +74,9 @@ def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
     )
     # Offset from base_freq_hz, NOT absolute -- the streamer's channel
     # mapping is round((freq_hz - base_freq_hz) / channel_width_hz), and
-    # this benchmark uses the default BASE_FREQ_HZ (the confirmed
-    # 50.78125MHz lowest valid SKA-Low frequency) as the band start.
+    # this benchmark uses the default BASE_FREQ_HZ (the confirmed 50.0MHz
+    # centre frequency of channel 64, the lowest valid SKA-Low channel)
+    # as the band start.
     tone_freq = sim.BASE_FREQ_HZ + 20 * sim.CHANNEL_WIDTH_HZ + 150_000.0
     return sim.DirectSynthesisStreamer(
         station=station,
@@ -114,7 +128,15 @@ def benchmark_tick(
 # with tone + tiled noise + pulsar all active together ---
 
 n_samples = HEAP_LEN
-budget_ms = (HEAP_LEN / sim.CHANNEL_WIDTH_HZ) * 1000
+# Real per-tick budget, from common.BLOCK_DURATION_S -- NOT
+# HEAP_LEN/CHANNEL_WIDTH_HZ, which silently assumes critical sampling
+# and overstates the budget by ~15.6% (2.621ms vs the real 2.212ms; see
+# common.CHANNEL_OUTPUT_RATE_HZ's docstring for the ICD's 32/27
+# oversampling factor). An earlier version of this script computed its
+# own budget independently instead of importing common.BLOCK_DURATION_S,
+# which meant it silently kept reporting the wrong (too generous) %
+# even after that fix landed elsewhere in the codebase.
+budget_ms = BLOCK_DURATION_S * 1000
 max_numba_threads = numba.config.NUMBA_NUM_THREADS
 
 print(
@@ -128,7 +150,7 @@ candidate_counts = sorted(set([1, 2, 4, 8, 16, 24, 32, max_numba_threads // 2, m
 candidate_counts = [n for n in candidate_counts if 1 <= n <= max_numba_threads]
 
 all_results: dict[int, dict[int, dict]] = {}
-for num_channels, label in [(96, "current (75 MHz)"), (448, "full band (350 MHz)")]:
+for num_channels, label in [(96, "current (75 MHz)"), (MAX_NUM_CHANNELS, "full band (300 MHz)")]:
     print("=" * 70)
     print(f"{label}, NUM_CHANNELS={num_channels} -- tone + tiled noise + pulsar combined")
     print("=" * 70)
@@ -159,12 +181,12 @@ for num_channels, label in [(96, "current (75 MHz)"), (448, "full band (350 MHz)
     )
 
 # %%
-# --- ~8-core target check, 448 channels, combined workload ---
+# --- ~8-core target check, full band (384 channels), combined workload ---
 print("=" * 70)
-print("TARGET CHECK: ~8 CPU cores/pod, 448 channels, tone+noise+pulsar combined")
+print(f"TARGET CHECK: ~8 CPU cores/pod, {MAX_NUM_CHANNELS} channels, tone+noise+pulsar combined")
 print("=" * 70)
 numba.set_num_threads(8)
-streamer = build_streamer(448)
+streamer = build_streamer(MAX_NUM_CHANNELS)
 stats = benchmark_tick(streamer, n_samples, n_warmup=10, n_measured=50)
 pct = stats["mean_ms"] / budget_ms * 100
 flag = "OK" if stats["mean_ms"] <= budget_ms else "OVER BUDGET"
@@ -204,26 +226,33 @@ print(f"noise tile-bank memory (both pols): {streamer.bank_memory_bytes()/1e9:.3
 # permanent regression check for that finding, not an oversight if the
 # ordering below looks non-monotonic.
 print("=" * 70)
-print("ONE-TIME CONSTRUCTION BUDGET (target 10s, hard limit 30s), 448 channels")
+print(f"ONE-TIME CONSTRUCTION BUDGET (target 10s, hard limit 30s), {MAX_NUM_CHANNELS} channels")
 print("=" * 70)
 
 print("-- noise tile-bank fill only (fill_noise_bank, both pols) --")
 for n_tiles_check in (256, 512, 1024):
     t0 = time.perf_counter()
     for _seed in (7, 1_000_010):  # V, H -- same as DirectSynthesisStreamer's two calls
-        sim.fill_noise_bank(_seed, 0.05, n_tiles_check, HEAP_LEN, 448)
+        sim.fill_noise_bank(_seed, 0.05, n_tiles_check, HEAP_LEN, MAX_NUM_CHANNELS)
     build_s = time.perf_counter() - t0
-    mem_gb = sim.bank_memory_bytes(n_tiles_check, HEAP_LEN, 448) / 1e9
+    mem_gb = sim.bank_memory_bytes(n_tiles_check, HEAP_LEN, MAX_NUM_CHANNELS) / 1e9
     flag = "OK" if build_s <= 10.0 else ("OVER 10s TARGET" if build_s <= 30.0 else "OVER 30s HARD LIMIT")
     print(f"n_tiles={n_tiles_check:>4}  bank_mem={mem_gb:6.2f}GB  build={build_s:7.3f}s  [{flag}]")
 
 print("\n-- pulsar wideband sky-carrier + dispersion + channelize only (build_pulsar_template) --")
 for period_s in (0.01, 0.05, 0.1, 0.2, 0.3):
-    n_wide_check = 448 * int(round(period_s * sim.CHANNEL_WIDTH_HZ))
+    # n_period_samples/n_wide must use the REAL oversampled channel_output_rate
+    # (CHANNEL_OUTPUT_RATE_HZ), not CHANNEL_WIDTH_HZ -- an earlier version of
+    # this benchmark passed CHANNEL_WIDTH_HZ directly as channel_output_rate,
+    # matching the (wrong) pre-oversampling-fix assumption; that silently
+    # undersized the template relative to what DirectSynthesisStreamer itself
+    # now actually builds.
+    n_period_samples_check = int(round(period_s * CHANNEL_OUTPUT_RATE_HZ))
+    n_wide_check = MAX_NUM_CHANNELS * n_period_samples_check
     fast = sim.scipy.fft.next_fast_len(n_wide_check) == n_wide_check
     t0 = time.perf_counter()
     sim.build_pulsar_template(
-        448, sim.CHANNEL_WIDTH_HZ, sim.BASE_FREQ_HZ, sim.CHANNEL_WIDTH_HZ,
+        MAX_NUM_CHANNELS, sim.CHANNEL_WIDTH_HZ, sim.BASE_FREQ_HZ, CHANNEL_OUTPUT_RATE_HZ,
         period_s, period_s * 0.05, 1.0, PULSAR_DM,
     )
     build_s = time.perf_counter() - t0
@@ -242,7 +271,7 @@ print("REPEATABILITY CHECK")
 print("=" * 70)
 
 n_repeats = 5
-for num_channels in (96, 448):
+for num_channels in (96, MAX_NUM_CHANNELS):
     best_threads = min(all_results[num_channels], key=lambda k: all_results[num_channels][k]["mean_ms"])
     numba.set_num_threads(best_threads)
     print(f"\nNUM_CHANNELS={num_channels}, numba_threads={best_threads}:")

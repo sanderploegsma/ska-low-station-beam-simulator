@@ -68,30 +68,71 @@ log = logging.getLogger("cbf_sim")
 # direct_synthesis.py generates.
 # ============================================================
 
-CHANNEL_WIDTH_HZ = 781_250.0  # per SPS-CBF ICD coarse channel spacing — CONFIRM
+CHANNEL_WIDTH_HZ = 781_250.0  # per SPS-CBF ICD coarse channel spacing — CONFIRMED (channel centre spacing)
 NUM_CHANNELS = 96  # 96 * 781.25kHz ≈ 75 MHz, per your requirement
 
-# CONFIRMED: the lowest valid frequency for the SKA-Low telescope is
-# 50.78125 MHz, which is coarse channel ID 65 in the ICD's GLOBAL channel
-# numbering (65 * CHANNEL_WIDTH_HZ = 50,781,250 Hz exactly — no rounding).
-# This is the frequency of LOCAL channel 0 for a station simulating the
-# band's bottom edge; StationConfig.first_channel_id (65 by default, see
-# below) is what maps that local channel 0 onto the correct GLOBAL
-# channel ID 65 in the wire-packed channel_info. No longer a placeholder
-# -- was 0.0 pending this confirmation; that made any pulsed source
-# configured through simulator.py's StartScan (which never overrode
-# base_freq_hz) fail outright, since DirectSynthesisStreamer requires
-# base_freq_hz > 0 for pulsed sources (dispersion diverges as f -> 0).
-BASE_FREQ_HZ = 50.78125e6
+# CONFIRMED against the real ICD text (not a screenshot, not an
+# assumption): the band is channelized as 384 equispaced coarse channels
+# spanning 50-350MHz sky frequency, configurable in steps of 8 from 8 to
+# 384 channels. Previously assumed 448 channels (350MHz) as "the full
+# band" -- WRONG, 384*CHANNEL_WIDTH_HZ = 300MHz is the actual maximum;
+# 448 channels was never a real configuration this hardware supports.
+# See CLAUDE.md's SPS-CBF ICD section for the correction and its
+# knock-on effect on every "448 channels" benchmark number from earlier
+# sessions (left in CLAUDE.md as historical record of what was actually
+# measured then, not retroactively rewritten).
+MIN_NUM_CHANNELS = 8
+MAX_NUM_CHANNELS = 384
+NUM_CHANNELS_STEP = 8
+
+# CONFIRMED against the real ICD text: "the lowest frequency channel is
+# channel 64, centre frequency 50MHz" -- 64 * CHANNEL_WIDTH_HZ =
+# 50,000,000 Hz exactly, confirming BASE_FREQ_HZ is meant as a CHANNEL
+# CENTRE frequency (matching how it's used everywhere in this codebase,
+# e.g. direct_synthesis.synth_tone_channel's
+# `channel_center = base_freq_hz + channel_idx*channel_width_hz`), not a
+# band edge. Previously assumed channel 65 / 50.78125MHz -- WRONG, off by
+# one channel; channel 64 is the true lowest channel. (The band's actual
+# lower EDGE -- distinct from channel 64's CENTRE -- is
+# 50e6 - CHANNEL_WIDTH_HZ/2 = 49,609,375 Hz, matching the ICD's stated
+# "lower edge of this channel is 49.61MHz"; nothing in this codebase
+# needs that edge value directly, since every per-channel frequency
+# calculation here is expressed in terms of channel CENTRES.)
+# StationConfig.first_channel_id (64 by default, see below) is what maps
+# local channel 0 onto the correct GLOBAL channel ID 64 in the
+# wire-packed channel_info.
+BASE_FREQ_HZ = 50.0e6
 
 HEAP_LEN = 2048  # time samples per heap per channel, per ICD
 
+# CONFIRMED against the real ICD text: each channel's actual per-sample
+# period is 1080ns (1.25ns ADC sample period * 1024 * 27/32), NOT the
+# naive 1/CHANNEL_WIDTH_HZ (1280ns) a CRITICALLY sampled channelizer
+# would give. The polyphase filterbank deliberately OVERSAMPLES by a
+# factor of 32/27 (more output samples per unit time than critical
+# sampling, hence a SHORTER sample period by 27/32) -- this is a real
+# hardware property of the SPS filterbank, not a simulator design choice,
+# and was previously missed entirely (channel_output_rate was assumed
+# equal to channel_width_hz -- see direct_synthesis.py's
+# DirectSynthesisStreamer, now fixed). CHANNEL_OUTPUT_RATE_HZ is the
+# per-channel TIME-DOMAIN sample rate; CHANNEL_WIDTH_HZ remains correct
+# as-is for FREQUENCY-DOMAIN channel spacing (unaffected by oversampling
+# -- channel centres are still exactly CHANNEL_WIDTH_HZ apart). Verify:
+# 1 / (CHANNEL_WIDTH_HZ * 32/27) = 1.08e-6 s = 1080ns exactly.
+OVERSAMPLING_NUMERATOR = 32
+OVERSAMPLING_DENOMINATOR = 27
+CHANNEL_OUTPUT_RATE_HZ = CHANNEL_WIDTH_HZ * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
+
 # Per-tick time budget, FIXED regardless of channel count — this is the
 # real-time constraint generation is racing against. Equal to
-# HEAP_LEN / channel_output_rate for a critically sampled channelizer —
-# a property of the ICD's channel width, not of any particular
-# generation strategy.
-BLOCK_DURATION_S = HEAP_LEN / CHANNEL_WIDTH_HZ
+# HEAP_LEN / CHANNEL_OUTPUT_RATE_HZ (the real, OVERSAMPLED per-channel
+# sample rate -- NOT HEAP_LEN/CHANNEL_WIDTH_HZ, which would assume
+# critical sampling and give a budget ~15.6% too generous: 2.621ms
+# instead of the real 2.212ms). Also confirms HEAP_LEN satisfies the
+# ICD's separate requirement that "the number of samples per packet
+# shall be a multiple of the numerator of the oversampling ratio" (32):
+# 2048 / 32 = 64 exactly.
+BLOCK_DURATION_S = HEAP_LEN / CHANNEL_OUTPUT_RATE_HZ
 
 OVERRUN_TOLERANCE = 2.0
 QUEUE_MAXSIZE = 4096  # heaps are much smaller units than before — more of them
@@ -280,12 +321,12 @@ class StationConfig:
     substation_id: int
     subarray_id: int
     beam_id: int
-    # 65 = the confirmed GLOBAL coarse channel ID of BASE_FREQ_HZ
-    # (50.78125 MHz, the lowest valid SKA-Low frequency) — the right
+    # 64 = the confirmed GLOBAL coarse channel ID of BASE_FREQ_HZ
+    # (50.0 MHz, the lowest valid SKA-Low channel centre) — the right
     # default for a station simulating the band's bottom edge, whose
     # local channel 0 corresponds to that global channel. Override for a
     # station covering a different sub-band.
-    first_channel_id: int = 65
+    first_channel_id: int = 64
     scan_id: int = 0
 
 
@@ -631,9 +672,10 @@ class ScanRunner:
         self.stop_event = threading.Event()
         self.thread: Optional[threading.Thread] = None
 
-        # Fixed by the ICD (critically sampled channel spacing), not by
-        # whichever backend is in use.
-        self.channel_output_rate = CHANNEL_WIDTH_HZ
+        # Fixed by the ICD (the OVERSAMPLED per-channel sample rate --
+        # see CHANNEL_OUTPUT_RATE_HZ's definition above for why this is
+        # NOT CHANNEL_WIDTH_HZ), not by whichever backend is in use.
+        self.channel_output_rate = CHANNEL_OUTPUT_RATE_HZ
         self.n_samples_per_tick = streamer.tick_n_samples()
 
         self.accumulator = HeapAccumulator(

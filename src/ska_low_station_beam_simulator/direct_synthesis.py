@@ -11,7 +11,8 @@ history for their individual development):
     - tiled_noise_streamer.py's pre-generated noise TILE BANK, adopted
       here as the noise strategy (replacing live per-tick Box-Muller
       generation) specifically so a station pod can meet a small
-      (~8 core) CPU budget at full 448-channel band -- see the tile-bank
+      (~8 core) CPU budget at full 384-channel band (the real ICD
+      maximum -- see common.MAX_NUM_CHANNELS) -- see the tile-bank
       section below for the resource/fidelity tradeoff this involves.
     - pulsed_source_streamer.py's coherent, dispersion-aware pulsar
       generation (v3 of that module's design -- see its section below
@@ -31,12 +32,15 @@ none of the three source types touch a per-tick FFT):
     - Per-tick work for a wideband+FFT approach scales as O(NUM_CHANNELS)
       for generation, worse than O(NUM_CHANNELS) for the FFT (N log N).
     - The per-tick TIME BUDGET is fixed (BLOCK_DURATION_S =
-      HEAP_LEN/CHANNEL_WIDTH_HZ), independent of channel count.
-    - Scaling from 96 channels (75 MHz) to 448 channels (350 MHz, full
-      SKA-Low band) is a large increase in work against an unchanged
-      budget. Direct, closed-form (or precomputed-and-replayed) per-
-      channel generation is what makes 448 channels viable at all on
-      real target hardware -- see CLAUDE.md's Benchmarking section.
+      HEAP_LEN/CHANNEL_OUTPUT_RATE_HZ, the real OVERSAMPLED per-channel
+      sample rate -- see common.py), independent of channel count.
+    - Scaling from 96 channels (75 MHz) to 384 channels (300 MHz, the
+      real ICD maximum -- 8 to 384 in steps of 8, NOT 448/350MHz as
+      earlier sessions assumed, see CLAUDE.md's SPS-CBF ICD section) is a
+      large increase in work against an unchanged budget. Direct,
+      closed-form (or precomputed-and-replayed) per-channel generation is
+      what makes 384 channels viable at all on real target hardware --
+      see CLAUDE.md's Benchmarking section.
 
 ============================================================
 TONE
@@ -50,12 +54,70 @@ no coarse/fine integer-sample split. This is EXACT for a truly
 monochromatic tone (verified in tests/test_direct_synthesis.py to ~1e-9), not an approximation.
 
 ============================================================
+OVERSAMPLING AND PER-PACKET PHASE (reasoned through, NOT independently
+verified against real SPS hardware -- flagged honestly as such)
+============================================================
+The ICD states the SPS filterbank OVERSAMPLES by 32/27 (see
+common.CHANNEL_OUTPUT_RATE_HZ -- this is now correctly reflected in
+channel_output_rate below, and is a real, numerically significant fix:
+it shrinks the per-tick budget from 2.621ms to 2.212ms, ~15.6% tighter).
+The same ICD passage also says the oversampled filterbank output "shall
+be derotated" and that "the first sample of every SPS SPEAD packet has
+zero phase". Worked through here rather than modeled blindly, since a
+literal per-heap phase RESET would be a much bigger, more invasive
+change than the sample-rate fix if it turned out to be necessary:
+
+  - An oversampled polyphase filterbank's RAW per-channel output (before
+    correction) carries a spurious, purely mechanical phase ramp from
+    sample to sample -- an artifact of the analysis window advancing by
+    a NON-integer number of FFT lengths per output sample (that's what
+    "oversampled" means structurally), present even for a pure DC/
+    channel-centre input. "Derotated" describes REMOVING that artifact
+    so the channel's output is a clean, physically meaningful baseband
+    signal at the new (finer) sample rate.
+  - "Zero phase at the first sample of every packet" reads as the
+    NORMALIZATION CONVENTION that pins down what "derotated" means in
+    absolute terms: for a hypothetical channel-centre-frequency (zero
+    residual) input, phase is defined to read exactly zero at each
+    packet's first sample.
+  - This module never generates the raw, undecorated PFB artifact at
+    all -- synth_tone_channel/add_pulsar_tick synthesize the ALREADY-
+    CLEAN baseband result directly (residual_freq relative to channel
+    centre, continuously evolving with absolute time, no window-hop
+    artifact to begin with). Under the reading above, that means this
+    module's output already satisfies BOTH ICD requirements by
+    construction: there is no oversampling ramp to derotate because none
+    was ever introduced, and for the zero-residual-frequency case (the
+    convention's own reference point) this module's phase formula
+    already evaluates to exactly zero at every sample, first-of-packet
+    included -- trivially, since phase = 2*pi*residual_freq*t_local is
+    identically zero for all t_local when residual_freq = 0.
+  - What this does NOT resolve with certainty: whether CBF's receiver
+    additionally expects literal per-heap phase discontinuities for a
+    GENUINELY off-centre residual frequency (i.e. whether "zero phase at
+    packet start" is meant as a NORMALIZATION reference point only, as
+    reasoned above, or as a literal reset applied to every packet
+    regardless of residual frequency, which would require this module to
+    intentionally reintroduce a phase discontinuity at every heap
+    boundary -- and would need CBF to reconstruct absolute phase
+    continuity externally via heap_counter/channel_info, since the raw
+    samples would no longer carry it). The former reading is far more
+    physically sensible (a literal reset would discard real information
+    -- frequency/delay -- that CBF's own delay-tracking and coherent
+    beamforming need to recover across packets) and is what this module
+    implements; flagged here, not silently assumed, so it can be
+    confirmed against the real hardware/firmware behaviour (or CBF's own
+    receive-side expectations) if a delay-tracking test ever shows a
+    phase discontinuity at heap boundaries that this reasoning didn't
+    predict.
+
+============================================================
 NOISE — pre-generated tile bank (adopted from tiled_noise_streamer.py)
 ============================================================
 Once the bank exists, per-tick cost is an index hash + a memcopy —
 independent of channel count and, past a couple of threads, independent
-of CPU budget too (benchmarked: ~8 cores clears the 448-channel budget
-with room to spare; even 1-2 would). This is NOT a free upgrade over
+of CPU budget too (benchmarked: ~8 cores clears the full 384-channel
+budget with room to spare; even 1-2 would). This is NOT a free upgrade over
 live per-tick generation — it is a deliberate fidelity/resource tradeoff,
 and the tradeoff is REPEATS, not noise or CPU cost:
 
@@ -216,9 +278,14 @@ from ska_low_station_beam_simulator.common import (
     BASE_FREQ_HZ,
     BLOCK_DURATION_S,
     CHANNEL_WIDTH_HZ,
+    MAX_NUM_CHANNELS,
+    MIN_NUM_CHANNELS,
+    NUM_CHANNELS,
+    NUM_CHANNELS_STEP,
+    OVERSAMPLING_DENOMINATOR,
+    OVERSAMPLING_NUMERATOR,
     DelayFeed,
     DelayPolynomial,
-    NUM_CHANNELS,
     StationConfig,
     log,
 )
@@ -457,8 +524,11 @@ def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_r
     Plain vectorized numpy, not numba: this is a ONE-TIME construction
     call (see build_pulsar_template), and benchmarked faster than the
     equivalent hand-rolled numba loop it replaced at every period length
-    tried (e.g. ~6.2s vs ~9.6s at a 1s period, 448 channels) — there was
-    no tradeoff to make here, unlike the per-tick kernels below.
+    tried (e.g. ~6.2s vs ~9.6s at a 1s period, measured at 448 channels
+    before this project's channel-count max was corrected to 384 -- see
+    common.MAX_NUM_CHANNELS; the qualitative finding is unaffected by
+    channel count) — there was no tradeoff to make here, unlike the
+    per-tick kernels below.
     """
     sigma = width_s / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # width_s = FWHM
     peak = period_s / 2.0
@@ -491,7 +561,10 @@ def _channelize_once(v: np.ndarray, num_channels: int, workers: int = PULSAR_FFT
     which is embarrassingly parallel across rows and benchmarked ~4-5x
     faster with scipy.fft's multi-threading than numpy.fft's
     single-threaded equivalent (e.g. 0.14s -> 0.03s at a 100ms pulsar
-    period, 448 channels) -- see CLAUDE.md's Benchmarking section.
+    period, measured at 448 channels before this project's channel-count
+    max was corrected to 384 -- see common.MAX_NUM_CHANNELS; the
+    qualitative finding is unaffected by channel count) -- see CLAUDE.md's
+    Benchmarking section.
     """
     n_out = v.shape[0] // num_channels
     v = v[: n_out * num_channels]
@@ -636,6 +709,20 @@ class DirectSynthesisStreamer:
         n_tiles: int = DEFAULT_N_TILES,
         tile_n_samples: Optional[int] = None,
     ):
+        if not (
+            MIN_NUM_CHANNELS <= num_channels <= MAX_NUM_CHANNELS
+            and num_channels % NUM_CHANNELS_STEP == 0
+        ):
+            raise ValueError(
+                f"num_channels={num_channels} is not a valid SPS beam "
+                f"configuration -- per the ICD, the number of channels "
+                f"assigned to a beam is configurable from "
+                f"{MIN_NUM_CHANNELS} to {MAX_NUM_CHANNELS} in steps of "
+                f"{NUM_CHANNELS_STEP} (384 channels * {CHANNEL_WIDTH_HZ:.0f}Hz "
+                f"= 300MHz is the real maximum -- 448 was never a valid "
+                f"configuration, see CLAUDE.md)."
+            )
+
         for cfg in source_cfgs:
             if cfg["kind"] not in ("tone", "pulsed"):
                 raise ValueError(
@@ -661,19 +748,23 @@ class DirectSynthesisStreamer:
                 f"pulsed source configured but base_freq_hz={base_freq_hz} -- "
                 f"dispersion physics diverges as frequency -> 0 (see "
                 f"dispersion_delay_s). The default (common.BASE_FREQ_HZ, "
-                f"confirmed as 50.78125 MHz, the lowest valid SKA-Low "
-                f"frequency) is already real and positive, so this only "
-                f"happens if base_freq_hz was explicitly overridden to "
-                f"something invalid -- pass a real, positive band-start "
-                f"frequency instead."
+                f"confirmed as 50.0 MHz, channel 64's centre frequency and "
+                f"the lowest valid SKA-Low channel) is already real and "
+                f"positive, so this only happens if base_freq_hz was "
+                f"explicitly overridden to something invalid -- pass a "
+                f"real, positive band-start frequency instead."
             )
 
         self.station = station
         self.num_channels = num_channels
         self.base_freq_hz = base_freq_hz
         self.channel_width_hz = channel_width_hz
-        # Critically sampled per-channel output rate.
-        self.channel_output_rate = channel_width_hz
+        # The real, OVERSAMPLED per-channel output sample rate -- NOT
+        # channel_width_hz (that would assume critical sampling). See
+        # common.CHANNEL_OUTPUT_RATE_HZ's docstring for the ICD reference
+        # and the derivation (32/27 oversampling factor -> 1080ns per
+        # sample, not the naive 1280ns critical-sampling period).
+        self.channel_output_rate = channel_width_hz * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
 
         self._obs_time_ref = obs_time_ref
 

@@ -10,11 +10,20 @@ independently of whatever CBF itself computes.
 
 Deployment target: one Tango device server per station, one Kubernetes
 pod per device, sending real SPEAD/UDP heaps to CBF per the SPS-CBF ICD.
-Currently developed/benchmarked at 96 channels (75 MHz); the real target
-is the full SKA-Low band, 448 channels (350 MHz) — **viable as of this
-session's allocation-overhead fix, comfortably clearing budget on target
-server hardware even with tone + noise + a pulsar combined, see
-Benchmarking below.**
+Currently developed/benchmarked at 96 channels (75 MHz); the real
+**CONFIRMED (against the real ICD text, not a screenshot or an
+assumption) maximum is 384 channels (300 MHz)** — the band is
+channelized as 384 equispaced coarse channels, configurable from 8 to
+384 in steps of 8. **448 channels/350MHz, used throughout earlier
+sessions as "the full band," was never a real configuration this
+hardware supports** — see "SPS-CBF ICD channelization" below for the
+full correction (also: the true first/lowest channel is ID 64, not 65,
+and each channel's actual per-sample period is 1080ns, not the
+1280ns a critically-sampled channelizer would give — a real ~15.6%
+tightening of the per-tick budget). `DirectSynthesisStreamer` now
+validates `num_channels` against this range and raises otherwise. See
+Benchmarking below for updated resource/timing numbers at the real
+384-channel maximum.
 
 ## Architectural decisions (settled, don't relitigate without new evidence)
 
@@ -499,6 +508,98 @@ current value on subscribe (vs. only on the next actual change) both
 depend on how the real delay-poly emulator is configured — confirm
 against it once available, not just against this assumption.
 
+## SPS-CBF ICD channelization — corrected this session
+
+Several channelization assumptions this codebase had been running on
+turned out to be wrong once checked against the real ICD text (not a
+screenshot, not carried forward from an earlier session's guess). All
+three corrections below are now reflected in `common.py`'s constants,
+`direct_synthesis.py`'s validation, and `simulator.py`'s device
+properties.
+
+1. **Maximum channel count is 384 (300MHz), not 448 (350MHz).** The ICD:
+   "The bandwidth is channelized as 384 equispaced coarse channels" and
+   "the number of frequency channels assigned to the beams is
+   configurable from 8 to 384 in steps of 8." 448 channels was used
+   throughout earlier sessions as "the full SKA-Low band" and benchmarked
+   extensively at that size — **that config was never valid on real
+   hardware.** `common.MAX_NUM_CHANNELS = 384`,
+   `common.MIN_NUM_CHANNELS = 8`, `common.NUM_CHANNELS_STEP = 8`;
+   `DirectSynthesisStreamer.__init__` now validates `num_channels`
+   against these and raises `ValueError` otherwise — this codebase can no
+   longer be silently pointed at an invalid channel count. Every "448
+   channels" figure in this file from before this correction is left as
+   historical record of what was actually measured then (not
+   retroactively rewritten) but should not be read as a currently-valid
+   configuration; see the Benchmarking section for corrected numbers at
+   the real 384-channel maximum.
+
+2. **The lowest channel is global ID 64, not 65.** The ICD: "the lowest
+   frequency channel is channel 64, centre frequency 50MHz." 64 ×
+   `CHANNEL_WIDTH_HZ` (781,250 Hz) = 50,000,000 Hz exactly, confirming
+   `BASE_FREQ_HZ` is meant as a channel **centre** frequency (matching
+   how it's used everywhere in this codebase — e.g.
+   `synth_tone_channel`'s `channel_center = base_freq_hz +
+   channel_idx*channel_width_hz` — not a band edge). Previous session's
+   channel 65/50.78125MHz was off by one channel.
+   `common.BASE_FREQ_HZ = 50.0e6`,
+   `StationConfig.first_channel_id` default changed 65 → 64 (also
+   `simulator.py`'s matching device_property default). The band's actual
+   lower **edge** (distinct from channel 64's centre) is
+   `50e6 - CHANNEL_WIDTH_HZ/2` = 49,609,375 Hz, matching the ICD's stated
+   "lower edge of this channel is 49.61MHz" — nothing in this codebase
+   needs that edge value directly, since every per-channel frequency
+   calculation here is already expressed in channel centres, but it's
+   recorded here in case a future edge-relative calculation needs it.
+
+3. **The real per-channel sample rate is oversampled by 32/27, not
+   critically sampled.** The ICD: "Each channel of data from SPS to Low
+   CBF has a sampling period of 1080 ns (1.25 ns per sample (ADC sample
+   rate) x 1024 samples x 27/32, wherein 32/27 is the oversampling factor
+   of the filterbank)." This codebase had been assuming
+   `channel_output_rate = CHANNEL_WIDTH_HZ` (i.e. a 1280ns sample period
+   — what a CRITICALLY sampled channelizer would give), missing the
+   oversampling factor entirely. `CHANNEL_WIDTH_HZ` itself
+   (781.25kHz) remains correct as-is — it's the FREQUENCY-DOMAIN channel
+   *spacing*, unaffected by oversampling (channel centres are still
+   exactly `CHANNEL_WIDTH_HZ` apart) — what was wrong is treating that
+   same number as the TIME-DOMAIN per-channel sample *rate* too.
+   `common.CHANNEL_OUTPUT_RATE_HZ = CHANNEL_WIDTH_HZ * 32/27` ≈
+   925,925.93 Hz (1080ns period, confirmed exactly:
+   `1/CHANNEL_OUTPUT_RATE_HZ = 1.08e-6 s`). **This is a real, numerically
+   significant fix, not just a naming correction**: `BLOCK_DURATION_S`
+   (the per-tick real-time budget every benchmark number in this file is
+   measured against) is `HEAP_LEN / CHANNEL_OUTPUT_RATE_HZ` = **2.21184ms
+   — about 15.6% tighter than the 2.621ms this codebase had been
+   budgeting against.** `DirectSynthesisStreamer.channel_output_rate`
+   and `ScanRunner.channel_output_rate` (`common.py`) both now use the
+   corrected rate; every per-tick timing kernel derives its sample
+   spacing from `channel_output_rate`, not `CHANNEL_WIDTH_HZ` directly,
+   so this one fix propagates correctly through tone/pulsar/noise timing
+   without further per-kernel changes. Confirmed compatible with the
+   ICD's separate packet-size constraint ("the number of samples per
+   packet shall be a multiple of the numerator of the oversampling
+   ratio," i.e. a multiple of 32): `HEAP_LEN` (2048) / 32 = 64 exactly.
+
+**A related ICD passage — REASONED THROUGH, not independently verified
+against real hardware**: "The oversampled filterbank data shall be
+derotated as well as ensuring the first sample of every SPS SPEAD packet
+has zero phase." Worked through in detail in `direct_synthesis.py`'s
+module docstring (search "OVERSAMPLING AND PER-PACKET PHASE"); short
+version: this describes a raw-PFB-output correction step this codebase
+never needs, because `synth_tone_channel`/`add_pulsar_tick` synthesize
+the already-clean, already-derotated baseband result directly rather
+than generating the raw oversampled artifact and correcting it
+afterward. The "zero phase at packet start" convention is read as a
+NORMALIZATION reference point (for a hypothetical zero-residual-
+frequency signal), which this module's phase formula already satisfies
+trivially, not as a literal per-heap phase reset for every source
+regardless of residual frequency — the latter reading would destroy the
+cross-heap phase continuity CBF's own delay-tracking and coherent
+beamforming need to recover, which seems physically implausible as the
+actual intent. Flagged honestly as reasoned-not-confirmed: revisit if a
+delay-tracking test ever shows a phase discontinuity at heap boundaries.
+
 ## SPS-CBF ICD heap structure — RESOLVED this session, was the top item
 
 One heap = ONE CHANNEL = 2048 consecutive time-domain samples, both
@@ -565,17 +666,19 @@ byte-by-byte decode of a real generated pcap's hex dump against the
 table above (every field matched, including `channel_info`'s packed
 `beam_id`/`frequency_id` and `antenna_info`'s packed station fields).
 
-**CONFIRMED**: the lowest valid frequency for the SKA-Low telescope is
-**50.78125 MHz**, which is **coarse channel ID 65** in the ICD's global
-channel numbering (65 × `CHANNEL_WIDTH_HZ` = 50,781,250 Hz exactly).
-`common.BASE_FREQ_HZ` and `StationConfig.first_channel_id`'s default (65)
-now reflect this — no longer placeholders. `direct_synthesis.py`'s
-`DEFAULT_PULSAR_BASE_FREQ_HZ` (an illustrative 50MHz stand-in) is deleted
-entirely now that `BASE_FREQ_HZ` itself is real and usable directly. This
-also fixes a real, previously-latent gap: `simulator.py`'s `StartScan`
-never overrode `base_freq_hz`, so any pulsed source configured through it
-would have hit `DirectSynthesisStreamer`'s `base_freq_hz > 0` check and
-failed outright while `BASE_FREQ_HZ` was still `0.0`.
+**CONFIRMED, then CORRECTED again the following session**: `BASE_FREQ_HZ`
+was first confirmed as 50.78125MHz (coarse channel 65), replacing an
+earlier `0.0` placeholder — this fixed a real, previously-latent gap:
+`simulator.py`'s `StartScan` never overrode `base_freq_hz`, so any
+pulsed source configured through it would have hit
+`DirectSynthesisStreamer`'s `base_freq_hz > 0` check and failed outright
+while `BASE_FREQ_HZ` was still `0.0`. `direct_synthesis.py`'s
+`DEFAULT_PULSAR_BASE_FREQ_HZ` (an illustrative 50MHz stand-in) was
+deleted at the same time, now that `BASE_FREQ_HZ` itself was real. **The
+65/50.78125MHz value itself was then found to be off by one channel** —
+see "SPS-CBF ICD channelization" above: the ICD names channel **64**
+(50.0MHz exactly) as the lowest, not 65. `common.BASE_FREQ_HZ` is now
+`50.0e6` and `StationConfig.first_channel_id`'s default is `64`.
 
 ## Known bugs — fixed (don't reintroduce), and their current status
 
@@ -748,6 +851,28 @@ reintroduce a regression into.
     hand-rolled SPEAD-64-48 encoder scoped to exactly the ICD's 6 items;
     `spead2` has been dropped from `pyproject.toml`, nothing in this
     codebase depends on it anymore.
+19. **Three channelization assumptions were wrong, all traced to not
+    having checked the real ICD text closely enough**: (a) 448 channels
+    was benchmarked and described throughout this file as "the full
+    band" — the real ICD maximum is 384 (300MHz), configurable 8-384 in
+    steps of 8; 448 was never a valid configuration. (b) the lowest
+    channel was assumed to be global ID 65 (50.78125MHz) — the ICD names
+    channel 64 (50.0MHz exactly) as the lowest. (c) `channel_output_rate`
+    was assumed equal to `CHANNEL_WIDTH_HZ` (781.25kHz, a 1280ns sample
+    period) — the ICD's filterbank oversamples by 32/27, giving a real
+    1080ns sample period (`CHANNEL_OUTPUT_RATE_HZ` ≈ 925,925.93 Hz).
+    (c) is the most consequential: it shrinks `BLOCK_DURATION_S` (the
+    per-tick real-time budget) from 2.621ms to 2.21184ms — every
+    percentage-of-budget figure in this file measured before this
+    correction is ~15.6% more optimistic than the real constraint. Fixed:
+    `common.MAX_NUM_CHANNELS`/`MIN_NUM_CHANNELS`/`NUM_CHANNELS_STEP`
+    (with `DirectSynthesisStreamer` validating against them),
+    `BASE_FREQ_HZ`/`StationConfig.first_channel_id` corrected to channel
+    64, `common.CHANNEL_OUTPUT_RATE_HZ` added and used everywhere
+    `channel_output_rate` is derived (`DirectSynthesisStreamer`,
+    `ScanRunner`) — see "SPS-CBF ICD channelization" above for the full
+    writeup, including a related derotation/phase-convention passage in
+    the ICD that was reasoned through rather than blindly implemented.
 
 ## Benchmarking
 
@@ -906,6 +1031,44 @@ real deployment needs the full comfort margin at exactly 8 cores, revisit
 of them trade memory and noise-repeat frequency for a bit more per-tick
 headroom, though the effect size hasn't been swept here.
 
+### CORRECTED combined benchmark — real 384-channel max + oversampled budget (following session)
+
+**The numbers above are superseded — re-run after the "SPS-CBF ICD
+channelization" corrections** (384-channel real maximum, not 448;
+`BLOCK_DURATION_S` = 2.21184ms, not 2.621ms — see that section for the
+full derivation). Same `benchmark_direct_synthesis.py`, same NUMA
+pinning (one node, 48 logical CPUs), same workload (tone + `n_tiles=256`
+noise bank + a 10ms/DM=2 pulsar):
+
+| channels | best config | best mean | 8 threads |
+|---|---|---|---|
+| 96 | 24 threads | 0.587ms (26.5%) | 0.689ms (31.2%) |
+| 384 | 16 threads | 1.821ms (82.3%) | 2.034ms (92.0%) |
+
+(% is of the corrected 2.212ms budget.) **The headline conclusion
+changes for the worse.** At 384 channels — fewer channels than the old
+(invalid) 448-channel config — the best-case result is 82.3% of budget,
+which is *outside* the 80%-comfort bar this project has been using
+throughout, not comfortably under it (the old 448-channel measurement
+read 71.9% best-case, comfortably under). This isn't a contradiction:
+work scales down only ~14% going from 448→384 channels, but the real
+budget is ~15.6% *tighter* than what those old numbers were measured
+against — the two effects land close enough to cancel that fewer
+channels does NOT translate into more comfortable margin once measured
+against the real budget. Repeatability-checked (5 repeats at
+`numba_threads=16`): mean 1.863ms (84.2% of budget), spread 1.769-2.074ms
+(80.0%-93.8%) — stdev 0.130ms, meaningfully noisier than the 96-channel
+case's 0.026ms, and the spread's upper end is close enough to 100% that
+an unlucky tick on this hardware could plausibly miss budget. **At
+exactly 8 threads (92.0%) this is tight, not comfortable — if a real
+deployment is hard-capped at 8 cores/pod, this configuration needs
+either fewer channels, a smaller noise bank (`n_tiles`/`tile_n_samples`
+tradeoff — not yet swept for its effect size), or accepting a
+proportionally larger overrun-tolerance margin, not just "measure once
+and move on."** Noise tile-bank memory at these settings: 6.44GB (both
+pols, `n_tiles=256`, 384 channels — smaller than the old 448-channel
+figure simply because there are fewer channels).
+
 ### One-time construction budget (new this session: target 10s, hard limit 30s)
 
 Distinct from the per-TICK budget above — this is the one-time cost of
@@ -956,6 +1119,67 @@ combined with a large noise bank at the largest settings simultaneously
 that combination used enough transient memory to threaten node stability
 on this shared host (see bug #16); if a real test scenario needs both
 large at once, budget memory as carefully as time before trying it.
+
+### CORRECTED pulsar construction budget — real 384-channel max + oversampled rate (following session)
+
+**The pulsar table above is superseded, and the news is worse, not
+better.** `n_wide = num_channels * round(period_s * channel_output_rate)`
+depends on BOTH corrected quantities (384 not 448, and
+`CHANNEL_OUTPUT_RATE_HZ` ≈ 925,925.93Hz not `CHANNEL_WIDTH_HZ` =
+781,250Hz) — the resulting array lengths are different numbers with
+noticeably WORSE factorization properties across the board, not just for
+an occasional unlucky period like 50ms used to be. Noise-bank fill
+numbers are unaffected by any of this (noise doesn't depend on
+`channel_output_rate`) and still clear the 10s target easily at 384
+channels: 0.55s / 1.18s / 2.22s at n_tiles=256/512/1024.
+
+Re-swept `build_pulsar_template` at 384 channels, the corrected
+`CHANNEL_OUTPUT_RATE_HZ`, NUMA-pinned, same host:
+
+| period | n_wide | fast-factored? | build | vs. target/limit |
+|---|---|---|---|---|
+| 5ms | 1,777,920 | No | 0.36s | OK |
+| 10ms | 3,555,456 | No | 0.61s | OK |
+| 15ms | 5,333,376 | No | 0.71s | OK |
+| 20ms | 7,111,296 | No | 3.26s | OK |
+| 25ms | 8,888,832 | No | 3.17s | OK |
+| 30ms | 10,666,752 | No | 1.57s | OK |
+| 40ms | 14,222,208 | No | 2.03s | OK |
+| 50ms | 17,777,664 | No | 5.81s | OK |
+| 60ms | 21,333,504 | No | 3.26s | OK |
+| 70ms | 24,888,960 | No | 4.52s | OK |
+| 80ms | 28,444,416 | No | 4.16s | OK |
+| 90ms | 31,999,872 | No | 11.21s | **OVER 10s TARGET** |
+| 100ms | 35,555,712 | No | 16.94s | **OVER 10s TARGET** |
+| 200ms | 71,111,040 | No | 10.38s | **OVER 10s TARGET** (barely) |
+| 300ms | 106,666,752 | No | 51.07s | **OVER 30s HARD LIMIT** |
+
+**Every single period tested comes back `fast-factored: No`** — under
+the old (uncorrected) constants, only isolated unlucky periods like 50ms
+had this problem while 100/200/300ms were well-factored and fast; under
+the corrected oversampled rate, NOTHING tested is well-factored anymore.
+This is a direct, structural consequence of the correction, not
+something a different period choice dodges: `CHANNEL_OUTPUT_RATE_HZ` is
+`CHANNEL_WIDTH_HZ * 32/27`, and that `/27` (`27 = 3^3`) means
+`round(period_s * channel_output_rate)` lands on far fewer
+small-prime-friendly integers than rounding against the old, cleaner
+`CHANNEL_WIDTH_HZ` did — `scipy.fft.next_fast_len()`'s previously-
+deferred padding fix (see the Pulsed sources section) is now a much
+higher-value target than it looked before this correction, since it
+would help essentially every period, not just occasional unlucky ones.
+
+**Approximate safe limits are now substantially tighter than previously
+documented** (still a band, not a precise threshold — see the
+run-to-run variance discussion above, unaffected by this correction):
+roughly **~80ms reliably clears the 10s target** (a real drop from the
+old ~100-200ms figure — note the non-monotonic 15ms→20ms jump, 0.71s to
+3.26s, underscoring that factorization noise dominates at these sizes
+too, not just a smooth period-vs-time curve), and the 30s hard limit is
+crossed somewhere between 200ms (10.38s, still under 30s) and 300ms
+(51.07s, well over) — call it **~200ms as the practical ceiling** until
+that range gets swept more finely. If a real test scenario needs a
+pulsar period longer than ~80ms, budget real margin and re-measure
+rather than trusting either this table or the old one.
 
 ### Historical hardware notes (legacy wideband path only, from earlier sessions)
 
@@ -1037,10 +1261,15 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    backend, and `wideband_streamer.py` plus the three separate prototype
    modules and their benchmarks were deleted (see "Code layout").
    Combined tone+noise+pulsar clears budget at 448 channels (see
-   Benchmarking's "Combined tone + tiled-noise + pulsar" subsection).
-   Remaining open items: (a) ~~decide on a real `base_freq_hz`~~ **done
-   this session**: confirmed as 50.78125 MHz (coarse channel 65) — see
-   the SPS-CBF ICD section above, (b) flux/SNR
+   Benchmarking's "Combined tone + tiled-noise + pulsar" subsection) --
+   **since superseded**: 448 channels was never a valid configuration
+   (the real ICD maximum is 384, see "SPS-CBF ICD channelization"); see
+   Benchmarking's corrected-numbers subsection for the real 384-channel
+   result.
+   Remaining open items: (a) ~~decide on a real `base_freq_hz`~~ **done,
+   then corrected the following session**: channel 64 / 50.0 MHz exactly
+   (was briefly 65/50.78125MHz, off by one channel) — see the SPS-CBF
+   ICD channelization section above, (b) flux/SNR
    calibration against the noise floor if the goal extends to testing
    whether PSS/PST can actually detect the injected pulsar, not just
    exercising delay-tracking, (c) confirm with whoever owns CBF's
@@ -1070,16 +1299,21 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    small primes than on period length itself — a poorly-factored period
    measured 3-6x slower than a well-factored neighbor of similar size
    (see the Pulsed sources section for the verified example: 50ms vs.
-   100ms). Approximate safe limits as of this session: ~100-300ms for the
-   10s target, ~300ms-0.9s for the 30s hard limit, depending on
-   factorization luck. `scipy.fft.next_fast_len()` is a promising,
-   already-identified candidate for fixing the factorization sensitivity
+   100ms). ~~Approximate safe limits as of that session: ~100-300ms for
+   the 10s target, ~300ms-0.9s for the 30s hard limit~~ **SUPERSEDED,
+   and worse, after the channelization corrections** (see "SPS-CBF ICD
+   channelization" and Benchmarking's "CORRECTED pulsar construction
+   budget" sections): every period tested now comes back
+   poorly-factored, not just occasional unlucky ones — real limits are
+   now roughly **~80ms for the 10s target, ~200ms for the 30s hard
+   limit**. `scipy.fft.next_fast_len()` is a promising, already-
+   identified candidate for fixing the factorization sensitivity
    directly, but padding correctness (keeping `_channelize_once`'s
    exact-multiple-of-`num_channels` requirement, and not silently
    changing what "one period" means to the dispersion FFT's implicit
-   circular convolution) needs real validation — not implemented, left
-   for a future session if multi-second pulsar periods become a real
-   requirement.
+   circular convolution) needs real validation — not implemented. **Now
+   a higher-priority item than before this correction**: it would help
+   essentially every period, not just the occasional unlucky one.
 9. ~~Minimize custom numba/RNG code where the per-tick budget doesn't
    require it~~ **Done this session for noise and the pulsar's wideband
    carrier** (see the Noise and Pulsed sources sections, and bug #16 for
@@ -1092,6 +1326,23 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    (a single per-tick integer hash for tile-index selection, not a
    statistical distribution, kept small and separate from the
    Box-Muller machinery it used to feed).
+10. **The 8-core/pod comfort margin no longer holds at the real
+    384-channel maximum** — see Benchmarking's "CORRECTED combined
+    benchmark" subsection: best-case is 82.3% of the corrected 2.212ms
+    budget (outside this project's own 80%-comfort bar), and exactly 8
+    threads is 92.0% (tight, not comfortable). Re-sweep
+    `n_tiles`/`tile_n_samples`'s effect on per-tick headroom (not yet
+    done), and/or confirm with whoever owns the deployment whether an
+    8-core/pod hard cap is actually fixed or has some flexibility, before
+    treating full-band + 8 cores as a settled, comfortable configuration.
+11. Confirm the "zero phase at first sample of every SPS SPEAD packet"
+    ICD passage's actual intent against real hardware/firmware or
+    whoever owns the SPS filterbank spec — this session reasoned through
+    a NORMALIZATION-convention reading (see `direct_synthesis.py`'s
+    "OVERSAMPLING AND PER-PACKET PHASE" section) and implemented nothing
+    further on that basis, but explicitly flagged it as reasoned-not-
+    verified. Revisit if a delay-tracking test ever shows a phase
+    discontinuity at heap boundaries this reasoning didn't predict.
 
 ## Setup
 
@@ -1103,7 +1354,7 @@ it from wherever you're running this before `uv sync`.
 ```
 uv sync                                              # installs everything, incl. dev group
 uv run pytest                                        # ALL correctness checks: tone, noise (kernel + tile bank), pulsar, delay feeds
-python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real multi-core timing, 96 + 448 channels, tone+noise+pulsar combined
+python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real multi-core timing, 96 + 384 (real ICD max) channels, tone+noise+pulsar combined
 ```
 
 Correctness checks used to live in `direct_synthesis.py`'s
