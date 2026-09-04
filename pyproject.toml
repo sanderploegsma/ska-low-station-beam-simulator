@@ -9,7 +9,6 @@ dependencies = [
     "numba>=0.67.0",
     "scipy>=1.15.3",
     "ska-tango-base>=1.7.0",
-    "spead2>=4.4.1",
 ]
 
 [[tool.uv.index]]

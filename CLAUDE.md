@@ -58,8 +58,9 @@ src/ska_low_station_beam_simulator/
   simulator.py                 Tango device server (StationSimulatorDevice)
   benchmark_direct_synthesis.py  benchmarks DirectSynthesisStreamer, incl. tone+noise+pulsar combined
   generate_test_pcap.py        writes a real pcap of a few SPEAD-encoded heaps, for testing the
-                                encoding path against an external unpacker (spead2 has no pcap writer
-                                of its own -- see its module docstring and bug #17)
+                                encoding path against an external unpacker (see common.py's
+                                hand-rolled SPEAD-64-48 encoder -- not spead2, see the ICD section
+                                below -- and bug #17)
 ```
 
 **This used to be two backends plus three separate experimental
@@ -498,29 +499,71 @@ current value on subscribe (vs. only on the next actual change) both
 depend on how the real delay-poly emulator is configured — confirm
 against it once available, not just against this assumption.
 
-## SPS-CBF ICD heap structure — HIGHEST-PRIORITY UNVERIFIED ITEM
+## SPS-CBF ICD heap structure — RESOLVED this session, was the top item
 
 One heap = ONE CHANNEL = 2048 consecutive time-domain samples, both
 polarisations interleaved per sample (Vreal, Vimag, Hreal, Himag, each
 int8). `pkt_len = 0x2000` (8192 bytes) confirms this: 2048 × 4 bytes.
 
-**The bit-field layout for `channel_info` and `antenna_info`
-(`common.pack_channel_info`/`pack_antenna_info`) was read off a
-SCREENSHOT of the ICD diagram, never the source document**, and the
-screenshot's own column numbering looked internally inconsistent
-(possible rendering artifact). Get this wrong and packets are malformed
-in a way that may not even error, just silently misparse. **Verify
-against the real ICD table before this touches real hardware** — nothing
-else in this codebase should be prioritized above this.
+**The bit-field layout for `channel_info`/`antenna_info` used to be read
+off a SCREENSHOT of the ICD diagram, flagged as this project's top
+unverified risk.** You've since confirmed the exact item layout against
+the real ICD directly — six items total, each an IMMEDIATE SPEAD-64-48
+item pointer (48-bit value field):
 
-**VERIFIED, no longer open**: `spead2`'s Python send API (checked
-directly against the installed `spead2==4.4.1`) does support an explicit
-`heap_counter`/`cnt` override exactly the way `common.SpsPacketizer`
-assumes — `send_heap(heap, cnt=..., substream_index=0, rate=-1.0)` on the
-concrete stream classes. See `common.py`'s module docstring for the full
-finding, including that `spead2.send.BytesStream` captures only raw
-SPEAD-protocol bytes (no pcap/UDP/IP framing) — not a pcap file on its
-own.
+| item ID | bit layout |
+|---|---|
+| `0x0001` | 8 bits reserved \| 40 bits `heap_counter` |
+| `0x0004` | 48 bits `packet_payload_length` (fixed: `0x2000`) |
+| `0x3010` | 48 bits `scan_id` |
+| `0x3000` | 16 bits reserved \| 16 bits `beam_id` \| 16 bits `frequency_id` |
+| `0x3001` | 8 bits `substation_id` \| 8 bits `subarray_id` \| 16 bits `station_id` \| 16 bits reserved |
+| `0x3300` | 48 bits `payload_offset` (fixed: `0x0` — heaps are always exactly one packet) |
+
+...followed immediately by the 8192-byte interleaved V/H I/Q payload —
+**no 7th "payload" item pointer**; CBF firmware reads the payload at a
+fixed byte offset (56 bytes in: 8-byte SPEAD header + 6×8-byte item
+pointers) rather than doing a generic SPEAD parse. `pack_channel_info`/
+`pack_antenna_info`'s bit widths turned out to match this exactly, bit
+for bit, once confirmed — no change needed there, just the "VERIFY"
+caveats removed.
+
+**A real architectural problem surfaced trying to send this via spead2,
+and it's why `common.SpsPacketizer` no longer uses spead2 at all.**
+Testing the SPEAD encoding path end-to-end (see the pcap section below)
+showed every heap coming out with 8 items instead of the ICD's 6.
+Checked directly against spead2==4.4.1's C++ source (`send_packet.cpp::
+packet_generator::next_packet`), not just its Python API: spead2's
+packet encoder unconditionally writes 4 reserved item pointers
+(`HEAP_CNT`, `HEAP_LENGTH`, `PAYLOAD_OFFSET`, `PAYLOAD_LENGTH`) at the
+start of every packet it ever emits, with **no flag, `StreamConfig`
+option, or `Heap` method to suppress any of them** — `Heap.
+repeat_pointers`, the only heap-level toggle in the public API, controls
+something unrelated (whether item pointers repeat across a fragmented
+multi-packet heap's packets, not whether this quartet appears at all).
+Since CBF's ICD heap has only 6 items total — fewer than spead2's own
+mandatory minimum of 4 reserved + any real items — **spead2 cannot
+produce a compliant packet no matter how it's configured.** A firmware
+receiver that addresses payload bytes directly at fixed offsets (rather
+than doing a generic SPEAD parse) has no way to skip items it doesn't
+expect, so this isn't cosmetic.
+
+**Fixed by replacing spead2 with a hand-rolled SPEAD-64-48 encoder**
+(`common.py`'s `_spead_header_bytes`/`_spead_item_pointer`, used by
+`SpsPacketizer.encode_channel_heap`) — scoped to exactly the 6 items
+above and nothing else. The wire format itself (8-byte header: magic
+`0x53`/version `4`, item-ID field width, heap-address field width, item
+count; then N 8-byte item pointers; then payload) matches real SPEAD,
+confirmed against spead2's own source — what differs is only which
+items get written. `spead2` has been dropped from `pyproject.toml`
+entirely; nothing in this codebase uses it anymore (`SpsPacketizer` now
+sends over a plain UDP `socket`, with dependency injection for testing —
+see its docstring). Verified two ways: an item-by-item pytest check that
+parses the encoded bytes back into (ID, value) pairs independent of the
+encoder's own logic (`tests/test_spead_packetizer.py`), and a manual
+byte-by-byte decode of a real generated pcap's hex dump against the
+table above (every field matched, including `channel_info`'s packed
+`beam_id`/`frequency_id` and `antenna_info`'s packed station fields).
 
 **CONFIRMED**: the lowest valid frequency for the SKA-Low telescope is
 **50.78125 MHz**, which is **coarse channel ID 65** in the ICD's global
@@ -676,22 +719,35 @@ reintroduce a regression into.
     multiplied `unix_to_tai2000_seconds(...)` by `CHANNEL_WIDTH_HZ` (the
     SAMPLE rate) instead of dividing by `BLOCK_DURATION_S` (the correct
     per-HEAP rate)** — inflated the value by `HEAP_LEN` (2048x). For any
-    current-era timestamp this overflows spead2's actual 40-bit `cnt`
-    limit (confirmed by directly probing the installed spead2==4.4.1:
-    `cnt` up to `2**40-1` is accepted, `2**48-1` and above raise
-    `OSError: Invalid argument`), meaning **every real
+    current-era timestamp this overflows the ICD's 40-bit `heap_counter`
+    field (the `0x0001` item — top 8 bits reserved, low 40 bits the
+    counter; see the ICD section above), meaning **every real
     `send_channel_heap()` call would have failed outright** — this had
-    silently never been caught because `spead2` usage lived only in
-    `SpsPacketizer`/the actual device server, and neither was ever
-    exercised end-to-end by this project's test suite before
-    `generate_test_pcap.py` (see "Code layout") tried to actually send a
-    heap through it for the first time. Fixed: `heap_counter =
-    unix_to_tai2000_seconds(t) / BLOCK_DURATION_S`, which keeps the
-    counter comfortably within 40 bits until roughly year 2091 — see
+    silently never been caught because nothing exercised
+    `send_channel_heap()` end-to-end before `generate_test_pcap.py` (see
+    "Code layout") tried to actually send a heap through it for the
+    first time. Fixed: `heap_counter = unix_to_tai2000_seconds(t) /
+    BLOCK_DURATION_S`, which keeps the counter comfortably within 40 bits
+    until roughly year 2091 — `encode_channel_heap` now also raises
+    `ValueError` outright if a future change ever pushes it out of range
+    again, rather than silently truncating. See
     `tests/test_spead_packetizer.py` for the regression coverage
-    (present-day and 30-years-out checks, plus an actual
-    `send_channel_heap()` call via a `BytesStream`, not just the
-    arithmetic in isolation).
+    (present-day and 30-years-out checks, an out-of-range rejection
+    check, plus an actual `send_channel_heap()` call against an injected
+    fake socket, not just the arithmetic in isolation). (This bug
+    predates, and is unrelated to, the separate spead2 item-count problem
+    described in the ICD section above — both were found by the same
+    "actually exercise this path end-to-end for the first time" session.)
+18. **spead2 cannot produce CBF's real heap format at all** — its packet
+    encoder unconditionally writes 4 reserved item pointers with no way
+    to suppress any of them, but the ICD heap has only 6 items total.
+    Every heap sent through spead2 came out with 8 items instead of 6.
+    Not a config problem, confirmed by reading spead2==4.4.1's own C++
+    source — see the SPS-CBF ICD section above for the full writeup.
+    Fixed by replacing `SpsPacketizer`'s spead2 usage entirely with a
+    hand-rolled SPEAD-64-48 encoder scoped to exactly the ICD's 6 items;
+    `spead2` has been dropped from `pyproject.toml`, nothing in this
+    codebase depends on it anymore.
 
 ## Benchmarking
 
@@ -1063,10 +1119,12 @@ Tango attribute subscription plumbing in `simulator.py` (against a fake
 `AttributeProxy`, not a live Tango context — this codebase still doesn't
 unit test the actual Tango device server layer).
 
-`pytango` and `spead2` aren't required to run the above — `simulator.py`
-degrades to stub Tango classes if `pytango` isn't installed (importable,
-not deployable), and nothing except `common.SpsPacketizer`/the actual
-device server touches `spead2`.
+`pytango` isn't required to run the above — `simulator.py` degrades to
+stub Tango classes if `pytango` isn't installed (importable, not
+deployable). `spead2` is no longer a dependency at all (see the SPS-CBF
+ICD section and bug #18 above): `common.SpsPacketizer` hand-rolls its
+own minimal SPEAD-64-48 encoder instead, since spead2's own packet
+encoder cannot produce CBF's real 6-item heap format.
 
 If this test server has machine-specific setup notes you don't want
 committed to the shared `CLAUDE.md` (paths, credentials, which NUMA nodes

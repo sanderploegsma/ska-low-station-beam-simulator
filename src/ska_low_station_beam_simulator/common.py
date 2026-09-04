@@ -16,45 +16,42 @@ implementation) so common.py stays testable and reusable independent of
 which generation strategy is behind it.
 
 ===========================================================================
-FIELDS READ OFF A SCREENSHOT OF THE ICD DIAGRAM — NOT THE SOURCE DOCUMENT.
+SPEAD ENCODING IS HAND-ROLLED, NOT VIA spead2 — see SpsPacketizer below.
 ===========================================================================
-Bit-field boundaries for `channel_info` and `antenna_info` (which fields
-pack into which bits) are my best reading of the image and are explicitly
-flagged at their definitions below. The top header row's column numbering
-also looked internally inconsistent in the image (possible rendering
-artifact) — do not trust bit offsets in this file without checking them
-against the actual ICD table. Get this wrong and every packet is
-malformed in a way that may not even error, just silently misparse.
+spead2's own packet encoder (its C++ send_packet.cpp::packet_generator::
+next_packet, checked directly against spead2==4.4.1's actual source, not
+just its Python API) unconditionally writes 4 reserved item pointers
+(HEAP_CNT, HEAP_LENGTH, PAYLOAD_OFFSET, PAYLOAD_LENGTH) at the start of
+EVERY packet it emits, with no flag, StreamConfig option, or Heap method
+to suppress any of them — it's hardcoded, not a missing config knob.
+CBF's real ICD heap has exactly 6 items total (see SpsPacketizer's ITEM
+LAYOUT), fewer than spead2's own mandatory minimum, so spead2 cannot
+produce a compliant packet no matter how it's configured. This was
+discovered the hard way: a real heap sent through spead2 came out with 8
+items instead of 6, which a firmware receiver that addresses payload
+bytes directly (rather than doing a generic SPEAD parse) would misread.
+SpsPacketizer below replaces spead2 entirely for the send path with a
+from-scratch SPEAD-64-48 item-pointer encoder.
+
+`pack_channel_info`/`pack_antenna_info`'s bit-field boundaries were
+originally read off a screenshot of the ICD diagram and flagged
+unverified; the exact widths below are now CONFIRMED against the real
+ICD (not the screenshot) and happen to match what was already there bit
+for bit.
 
 ALSO UNVERIFIED:
     - HeapAccumulator: buffers per-channel samples until 2048/channel are
       available, then emits one heap per channel.
     - TAI2000 heap_counter conversion (astropy-based, with a heavily
       caveated non-astropy fallback).
-
-VERIFIED against the installed spead2==4.4.1 API directly (not assumed):
-`send_heap(heap, cnt=..., substream_index=0, rate=-1.0)` on the concrete
-stream classes (UdpStream, BytesStream, ...) DOES take an explicit `cnt`
-override matching what SpsPacketizer.send_channel_heap already does
-below — this was previously listed here as unverified; it checks out.
-spead2 also exposes `Stream.set_cnt_sequence(next, step)` for an
-auto-incrementing counter instead, not used here since heap_counter is
-derived from heap_start_time per heap, and `send_heaps`/`HeapReference`
-for batched sends (also not used here — heaps are sent one at a time via
-sender_loop). Note spead2.send.BytesStream captures only the raw
-SPEAD-protocol bytes (`getvalue() -> bytes`, no Ethernet/IP/UDP framing,
-no pcap headers) — it is NOT a pcap file on its own; spead2 has no pcap
-*writer* at all (only `recv.Stream.add_udp_pcap_file_reader` on the
-receive side, backed by the bundled libpcap). Producing an actual pcap
-for testing (e.g. against that reader, or an external unpacker) means
-wrapping BytesStream's output in real UDP/IP/(Ethernet) framing and pcap
-record headers yourself.
 """
 
 from __future__ import annotations
 
 import logging
 import queue
+import socket
+import struct
 import threading
 import time
 from dataclasses import dataclass
@@ -364,22 +361,20 @@ class HeapAccumulator:
 
 # ============================================================
 # PACKING — channel_info / antenna_info bit layout
-# ⚠️ READ OFF A SCREENSHOT, NOT THE ICD SOURCE. VERIFY BEFORE USE.
+# CONFIRMED against the real ICD (see SpsPacketizer's ITEM LAYOUT below)
 # ============================================================
 
 
 def pack_channel_info(beam_id: int, frequency_id: int) -> int:
-    """Per diagram: [63:...] Reserved | beam_id | frequency_id [...:0].
-    Guessed widths: frequency_id 16 bits (bits 0-15), beam_id 16 bits
-    (bits 16-31), rest reserved. VERIFY against source ICD."""
+    """0x3000 item value: 16 bits reserved | 16 bits beam_id | 16 bits
+    frequency_id, within the low 48 bits of the SPEAD item pointer."""
     return ((beam_id & 0xFFFF) << 16) | (frequency_id & 0xFFFF)
 
 
 def pack_antenna_info(substation_id: int, subarray_id: int, station_id: int) -> int:
-    """Per diagram: substation_id | subarray_id | station_id | Reserved.
-    Guessed widths: station_id 16 bits (bits 16-31), subarray_id 8 bits
-    (bits 32-39), substation_id 8 bits (bits 40-47), reserved elsewhere.
-    VERIFY against source ICD."""
+    """0x3001 item value: 8 bits substation_id | 8 bits subarray_id |
+    16 bits station_id | 16 bits reserved, within the low 48 bits of the
+    SPEAD item pointer."""
     return (
         ((substation_id & 0xFF) << 40)
         | ((subarray_id & 0xFF) << 32)
@@ -411,72 +406,118 @@ def quantize_8bit(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ============================================================
-# SPEAD PACKETIZATION
+# SPEAD ENCODING — hand-rolled SPEAD-64-48, NOT spead2
+#
+# spead2 cannot produce CBF's real heap format: its packet encoder always
+# writes 4 mandatory reserved item pointers spead2 itself picks, and
+# CBF's ICD heap has only 6 items total, fewer than that mandatory
+# minimum — see this module's docstring for the full finding (checked
+# directly against spead2==4.4.1's C++ source, not assumed). The encoder
+# below is a minimal from-scratch replacement, scoped to exactly the 6
+# items CBF's firmware expects and nothing else.
 # ============================================================
+
+SPEAD_VERSION = 4
+SPEAD_ITEM_POINTER_BITS = 64
+SPEAD_HEAP_ADDRESS_BITS = 48  # SPEAD-64-48, confirmed against the real ICD
+_SPEAD_ID_BITS = SPEAD_ITEM_POINTER_BITS - 1 - SPEAD_HEAP_ADDRESS_BITS  # 15
+_SPEAD_ID_MASK = (1 << _SPEAD_ID_BITS) - 1
+_SPEAD_VALUE_MASK = (1 << SPEAD_HEAP_ADDRESS_BITS) - 1
+_SPEAD_HEAP_COUNTER_BITS = 40  # top 8 bits of the 0x0001 item are reserved
+_SPEAD_HEAP_COUNTER_MASK = (1 << _SPEAD_HEAP_COUNTER_BITS) - 1
+
+PAYLOAD_LENGTH_BYTES = 0x2000  # HEAP_LEN * 4 bytes/sample, fixed by the ICD
+
+
+def _spead_header_bytes(n_items: int) -> bytes:
+    """The 8-byte SPEAD packet header: magic (0x53) + version (0x04),
+    then the two field-width bytes spead2's own encoder also writes (item
+    ID field width in bytes, heap-address field width in bytes — fixed
+    here at SPEAD-64-48's 2 and 6), then the item-pointer count. Layout
+    matches the real SPEAD wire format (checked directly against
+    spead2==4.4.1's send_packet.cpp, not reverse-engineered from output);
+    what differs from spead2 is only WHICH items follow this header."""
+    heap_address_bytes = SPEAD_HEAP_ADDRESS_BITS // 8
+    id_bytes = (SPEAD_ITEM_POINTER_BITS // 8) - heap_address_bytes
+    word = (
+        (0x5300 | SPEAD_VERSION) << 48
+        | (id_bytes << 40)
+        | (heap_address_bytes << 32)
+        | n_items
+    )
+    return struct.pack(">Q", word)
+
+
+def _spead_item_pointer(item_id: int, value: int) -> bytes:
+    """One IMMEDIATE SPEAD-64-48 item pointer (mode bit set, value
+    embedded directly in the pointer's low 48 bits). CBF's 6-item heap
+    never needs an ADDRESS-mode pointer: even the fixed 0x2000 payload
+    length and the always-zero payload offset are immediate values here,
+    not pointers into the payload. The actual sample payload follows the
+    item pointers as raw bytes with no item pointer of its own — CBF
+    firmware reads it at a fixed byte offset (56 bytes in: 8-byte header
+    + 6*8-byte item pointers), not through generic SPEAD item addressing."""
+    if not (0 <= item_id <= _SPEAD_ID_MASK):
+        raise ValueError(f"item id {item_id:#x} does not fit in {_SPEAD_ID_BITS} bits")
+    if not (0 <= value <= _SPEAD_VALUE_MASK):
+        raise ValueError(
+            f"value {value:#x} for item {item_id:#x} does not fit in "
+            f"{SPEAD_HEAP_ADDRESS_BITS} bits"
+        )
+    pointer = (1 << 63) | (item_id << SPEAD_HEAP_ADDRESS_BITS) | value
+    return struct.pack(">Q", pointer)
 
 
 class SpsPacketizer:
+    """Encodes and sends one ChannelHeap per SPS-CBF ICD, via a hand-rolled
+    SPEAD-64-48 encoder — NOT spead2 (see this module's docstring for why
+    spead2 cannot produce this format at all).
+
+    ITEM LAYOUT (confirmed against the real ICD, six items total):
+        0x0001  8 bits reserved | 40 bits heap_counter
+        0x0004  48 bits packet_payload_length (fixed: 0x2000)
+        0x3010  48 bits scan_id
+        0x3000  16 bits reserved | 16 bits beam_id | 16 bits frequency_id
+        0x3001  8 bits substation_id | 8 bits subarray_id |
+                16 bits station_id | 16 bits reserved
+        0x3300  48 bits payload_offset (fixed: 0x0 — heaps are always
+                exactly one packet, never fragmented, so this is never
+                anything else)
+    ...followed immediately by the 8192-byte interleaved V/H I/Q payload.
+    There is no 7th "payload" item pointer — CBF firmware addresses the
+    payload bytes directly at a fixed offset after the 6 item pointers,
+    rather than doing a generic SPEAD parse (this is also exactly why
+    spead2's own extra reserved items are a real problem, not cosmetic:
+    a fixed-offset reader has no way to skip items it doesn't expect).
+    """
+
     def __init__(
         self,
         station: StationConfig,
         dest_ip: Optional[str] = None,
         dest_port: Optional[int] = None,
-        stream=None,
+        sock=None,
     ):
-        """`stream`, if given, is used directly instead of constructing a
-        live `UdpStream` from dest_ip/dest_port — lets a caller inject a
-        `spead2.send.BytesStream` to capture raw SPEAD bytes for a heap
-        instead of actually sending it (see generate_test_pcap.py, which
-        needs exactly this to produce a test pcap: spead2 has no pcap
-        writer of its own, so the raw bytes have to be captured here and
-        wrapped in real network/pcap framing separately)."""
-        import spead2
-        import spead2.send
-
+        """`sock`, if given (anything with a `.sendto(bytes, addr)`
+        method), is used directly instead of constructing a live UDP
+        socket from dest_ip/dest_port — lets a caller capture raw SPEAD
+        bytes without actually sending them (see generate_test_pcap.py),
+        or a test inject a fake socket to inspect what would be sent."""
         self.station = station
-        if stream is not None:
-            self.stream = stream
+        self.dest_addr = (dest_ip, dest_port) if dest_ip is not None else None
+        if sock is not None:
+            self._sock = sock
+        elif dest_ip is not None:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         else:
-            config = spead2.send.StreamConfig(rate=0)
-            self.stream = spead2.send.UdpStream(
-                spead2.ThreadPool(), [(dest_ip, dest_port)], config
-            )
-        self.item_group = spead2.send.ItemGroup()
+            self._sock = None
 
-        # Standard SPEAD immediate items — IDs per the diagram (0x0001,
-        # 0x0004 match SPEAD's own heap_cnt/payload_length convention).
-        # send_channel_heap's cnt=heap_counter override below is VERIFIED
-        # against spead2==4.4.1's actual API (see module docstring) — no
-        # longer an assumption.
-        self.item_group.add_item(
-            0x3010, "scan_id", "scan identifier", shape=(), format=[("u", 32)]
-        )
-        self.item_group.add_item(
-            0x3000,
-            "channel_info",
-            "packed beam_id/frequency_id",
-            shape=(),
-            format=[("u", 32)],
-        )
-        self.item_group.add_item(
-            0x3001,
-            "antenna_info",
-            "packed station/subarray/substation",
-            shape=(),
-            format=[("u", 48)],
-        )
-        self.item_group.add_item(
-            0x3300, "payload_offset", "sample offset", shape=(), format=[("u", 32)]
-        )
-        self.item_group.add_item(
-            0x3400,
-            "payload",
-            "interleaved V/H I/Q samples",
-            shape=(0x2000,),
-            dtype=np.uint8,
-        )
-
-    def send_channel_heap(self, heap: ChannelHeap):
+    def encode_channel_heap(self, heap: ChannelHeap) -> bytes:
+        """Builds the raw SPEAD-64-48 heap bytes for one channel — the
+        full on-wire payload of one UDP packet, per this class's ITEM
+        LAYOUT. Split out from send_channel_heap so callers that only
+        need the encoded bytes (generate_test_pcap.py, tests) don't need
+        a real or fake socket at all."""
         v_i8, v_q8 = quantize_8bit(heap.v_samples)
         h_i8, h_q8 = quantize_8bit(heap.h_samples)
         payload = build_heap_payload_bytes(v_i8, v_q8, h_i8, h_q8)
@@ -487,35 +528,53 @@ class SpsPacketizer:
         # here: multiplying by CHANNEL_WIDTH_HZ (the SAMPLE rate) instead
         # of dividing by BLOCK_DURATION_S (the correct HEAP rate) inflated
         # this by a factor of HEAP_LEN (2048x) -- for any current-era
-        # timestamp that overflows spead2's actual 40-bit cnt limit
-        # (confirmed by probing spead2==4.4.1 directly: cnt values up to
-        # 2**40-1 are accepted, 2**48-1 and above raise OSError), making
-        # every real send_channel_heap() call fail outright. Caught only
-        # by actually exercising this path end-to-end for the first time
-        # (generate_test_pcap.py) -- spead2/SpsPacketizer are explicitly
-        # not required to run this project's test suite (see Setup in
-        # CLAUDE.md), so this had never been exercised before. Fixed
-        # formula keeps heap_counter comfortably within 40 bits until
-        # roughly year 2091.
+        # timestamp that would overflow the ICD's 40-bit heap_counter
+        # field. Caught only by actually exercising this path end-to-end
+        # for the first time (generate_test_pcap.py) -- this had never
+        # been exercised before. Fixed formula keeps heap_counter
+        # comfortably within 40 bits until roughly year 2091.
         heap_counter = int(
             round(unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S)
         )
+        if not (0 <= heap_counter <= _SPEAD_HEAP_COUNTER_MASK):
+            raise ValueError(
+                f"heap_counter {heap_counter} does not fit in the ICD's "
+                f"{_SPEAD_HEAP_COUNTER_BITS}-bit field (top 8 bits of the "
+                f"0x0001 item are reserved)"
+            )
 
-        self.item_group["scan_id"].value = self.station.scan_id
-        self.item_group["channel_info"].value = pack_channel_info(
-            self.station.beam_id, self.station.first_channel_id + heap.channel_id
+        items = (
+            (0x0001, heap_counter),
+            (0x0004, PAYLOAD_LENGTH_BYTES),
+            (0x3010, self.station.scan_id),
+            (
+                0x3000,
+                pack_channel_info(
+                    self.station.beam_id,
+                    self.station.first_channel_id + heap.channel_id,
+                ),
+            ),
+            (
+                0x3001,
+                pack_antenna_info(
+                    self.station.substation_id,
+                    self.station.subarray_id,
+                    self.station.station_id,
+                ),
+            ),
+            (0x3300, 0x0),
         )
-        self.item_group["antenna_info"].value = pack_antenna_info(
-            self.station.substation_id,
-            self.station.subarray_id,
-            self.station.station_id,
-        )
-        self.item_group["payload_offset"].value = 0
-        self.item_group["payload"].value = np.frombuffer(payload, dtype=np.uint8)
+        pointers = b"".join(_spead_item_pointer(item_id, value) for item_id, value in items)
+        return _spead_header_bytes(len(items)) + pointers + payload
 
-        # cnt= override VERIFIED against spead2==4.4.1's real send_heap
-        # signature (see module docstring) -- no longer an assumption.
-        self.stream.send_heap(self.item_group.get_heap(), cnt=heap_counter)
+    def send_channel_heap(self, heap: ChannelHeap):
+        if self._sock is None or self.dest_addr is None:
+            raise RuntimeError(
+                "SpsPacketizer has no destination -- pass dest_ip/dest_port "
+                "(a sock alone, with no dest_ip, only supports "
+                "encode_channel_heap, not send_channel_heap)"
+            )
+        self._sock.sendto(self.encode_channel_heap(heap), self.dest_addr)
 
 
 # ============================================================

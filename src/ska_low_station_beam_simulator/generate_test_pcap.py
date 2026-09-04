@@ -1,50 +1,36 @@
 """
 Generates a small .pcap file containing a handful of heaps produced by
 DirectSynthesisStreamer's noise floor (content doesn't matter for testing
-SPEAD encoding — see below), for feeding into an external SPEAD unpacker
-or spead2.recv's own pcap-file reader.
+SPEAD encoding — see below), for feeding into an external SPEAD unpacker.
 
-spead2 has NO pcap WRITER — confirmed by inspecting the installed
-spead2==4.4.1 API directly, not assumed: spead2.send.BytesStream
-captures only the raw SPEAD-protocol bytes (getvalue() -> bytes), with
-no Ethernet/IP/UDP framing and no pcap record headers at all. It is NOT
-a pcap file on its own. spead2 DOES have a pcap file READER on the
-receive side (spead2.recv.Stream.add_udp_pcap_file_reader, backed by the
-bundled libpcap) — confirmation that a real pcap (real network framing)
-is the expected input format for testing against spead2 or an external
-unpacker. So this module does the Ethernet/IPv4/UDP + pcap-record
-wrapping itself: capture each heap's raw SPEAD bytes via
-SpsPacketizer(stream=BytesStream(...)) (see common.SpsPacketizer's
-`stream` parameter, added for exactly this), then wrap.
+common.SpsPacketizer hand-rolls its own SPEAD-64-48 encoder rather than
+using spead2 (see common.py's module docstring for why: spead2's packet
+encoder always writes 4 reserved item pointers CBF's real 6-item ICD
+heap has no room for, and there's no way to configure it not to). One
+consequence of that: this file's output is NOT expected to be parseable
+by a generic SPEAD reader like spead2.recv — it deliberately omits
+HEAP_LENGTH and repurposes the payload-offset item's ID, exactly per the
+ICD, not per generic SPEAD. So this module does its own Ethernet/IPv4/
+UDP + pcap-record wrapping around SpsPacketizer.encode_channel_heap's
+raw bytes; verify the result with `tcpdump`/Wireshark or an external
+unpacker (this codebase's "rudimentary" one), not spead2.recv.
 
 Only the noise floor is generated (no tone/pulsar, no delay_feed
 needed) — the point of this file is exercising the SPEAD encoding path
 (item packing, heap_counter, payload framing), not signal content.
 
-Building this actually caught a real, previously-undetected production
-bug (common.SpsPacketizer.send_channel_heap's heap_counter formula
+Building the ORIGINAL spead2-based version of this module caught a
+real, previously-undetected production bug (the heap_counter formula
 multiplied by CHANNEL_WIDTH_HZ, the SAMPLE rate, instead of dividing by
 BLOCK_DURATION_S, the correct per-HEAP rate — inflating it by 2048x,
-enough to overflow spead2's actual 40-bit cnt limit for any current-era
-timestamp and make every real send_channel_heap() call fail outright —
-see the fix and its comment in common.py). This had never been caught
-before because spead2 is explicitly not required to run this project's
-test suite (see CLAUDE.md's Setup section) — this module is the first
-thing that actually exercises send_channel_heap() end-to-end.
+enough to overflow the 40-bit heap_counter field for any current-era
+timestamp and make every real send fail outright — see the fix and its
+comment in common.py). This had never been caught before because
+nothing exercised send_channel_heap()/encode_channel_heap() end-to-end
+until this module did.
 
 The output IS a correct, well-formed pcap — verified independently via
-`tcpdump -r` (not just by this module's own logic) — and a SMALL
-synthetic heap round-trips successfully through spead2.recv.Stream's
-OWN `add_udp_pcap_file_reader`, confirming the encoding/framing is sound
-at the protocol level. However, a FULL heap (the real ICD's 8192-byte
-payload, ~9.2KB once SPEAD-encoded and UDP/IP/Ethernet-wrapped) is
-silently DROPPED when read back that same way — `add_udp_pcap_file_reader`
-takes only `(filename, filter)`, with no exposed way to raise whatever
-internal packet-size limit is causing this (not a `StreamConfig` option
-either). This is a real limitation of spead2's OWN pcap reader, not a
-flaw in the pcap this module produces — to inspect full-size heaps,
-use `tcpdump`/Wireshark or an external unpacker (this codebase's
-"rudimentary" one) instead of spead2.recv for reading this file back.
+`tcpdump -r`, not just by this module's own logic.
 
 Run: python -m ska_low_station_beam_simulator.generate_test_pcap [output.pcap] [n_heaps]
 """
@@ -55,9 +41,6 @@ import socket
 import struct
 import sys
 import time
-
-import spead2
-import spead2.send
 
 from ska_low_station_beam_simulator.common import (
     ChannelHeap,
@@ -138,16 +121,6 @@ def _pcap_record(frame: bytes, timestamp: float) -> bytes:
     return struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame)) + frame
 
 
-def _capture_heap_bytes(heap: ChannelHeap, station: StationConfig) -> bytes:
-    """Uses SpsPacketizer backed by a fresh BytesStream to capture
-    exactly this heap's raw SPEAD bytes -- a fresh stream per heap avoids
-    needing to track byte offsets into a shared, growing buffer."""
-    stream = spead2.send.BytesStream(spead2.ThreadPool())
-    packetizer = SpsPacketizer(station, stream=stream)
-    packetizer.send_channel_heap(heap)
-    return stream.getvalue()
-
-
 def generate_test_pcap(output_path: str, n_heaps: int = 5) -> None:
     station = StationConfig(station_id=1, substation_id=0, subarray_id=1, beam_id=1, scan_id=1)
     obs_time = time.time()
@@ -160,6 +133,9 @@ def generate_test_pcap(output_path: str, n_heaps: int = 5) -> None:
         streamer.num_channels, obs_time, streamer.channel_output_rate,
         channel_id_map=streamer.channel_id_map,
     )
+    # No dest_ip/sock needed -- this module only calls encode_channel_heap,
+    # never send_channel_heap, so SpsPacketizer never touches a socket.
+    packetizer = SpsPacketizer(station)
 
     n_samples = streamer.tick_n_samples()
     tick_dt = n_samples / streamer.channel_output_rate
@@ -178,7 +154,7 @@ def generate_test_pcap(output_path: str, n_heaps: int = 5) -> None:
     with open(output_path, "wb") as f:
         f.write(_pcap_global_header())
         for heap in heaps[:n_heaps]:
-            raw_bytes = _capture_heap_bytes(heap, station)
+            raw_bytes = packetizer.encode_channel_heap(heap)
             frame = _wrap_udp_frame(raw_bytes, SRC_IP, DST_IP, SRC_PORT, DST_PORT)
             f.write(_pcap_record(frame, heap.heap_start_time))
 
