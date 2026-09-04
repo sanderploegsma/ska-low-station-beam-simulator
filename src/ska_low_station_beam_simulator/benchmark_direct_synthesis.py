@@ -100,8 +100,17 @@ def benchmark_tick(
     n_warmup: int = 5,
     n_measured: int = 30,
 ) -> dict:
-    """n_warmup also absorbs numba JIT compilation cost for the first call
-    to each kernel."""
+    """``n_warmup`` also absorbs numba JIT compilation cost for the first
+    call to each kernel.
+
+    :param streamer: the streamer to benchmark.
+    :param n_samples: per-channel samples to request per
+        ``generate_next_tick`` call.
+    :param n_warmup: unmeasured calls before timing starts.
+    :param n_measured: timed calls to average over.
+    :returns: a dict of ``mean_ms``/``median_ms``/``stdev_ms``/``min_ms``/
+        ``max_ms`` timings across the measured calls.
+    """
     obs_time = 1_800_000_000.0
     tick_dt = n_samples / streamer.channel_output_rate
 

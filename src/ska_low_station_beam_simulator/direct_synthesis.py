@@ -3,69 +3,54 @@ Direct per-channel synthesis — the SOLE signal-generation backend for
 this simulator. Bypasses wideband time-domain generation + FFT
 channelization for the per-tick hot path entirely, for all three source
 types this simulator supports: TONE, per-pol station (receiver) NOISE,
-and PULSED (pulsar) sources.
+and PULSED (pulsar) sources. This module's development history
+(prototypes it converged from, deleted legacy paths, design iterations
+that were tried and rejected) lives in CLAUDE.md, not here — this
+docstring describes only the design as it stands.
 
-THIS MODULE IS A CONVERGENCE of four earlier, separate pieces (see git
-history for their individual development):
-    - This module's own original scope (tone + live-generated noise).
-    - tiled_noise_streamer.py's pre-generated noise TILE BANK, adopted
-      here as the noise strategy (replacing live per-tick Box-Muller
-      generation) specifically so a station pod can meet a small
-      (~8 core) CPU budget at full 384-channel band (the real ICD
-      maximum -- see common.MAX_NUM_CHANNELS) -- see the tile-bank
-      section below for the resource/fidelity tradeoff this involves.
-    - pulsed_source_streamer.py's coherent, dispersion-aware pulsar
-      generation (v3 of that module's design -- see its section below
-      for why v1 and v2 were wrong).
-    - wideband_streamer.py's StationStreamer, the legacy wideband+FFT
-      path, is now DELETED. It was kept only as a fallback for pulsed
-      sources; now that pulsed sources have a direct per-channel
-      representation, nothing in this simulator needs the wideband+FFT
-      path at all. WidebandChannelizer's one remaining use (a one-time,
-      offline channelization step for pulsar template construction) is
-      reimplemented as a small standalone function below
-      (_channelize_once) rather than kept as a live dependency on a
-      deleted module.
+WHY DIRECT SYNTHESIS AT ALL — the reason none of the three source types
+touch a per-tick FFT:
 
-WHY DIRECT SYNTHESIS AT ALL (the original rationale, still the reason
-none of the three source types touch a per-tick FFT):
-    - Per-tick work for a wideband+FFT approach scales as O(NUM_CHANNELS)
-      for generation, worse than O(NUM_CHANNELS) for the FFT (N log N).
-    - The per-tick TIME BUDGET is fixed (BLOCK_DURATION_S =
-      HEAP_LEN/CHANNEL_OUTPUT_RATE_HZ, the real OVERSAMPLED per-channel
-      sample rate -- see common.py), independent of channel count.
+    - Per-tick work for a wideband+FFT approach scales as
+      O(NUM_CHANNELS) for generation, worse than O(NUM_CHANNELS) for the
+      FFT (N log N).
+    - The per-tick TIME BUDGET is fixed (``BLOCK_DURATION_S`` =
+      ``HEAP_LEN``/``CHANNEL_OUTPUT_RATE_HZ``, the real OVERSAMPLED
+      per-channel sample rate -- see ``common.py``), independent of
+      channel count.
     - Scaling from 96 channels (75 MHz) to 384 channels (300 MHz, the
-      real ICD maximum -- 8 to 384 in steps of 8, NOT 448/350MHz as
-      earlier sessions assumed, see CLAUDE.md's SPS-CBF ICD section) is a
-      large increase in work against an unchanged budget. Direct,
-      closed-form (or precomputed-and-replayed) per-channel generation is
-      what makes 384 channels viable at all on real target hardware --
-      see CLAUDE.md's Benchmarking section.
+      real ICD maximum -- 8 to 384 in steps of 8, see CLAUDE.md's SPS-CBF
+      ICD section) is a large increase in work against an unchanged
+      budget. Direct, closed-form (or precomputed-and-replayed)
+      per-channel generation is what makes 384 channels viable at all on
+      real target hardware -- see CLAUDE.md's Benchmarking section.
 
-============================================================
 TONE
-============================================================
+====
+
 Spectrally sparse — after channelization it lives almost entirely in ONE
 channel. Synthesized directly via a closed-form complex exponential at
 the tone's frequency residual relative to that channel's center. Cost is
 O(1) per tone — INDEPENDENT of total channel count. Delay is a
 CONTINUOUS PHASE TERM applied directly in the exponent — no ring buffer,
 no coarse/fine integer-sample split. This is EXACT for a truly
-monochromatic tone (verified in tests/test_direct_synthesis.py to ~1e-9), not an approximation.
+monochromatic tone (verified in ``tests/test_direct_synthesis.py`` to
+~1e-9), not an approximation.
 
-============================================================
-OVERSAMPLING AND PER-PACKET PHASE (reasoned through, NOT independently
-verified against real SPS hardware -- flagged honestly as such)
-============================================================
-The ICD states the SPS filterbank OVERSAMPLES by 32/27 (see
-common.CHANNEL_OUTPUT_RATE_HZ -- this is now correctly reflected in
-channel_output_rate below, and is a real, numerically significant fix:
-it shrinks the per-tick budget from 2.621ms to 2.212ms, ~15.6% tighter).
-The same ICD passage also says the oversampled filterbank output "shall
-be derotated" and that "the first sample of every SPS SPEAD packet has
-zero phase". Worked through here rather than modeled blindly, since a
-literal per-heap phase RESET would be a much bigger, more invasive
-change than the sample-rate fix if it turned out to be necessary:
+OVERSAMPLING AND PER-PACKET PHASE
+==================================
+
+Reasoned through, NOT independently verified against real SPS hardware
+-- flagged honestly as such. The ICD states the SPS filterbank
+OVERSAMPLES by 32/27 (see ``common.CHANNEL_OUTPUT_RATE_HZ`` -- this is
+now correctly reflected in ``channel_output_rate`` below, and is a real,
+numerically significant fix: it shrinks the per-tick budget from
+2.621ms to 2.212ms, ~15.6% tighter). The same ICD passage also says the
+oversampled filterbank output "shall be derotated" and that "the first
+sample of every SPS SPEAD packet has zero phase". Worked through here
+rather than modeled blindly, since a literal per-heap phase RESET would
+be a much bigger, more invasive change than the sample-rate fix if it
+turned out to be necessary:
 
   - An oversampled polyphase filterbank's RAW per-channel output (before
     correction) carries a spurious, purely mechanical phase ramp from
@@ -81,17 +66,17 @@ change than the sample-rate fix if it turned out to be necessary:
     residual) input, phase is defined to read exactly zero at each
     packet's first sample.
   - This module never generates the raw, undecorated PFB artifact at
-    all -- synth_tone_channel/add_pulsar_tick synthesize the ALREADY-
-    CLEAN baseband result directly (residual_freq relative to channel
-    centre, continuously evolving with absolute time, no window-hop
-    artifact to begin with). Under the reading above, that means this
-    module's output already satisfies BOTH ICD requirements by
-    construction: there is no oversampling ramp to derotate because none
-    was ever introduced, and for the zero-residual-frequency case (the
-    convention's own reference point) this module's phase formula
+    all -- ``synth_tone_channel``/``add_pulsar_tick`` synthesize the
+    ALREADY-CLEAN baseband result directly (``residual_freq`` relative
+    to channel centre, continuously evolving with absolute time, no
+    window-hop artifact to begin with). Under the reading above, that
+    means this module's output already satisfies BOTH ICD requirements
+    by construction: there is no oversampling ramp to derotate because
+    none was ever introduced, and for the zero-residual-frequency case
+    (the convention's own reference point) this module's phase formula
     already evaluates to exactly zero at every sample, first-of-packet
-    included -- trivially, since phase = 2*pi*residual_freq*t_local is
-    identically zero for all t_local when residual_freq = 0.
+    included -- trivially, since ``phase = 2*pi*residual_freq*t_local``
+    is identically zero for all ``t_local`` when ``residual_freq = 0``.
   - What this does NOT resolve with certainty: whether CBF's receiver
     additionally expects literal per-heap phase discontinuities for a
     GENUINELY off-centre residual frequency (i.e. whether "zero phase at
@@ -111,31 +96,24 @@ change than the sample-rate fix if it turned out to be necessary:
     phase discontinuity at heap boundaries that this reasoning didn't
     predict.
 
-============================================================
-NOISE — pre-generated tile bank (adopted from tiled_noise_streamer.py)
-============================================================
+NOISE — pre-generated tile bank
+================================
+
 Once the bank exists, per-tick cost is an index hash + a memcopy —
 independent of channel count and, past a couple of threads, independent
 of CPU budget too (benchmarked: ~8 cores clears the full 384-channel
-budget with room to spare; even 1-2 would). This is NOT a free upgrade over
-live per-tick generation — it is a deliberate fidelity/resource tradeoff,
-and the tradeoff is REPEATS, not noise or CPU cost:
+budget with room to spare; even 1-2 would). This is NOT a free upgrade
+over live per-tick generation — it is a deliberate fidelity/resource
+tradeoff, and the tradeoff is REPEATS, not noise or CPU cost:
 
-Filling the bank itself is plain `numpy.random.Generator` (see
-DirectSynthesisStreamer.__init__), not custom RNG code — an earlier
-version of this module used a hand-rolled splitmix64 hash + Box-Muller
-kernel here specifically because it needed per-tick, per-sample live
-generation under numba (which doesn't support numpy's Philox/PCG64 in
-nopython mode — see bug #7). Once noise moved to "generate once at
-construction, replay per tick" (this section), that constraint no longer
-applies: bank-filling is a ONE-TIME, offline call, so there's no reason
-to avoid numpy's own (better-tested) Generator there. Parallelized via a
-plain `ThreadPoolExecutor` over independent `SeedSequence.spawn()`
-children — numpy's Generator releases the GIL during generation, so this
-is genuine multi-core speedup with zero custom numerical code, not
-numba's kind of parallelism. See CLAUDE.md's Benchmarking section for
-the one-time construction-time budget this needs to fit (target 10s,
-hard limit 30s) and measurements confirming it does.
+Filling the bank itself is plain ``numpy.random.Generator`` (see
+``DirectSynthesisStreamer.__init__``) — a ONE-TIME, offline call at
+construction, parallelized via a plain ``ThreadPoolExecutor`` over
+independent ``SeedSequence.spawn()`` children. numpy's Generator
+releases the GIL during generation, so this is genuine multi-core
+speedup with zero custom numerical code. See CLAUDE.md's Benchmarking
+section for the one-time construction-time budget this needs to fit
+(target 10s, hard limit 30s) and measurements confirming it does.
 
   - By the birthday paradox, a station's OWN tile-index sequence hits
     its first repeat after roughly 1.25*sqrt(n_tiles) ticks. For any
@@ -158,61 +136,42 @@ hard limit 30s) and measurements confirming it does.
     breaking beamforming-SNR and cross-correlation tests that rely on
     receiver noise being uncorrelated between stations.
 
-`n_tiles` and `tile_n_samples` ("tile width") are both configurable —
-see DirectSynthesisStreamer's constructor. Bigger tiles or more of them
-cost more one-time build time and memory (linear in both) and push the
-first-repeat point out (roughly as sqrt(n_tiles), NOT linearly — no
+``n_tiles`` and ``tile_n_samples`` ("tile width") are both configurable
+— see ``DirectSynthesisStreamer``'s constructor. Bigger tiles or more of
+them cost more one-time build time and memory (linear in both) and push
+the first-repeat point out (roughly as sqrt(n_tiles), NOT linearly — no
 memory-feasible size makes repeats rare over a full scan; it only delays
 them a bit).
 
-Also fixes a real physics bug present in the now-deleted
-wideband_streamer.py: station (receiver) noise there got delay-corrected
-identically to the sky signal, which is wrong — receiver noise
+Noise never enters a delay pipeline here at all: receiver noise
 originates locally at each station, after any signal-path delay would
-apply. Noise never enters a delay pipeline here at all (by construction,
-not as a patch).
+apply, so applying station delay to it would be physically wrong.
 
-============================================================
-PULSED (pulsar) sources — v3 design (from pulsed_source_streamer.py)
-============================================================
+PULSED (pulsar) sources
+=======================
+
 A pulsar is genuinely periodic, unlike noise: replaying one precomputed
 period isn't a fidelity compromise, it's ground truth. So there is no
 birthday-paradox tradeoff for pulsars — periodicity here is exact, to
-the precision this simulator needs.
+the precision this simulator needs. (This design's rejected earlier
+iterations, and why each was wrong, are documented in CLAUDE.md's
+Pulsed sources section, not here.)
 
-THIS WENT THROUGH THREE DESIGNS before arriving at the current one — the
-history matters because each wrong version looked reasonable until it
-was actually built and numerically checked, not just reasoned about:
-
-  v1 (WRONG): each channel sees one constant DM delay (evaluated at that
-  channel's center frequency only), applied to a real-valued achromatic
-  envelope; per-tick geometric delay via a first-order Taylor correction.
-  v2 (fixed intra-channel smear, still broken for beamforming): a
-  channel isn't one frequency, it's a ~781kHz passband — at SKA-Low
-  frequencies, even DM=2 pc/cm^3 (a low, realistic value) smears the
-  dispersion curve across tens of thousands of channel-widths at the
-  bottom of the band, a real low-frequency-radio effect, not a bug. v2
-  fixed this by averaging many shifted copies of the profile across each
-  channel's own passband. But v2 was still real-valued (no carrier),
-  which turns out to be a bigger problem: CBF's beamformer coherently
-  combines stations by phase-rotating already-channelized complex data —
-  physically valid only because a real channelizer inherently produces
-  complex output with genuine carrier phase. Real-valued content has no
-  phase for that rotation to act on, so v2 could not be coherently
-  beamformed across stations at all (tone doesn't have this problem — it
-  has a genuine residual-frequency carrier by construction).
-  v3 (current): generate the wideband, undispersed pulse train as one
-  real time series spanning the whole band (a shared "sky carrier" — see
-  below), apply the standard coherent-dispersion transfer function
-  (Lorimer & Kramer 2006, eq. 5.21) directly to its full complex FFT,
-  then channelize (_channelize_once, a one-time, offline call — not a
-  hot-path FFT). This fixes both v1/v2 problems at once: intra-channel
-  smear falls out correctly as an emergent property of dispersing at
-  full wideband FFT resolution before channelizing, and channelizing a
-  real signal via FFT inherently produces genuinely complex per-channel
-  content with real carrier phase — which lets the per-tick geometric-
-  delay correction use tone's EXACT phase trick instead of a Taylor
-  approximation.
+The current design generates the wideband, undispersed pulse train as
+one real time series spanning the whole band (a shared "sky carrier" —
+see below), applies the standard coherent-dispersion transfer function
+(Lorimer & Kramer 2006, eq. 5.21) directly to its full complex FFT, then
+channelizes (``_channelize_once``, a one-time, offline call — not a
+hot-path FFT). Dispersing at full wideband FFT resolution before
+channelizing correctly captures intra-channel dispersion smear as an
+emergent property of the FFT resolution (a real low-frequency-radio
+effect at SKA-Low frequencies — even DM=2 pc/cm^3 smears the dispersion
+curve across tens of thousands of channel-widths at the bottom of the
+band). Channelizing a real signal via FFT also inherently produces
+genuinely complex per-channel content with real carrier phase, which
+CBF's beamformer needs (it coherently combines stations by
+phase-rotating already-channelized complex data) and which lets the
+per-tick geometric-delay correction use tone's EXACT phase trick.
 
 Verified against an external, peer-reviewed reference, not just internal
 self-consistency: this module's dispersion constant (4148.808) matches
@@ -220,10 +179,10 @@ NANOGrav's PsrSigSim package's DM_K (1/2.41e-4 = 4149.38) to 0.014% —
 the same standard literature constant, cross-validated independently
 (PsrSigSim itself wasn't taken as a runtime dependency: its own package
 is heavy and partially broken for this purpose — pulls in PINT, fitsio,
-emcee, nestle, matplotlib just to import; its BasebandSignal.to_RF/
-to_FilterBank conversions are unimplemented stubs — so its
-ISM._disperse_baseband physics was read directly and reimplemented here
-instead).
+emcee, nestle, matplotlib just to import; its ``BasebandSignal.to_RF``/
+``to_FilterBank`` conversions are unimplemented stubs — so its
+``ISM._disperse_baseband`` physics was read directly and reimplemented
+here instead).
 
 WHY THE "SKY CARRIER" IS SHARED ACROSS STATIONS, NOT PER-STATION —
 opposite of the rule for noise, easy to get backwards: every station in
@@ -231,9 +190,9 @@ a real array observes the literal same wavefront from the same source,
 just arriving at a different time because of geometry — that's the
 entire physical basis of interferometry. So the wideband pulse train's
 random carrier is generated from a single fixed seed shared by every
-station simulating this pulsar, never from station.station_id. Receiver
-noise is the opposite: independently seeded per station, because each
-station's receiver is a physically separate noise source.
+station simulating this pulsar, never from ``station.station_id``.
+Receiver noise is the opposite: independently seeded per station,
+because each station's receiver is a physically separate noise source.
 
 WHAT PULSED SOURCES DO NOT MODEL: pulse-to-pulse jitter, scintillation,
 nulling, profile evolution with frequency, or realistic flux/SNR
@@ -242,26 +201,24 @@ matters specifically if the goal is testing whether PSS/PST can actually
 detect the injected pulsar as a candidate, not just exercising
 delay-tracking.
 
-============================================================
 NUMBA — only where the PER-TICK budget actually requires it
-============================================================
-numba is deliberately NOT used for anything that only runs once at
-construction anymore (noise-bank fill, the pulsar's wideband sky-carrier
-generation — both now plain/parallelized numpy, see their sections
-above). It earns its complexity only for genuinely per-tick, hot-path
-work, benchmarked directly against plain numpy alternatives before
-committing to it (see CLAUDE.md's benchmarking notes):
-    - `synth_tone_channel` / `add_pulsar_tick`: fused per-(sample,
-      channel) loops that avoid full-array temporaries — the pulsar
-      kernel specifically needed a phase-accumulator (NCO-style)
-      recurrence rather than calling cos/sin per (sample, channel); that
-      mistake alone needed 4x the threads to clear budget.
-    - `_splitmix64_hash`: the ONLY RNG-shaped code left as custom numba —
-      used solely for picking each tick's noise tile index (a single
-      integer hash + modulo, not a statistical distribution), because it
-      must be callable per-tick with zero allocation from inside
-      `generate_next_tick`. Deliberately kept small and separate from the
-      (now-removed) Box-Muller machinery it used to feed.
+==============================================================
+
+numba is used only for genuinely per-tick, hot-path work — construction-
+time work (noise-bank fill, the pulsar's wideband sky-carrier
+generation) is plain/parallelized numpy instead, see their sections
+above and CLAUDE.md's benchmarking notes:
+
+    - ``synth_tone_channel``/``add_pulsar_tick``: fused per-(sample,
+      channel) loops that avoid full-array temporaries. ``add_pulsar_tick``
+      uses a phase-accumulator (NCO-style) recurrence rather than calling
+      cos/sin per (sample, channel), which is significantly cheaper (see
+      CLAUDE.md's bug #15).
+    - ``_splitmix64_hash``: the only RNG-shaped code that's custom
+      numba — used solely for picking each tick's noise tile index (a
+      single integer hash + modulo, not a statistical distribution),
+      because it must be callable per-tick with zero allocation from
+      inside ``generate_next_tick``.
 """
 
 from __future__ import annotations
@@ -325,52 +282,28 @@ DEFAULT_SKY_SEED = 0x5AB1E5EED
 
 @njit(cache=True)
 def _splitmix64_hash(seed, index):
-    """Deterministic (seed, index) -> uint64 hash, used ONLY to pick each
-    tick's noise tile index (`generate_next_tick`: `_splitmix64_hash(seed,
-    tick_index) % n_tiles`) -- not a statistical distribution, just a
-    well-distributed integer.
+    """Deterministic ``(seed, index) -> uint64`` hash, used ONLY to pick
+    each tick's noise tile index (``generate_next_tick``:
+    ``_splitmix64_hash(seed, tick_index) % n_tiles``) -- not a
+    statistical distribution, just a well-distributed integer.
 
-    WHY NOT JUST DRAW FROM A NUMPY RNG, e.g. `Generator(PCG64(seed))
-    .integers(0, n_tiles)`: a numpy Generator is STATEFUL and
-    SEQUENTIAL -- each call advances it, so the value you get for "tick
-    N" depends on how many times the generator has already been called,
-    not on N itself. That's fine for the noise tile BANK's own content
-    (fill_noise_bank generates it all in one sequential pass, once, and
-    never needs to reproduce a specific earlier draw in isolation) but
-    wrong for tile SELECTION, which must be a pure function of tick index
-    alone: `ScanRunner`/tests can and do call `generate_next_tick` with
-    the SAME `t` twice and require byte-identical output (see
-    test_tile_bank_determinism) -- a stateful sequential generator would
-    advance on the second call and pick a DIFFERENT tile. This function
-    gives that "pure function of an arbitrary index" property directly,
-    with no state to track across calls.
+    Must be a PURE FUNCTION of ``index`` alone, with no state to track
+    across calls: ``ScanRunner``/tests can and do call
+    ``generate_next_tick`` with the SAME ``t`` twice and require
+    byte-identical output (see ``test_tile_bank_determinism``), which
+    rules out a stateful/sequential generator (a plain numpy
+    ``Generator`` would advance and pick a different tile on the second
+    call). Kept as a hand-rolled ``@njit`` function rather than an
+    off-the-shelf numpy RNG for performance reasons benchmarked directly,
+    not assumed -- see CLAUDE.md's bug #7 for the comparison against
+    ``numpy.random.Philox`` (the one numpy BitGenerator that could
+    otherwise provide this same "seek to an arbitrary index" property).
 
-    WHY NOT `numpy.random.Philox` specifically -- it's the one numpy
-    BitGenerator that actually supports exactly this via an explicit
-    `counter=` constructor argument, so it's the more obvious
-    off-the-shelf fit than PCG64. Two reasons it's still not used here:
-    (1) constructing a fresh `Philox(key=seed, counter=tick_index)` +
-    `Generator` PER TICK measured ~12.7us/call, vs. ~0.13us/call for this
-    numba-jitted hash -- ~100x slower for work this function reduces to
-    a handful of integer ops (Philox's per-call cost is Python/pybind11
-    object construction overhead, not the underlying algorithm). At 2
-    pols/tick that's a ~25us/tick difference either way is small against
-    the 2621us budget, but there's no correctness or simplicity upside to
-    spending it. (2) Philox is built to produce full statistical
-    distributions (uniform floats, normals, etc.) at cryptographic-ish
-    quality; picking one of `n_tiles` tiles doesn't need that rigor, just
-    a well-distributed integer -- confirmed statistically sound here via
-    a 200-seed sweep whose mean first-repeat-tick matches the
-    birthday-paradox prediction (~1.25*sqrt(n_tiles)) closely (see the
-    Noise section in CLAUDE.md).
-
-    Verified NOT worth removing the @njit here either, even though this
-    is called only from plain Python (`generate_next_tick`, not from
-    inside another numba kernel): benchmarked at ~25x faster than the
-    equivalent plain-Python/numpy-scalar version (0.13us vs. 3.3us/call)
-    -- numba compiles the whole function to one native routine, while
-    plain Python pays per-operation overhead for each `np.uint64(...)`
-    scalar op in the body.
+    :param seed: this source's own seed (e.g. a station's per-pol noise
+        seed).
+    :param index: the tick index to hash.
+    :returns: a well-distributed ``uint64``, to be reduced mod
+        ``n_tiles``.
     """
     x = (np.uint64(seed) ^ (np.uint64(index) * GOLDEN)) & MASK64
     x = (x + GOLDEN) & MASK64
@@ -383,9 +316,15 @@ def _splitmix64_hash(seed, index):
 
 @njit(cache=True)
 def eval_delay_poly_ns(coeffs, t_rel):
-    """t_rel MUST already be relative to the polynomial's own
-    start_validity_sec (small magnitude) — same precision-safety
-    requirement established for common.DelayPolynomial."""
+    """``t_rel`` MUST already be relative to the polynomial's own
+    ``start_validity_sec`` (small magnitude) — same precision-safety
+    requirement established for ``common.DelayPolynomial``.
+
+    :param coeffs: polynomial coefficients, ascending order.
+    :param t_rel: time relative to the polynomial's own
+        ``start_validity_sec``.
+    :returns: delay, in nanoseconds.
+    """
     tau_ns = 0.0
     power = 1.0
     for c in range(coeffs.shape[0]):
@@ -408,11 +347,26 @@ def synth_tone_channel(
     sample_rate_per_channel,
     n_samples,
 ):
-    """
-    Returns (channel_index, samples). Delay applied as continuous phase
-    modulation — no ring buffer, no coarse/fine split. poly_t_rel_start
-    and t_local_rel_start are both small-magnitude relative times (see
+    """Synthesizes ``n_samples`` of a tone in whichever channel ``freq_hz``
+    maps to. Delay applied as continuous phase modulation — no ring
+    buffer, no coarse/fine split. ``poly_t_rel_start`` and
+    ``t_local_rel_start`` are both small-magnitude relative times (see
     module docstring's note on why raw epoch time breaks this).
+
+    :param freq_hz: the tone's absolute frequency.
+    :param amplitude: the tone's amplitude.
+    :param base_freq_hz: channel 0's centre frequency.
+    :param channel_width_hz: channel spacing.
+    :param delay_coeffs: this source's delay polynomial coefficients.
+    :param poly_t_rel_start: time relative to the polynomial's own
+        ``start_validity_sec``, at sample 0.
+    :param ypol_offset_ns: H-pol delay offset, in nanoseconds.
+    :param is_h_pol: whether this call is for the H polarisation.
+    :param t_local_rel_start: time relative to ``obs_time_ref``, at
+        sample 0.
+    :param sample_rate_per_channel: the per-channel output sample rate.
+    :param n_samples: how many samples to synthesize.
+    :returns: a ``(channel_index, samples)`` tuple.
     """
     channel_idx = int(round((freq_hz - base_freq_hz) / channel_width_hz))
     channel_center = base_freq_hz + channel_idx * channel_width_hz
@@ -439,44 +393,39 @@ def synth_tone_channel(
 
 
 def fill_noise_bank(seed: int, std: float, n_tiles: int, tile_n_samples: int, num_channels: int) -> np.ndarray:
-    """Fills a (n_tiles, tile_n_samples, num_channels) complex128 bank of
-    independent complex Gaussian noise — statistically exact equivalent
-    of "wideband noise, then FFT channelized" (DFT of i.i.d. Gaussian is
-    i.i.d. Gaussian). NO delay applied — physically correct for receiver
-    noise (see module docstring).
+    """Fills a ``(n_tiles, tile_n_samples, num_channels)`` complex128 bank
+    of independent complex Gaussian noise — statistically exact
+    equivalent of "wideband noise, then FFT channelized" (DFT of i.i.d.
+    Gaussian is i.i.d. Gaussian). NO delay applied — physically correct
+    for receiver noise (see module docstring).
 
-    Parallelized across a plain ThreadPoolExecutor over independent
-    numpy.random.SeedSequence children — numpy's Generator releases the
-    GIL during generation, so this genuinely uses multiple cores despite
-    being plain Python/numpy, no numba required. Deterministic given
-    (seed, n_tiles, tile_n_samples, num_channels): unlike the per-tick
-    tile REPLAY (which must be a pure function of tick index so the same
-    tick can be regenerated identically), the BANK ITSELF is built
-    exactly once and never regenerated mid-scan, so it only needs to be
-    reproducible run-to-run, not seekable to an arbitrary offset — a
-    single seeded Generator stream is sufficient.
+    Parallelized across a plain ``ThreadPoolExecutor`` over independent
+    ``numpy.random.SeedSequence`` children — numpy's Generator releases
+    the GIL during generation, so this genuinely uses multiple cores
+    despite being plain Python/numpy, no numba required. Deterministic
+    given ``(seed, n_tiles, tile_n_samples, num_channels)``: unlike the
+    per-tick tile REPLAY (which must be a pure function of tick index so
+    the same tick can be regenerated identically), the BANK ITSELF is
+    built exactly once and never regenerated mid-scan, so it only needs
+    to be reproducible run-to-run, not seekable to an arbitrary offset —
+    a single seeded Generator stream is sufficient.
 
     Each worker writes directly into its slice of a single preallocated
-    `bank` array, ONE TILE AT A TIME — the same "avoid full-array
-    temporaries, write in place" discipline as bug #13 elsewhere in this
-    codebase, applied here to bound transient memory to a handful of
-    tiles (a few tens of MB) regardless of the bank's total size. Two
-    earlier versions of this function got this wrong, in different ways,
-    both caught only by actually running them at realistic bank size —
-    not by reasoning about the code:
-      - v1 returned one freshly allocated array per WORKER CHUNK and
-        np.concatenate'd them at the end, peaking at several times the
-        bank's own footprint (chunk return arrays + concatenate's
-        source-and-destination all alive at once) and OOM-killing the
-        process building a large bank.
-      - v2 tried writing generation output directly into (bank[start:
-        end]).real/.imag via numpy.random.Generator's out= parameter to
-        avoid v1's copies -- numpy's out= requires a C-contiguous target,
-        and .real/.imag views of a complex array are strided (not
-        contiguous), so this fails outright with a clear error (caught
-        immediately, not silently wrong).
-    Plain assignment (`bank[i].real = arr`, unlike out=) DOES accept a
-    strided target, which is what makes the per-tile version below work.
+    ``bank`` array, ONE TILE AT A TIME, bounding transient memory to a
+    handful of tiles (a few tens of MB) regardless of the bank's total
+    size (see CLAUDE.md's bug #16 for why this matters and what goes
+    wrong without it). Plain assignment (``bank[i].real = arr``) is what
+    makes this work: numpy's ``out=`` parameter would be the more obvious
+    choice but requires a C-contiguous target, and ``.real``/``.imag``
+    views of a complex array are strided.
+
+    :param seed: seed for this bank's noise.
+    :param std: per-sample standard deviation (both real and imaginary
+        parts).
+    :param n_tiles: number of tiles to generate.
+    :param tile_n_samples: samples per tile, per channel.
+    :param num_channels: channels per tile.
+    :returns: the filled bank.
     """
     n_workers = max(1, min(n_tiles, os.cpu_count() or 8, 16))
     seed_seq = np.random.SeedSequence(seed)
@@ -500,13 +449,20 @@ def fill_noise_bank(seed: int, std: float, n_tiles: int, tile_n_samples: int, nu
 
 
 def bank_memory_bytes(n_tiles: int, tile_n_samples: int, num_channels: int, n_pols: int = 2) -> int:
-    """Total resident memory for the noise bank across both pols."""
+    """Total resident memory for the noise bank across both pols.
+
+    :param n_tiles: number of tiles in the bank.
+    :param tile_n_samples: samples per tile, per channel.
+    :param num_channels: channels per tile.
+    :param n_pols: how many per-pol banks to account for.
+    :returns: total bytes.
+    """
     return n_tiles * tile_n_samples * num_channels * 16 * n_pols  # complex128 = 16 bytes
 
 
 # ============================================================
 # PULSAR — wideband generate + coherent dispersion + one-time
-# channelization. See module docstring's v1/v2/v3 history.
+# channelization. See module docstring's PULSED (pulsar) sources section.
 # ============================================================
 
 
@@ -520,16 +476,22 @@ def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_r
     the WHOLE band as a single time series), UNDISPERSED pulse train.
     Physically: incoherent broadband radio emission (noise-like),
     power-modulated by the pulsar's rotation -- amplitude = envelope(t)
-    * a real Gaussian draw, same model PsrSigSim's _make_amp_pulses uses.
+    * a real Gaussian draw, same model PsrSigSim's ``_make_amp_pulses``
+    uses.
 
     Plain vectorized numpy, not numba: this is a ONE-TIME construction
-    call (see build_pulsar_template), and benchmarked faster than the
-    equivalent hand-rolled numba loop it replaced at every period length
-    tried (e.g. ~6.2s vs ~9.6s at a 1s period, measured at 448 channels
-    before this project's channel-count max was corrected to 384 -- see
-    common.MAX_NUM_CHANNELS; the qualitative finding is unaffected by
-    channel count) — there was no tradeoff to make here, unlike the
-    per-tick kernels below.
+    call (see ``build_pulsar_template``) -- see CLAUDE.md's Benchmarking
+    section for measurements.
+
+    :param seed: seed for this pulsar's shared sky carrier (see module
+        docstring for why it's shared across stations, not per-station).
+    :param period_s: rotation period, in seconds.
+    :param width_s: pulse profile FWHM, in seconds.
+    :param amplitude: overall amplitude scale.
+    :param wideband_rate: the sample rate of the wideband array, i.e.
+        ``num_channels * channel_width_hz``.
+    :param n_wide: total samples to generate (one period).
+    :returns: the real-valued wideband pulse train, length ``n_wide``.
     """
     sigma = width_s / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # width_s = FWHM
     peak = period_s / 2.0
@@ -543,29 +505,22 @@ def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_r
 
 def _channelize_once(v: np.ndarray, num_channels: int, workers: int = PULSAR_FFT_WORKERS) -> np.ndarray:
     """One-shot FFT channelization of a complex 1D array of length
-    n = k*num_channels into (k, num_channels), EXTERNAL ascending-
-    channel-id order (channel c's center frequency is
-    base_freq_hz + c*channel_width_hz for whatever base_freq_hz the
-    caller used to build v's frequency axis).
+    ``n = k*num_channels`` into ``(k, num_channels)``, EXTERNAL
+    ascending-channel-id order (channel c's center frequency is
+    ``base_freq_hz + c*channel_width_hz`` for whatever ``base_freq_hz``
+    the caller used to build ``v``'s frequency axis). A one-time,
+    offline construction step, never the per-tick hot path.
 
-    Equivalent to the now-deleted wideband_streamer.WidebandChannelizer
-    at overlap=0 for a single, already-complete block -- ported as a
-    minimal standalone function since this is the one remaining use of
-    that class, and it was only ever needed for this one-time, offline
-    pulsar-template construction step, never the per-tick hot path. With
-    overlap=0 and step==fft_len, WidebandChannelizer's sliding-window
-    approach is exactly equivalent to a reshape (no windows actually
-    slide past each other), which is what this does directly.
+    Uses ``scipy.fft`` (not ``numpy.fft``) with ``workers=`` -- this is
+    the batched FFT along ``axis=-1`` over many independent
+    ``(num_channels,)``-length rows, which is embarrassingly parallel
+    across rows -- see CLAUDE.md's Benchmarking section for measurements.
 
-    Uses scipy.fft (not numpy.fft) with workers= -- this is the batched
-    FFT along axis=-1 over many independent (num_channels,)-length rows,
-    which is embarrassingly parallel across rows and benchmarked ~4-5x
-    faster with scipy.fft's multi-threading than numpy.fft's
-    single-threaded equivalent (e.g. 0.14s -> 0.03s at a 100ms pulsar
-    period, measured at 448 channels before this project's channel-count
-    max was corrected to 384 -- see common.MAX_NUM_CHANNELS; the
-    qualitative finding is unaffected by channel count) -- see CLAUDE.md's
-    Benchmarking section.
+    :param v: a complex 1D array, length a multiple of ``num_channels``.
+    :param num_channels: channels to split ``v`` into.
+    :param workers: ``scipy.fft`` worker thread count.
+    :returns: ``(k, num_channels)`` complex spectra, external
+        ascending-channel-id order.
     """
     n_out = v.shape[0] // num_channels
     v = v[: n_out * num_channels]
@@ -591,18 +546,28 @@ def build_pulsar_template(
     """ONE-TIME, offline construction (numpy + scipy.fft -- no per-tick
     budget applies here, so a real, multi-threaded FFT is fine, unlike
     the hot path). Generates the shared wideband pulse train, applies the
-    coherent dispersion
-    transfer function directly to its full complex FFT (capturing
-    intra-channel smear as an emergent property of the full wideband
-    frequency resolution), then channelizes via _channelize_once to
-    produce genuinely complex per-channel content with real carrier
-    phase.
+    coherent dispersion transfer function directly to its full complex
+    FFT (capturing intra-channel smear as an emergent property of the
+    full wideband frequency resolution), then channelizes via
+    ``_channelize_once`` to produce genuinely complex per-channel content
+    with real carrier phase.
 
-    Returns (template, n_period_samples): template is
-    (num_channels, n_period_samples) complex128, in this project's
-    EXTERNAL ascending-channel-id order -- verified against a known-tone
-    injection check in tests/test_direct_synthesis.py, not assumed from reading the FFT-bin
-    permutation logic.
+    :param num_channels: channels to generate.
+    :param channel_width_hz: channel spacing.
+    :param base_freq_hz: channel 0's centre frequency.
+    :param channel_output_rate: the per-channel output sample rate.
+    :param period_s: rotation period, in seconds.
+    :param width_s: pulse profile FWHM, in seconds.
+    :param amplitude: overall amplitude scale.
+    :param dm_pc_cm3: dispersion measure, in pc/cm^3.
+    :param sky_seed: seed for the shared sky carrier (see module
+        docstring).
+    :returns: a ``(template, n_period_samples)`` tuple; ``template`` is
+        ``(num_channels, n_period_samples)`` complex128, in this
+        project's EXTERNAL ascending-channel-id order -- verified
+        against a known-tone injection check in
+        ``tests/test_direct_synthesis.py``, not assumed from reading the
+        FFT-bin permutation logic.
     """
     wideband_rate = num_channels * channel_width_hz
     n_period_samples = int(round(period_s * channel_output_rate))
@@ -612,22 +577,11 @@ def build_pulsar_template(
     v = generate_wideband_pulse_train(sky_seed, period_s, width_s, amplitude, wideband_rate, n_wide)
 
     # Full complex FFT, NOT rfft -- this project's own convention (see
-    # _channelize_once / the deleted WidebandChannelizer.channel_center_frequencies)
-    # treats negative fftfreq bins as meaningful, independent channels —
-    # using rfft here originally only covered half the intended band and
-    # shifted every channel's frequency. Caught by injecting a KNOWN tone
-    # at a known external channel and checking where it actually landed,
-    # not by reasoning about the convention. v_dispersed is genuinely
-    # complex after this (dispersion breaks the real signal's Hermitian
-    # symmetry) -- expected, not a bug, and what gives the template real
-    # carrier phase.
-    #
-    # scipy.fft (not numpy.fft), with workers=, for these two big 1D
-    # transforms -- benchmarked ~15-20% faster than numpy.fft here
-    # (bandwidth-bound at this size, so multi-threading helps less than
-    # for _channelize_once's batched small FFTs above, but it's free and
-    # numerically identical -- verified via np.allclose against
-    # numpy.fft's output before adopting this).
+    # _channelize_once) treats negative fftfreq bins as meaningful,
+    # independent channels. v_dispersed is genuinely complex after this
+    # (dispersion breaks the real signal's Hermitian symmetry) --
+    # expected, not a bug, and what gives the template real carrier
+    # phase.
     V = scipy.fft.fft(v, workers=PULSAR_FFT_WORKERS)
     u = scipy.fft.fftfreq(n_wide, d=1.0 / wideband_rate)  # natural bin order, [-wideband_rate/2, wideband_rate/2)
     band_center_hz = base_freq_hz + wideband_rate / 2.0
@@ -652,23 +606,40 @@ def add_pulsar_tick(
     delay_coeffs, poly_t_rel_start, ypol_offset_ns, is_h_pol,
     base_freq_hz, channel_width_hz, channel_output_rate, n_samples, num_channels,
 ):
-    """Adds this tick's contribution into `out` (n_samples, num_channels
-    complex128), reading the precomputed template circularly and
-    applying the EXACT per-channel geometric-delay phase correction --
-    valid because the template is genuinely complex/narrowband per
-    channel (see module docstring), the same reasoning that makes
-    synth_tone_channel's delay-as-phase exact. Adds (not writes) so this
-    composes with noise/tone in generate_next_tick's fixed order.
+    """Adds this tick's contribution into ``out`` (``n_samples,
+    num_channels`` complex128), reading the precomputed template
+    circularly and applying the EXACT per-channel geometric-delay phase
+    correction -- valid because the template is genuinely
+    complex/narrowband per channel (see module docstring), the same
+    reasoning that makes ``synth_tone_channel``'s delay-as-phase exact.
+    Adds (not writes) so this composes with noise/tone in
+    ``generate_next_tick``'s fixed order.
 
     Uses a phase-accumulator (NCO-style) recurrence rather than calling
-    cos/sin per (sample, channel) -- phase(c) = phase(0) - c*dphase is
+    cos/sin per (sample, channel): ``phase(c) = phase(0) - c*dphase`` is
     linear in c at fixed sample, so each channel's rotation is the
     previous one times a single fixed per-sample step, computed via one
-    complex multiply instead of two fresh transcendental calls. An
-    earlier version called cos/sin per channel directly and needed 4x
-    the threads to clear budget for exactly the reason this codebase's
-    noise-kernel work already established: per-element transcendental
-    calls are the expensive part, not the arithmetic around them."""
+    complex multiply instead of two fresh transcendental calls per
+    channel (see CLAUDE.md's bug #15 for why this matters).
+
+    :param out: output buffer to accumulate into, ``(n_samples,
+        num_channels)`` complex128.
+    :param template: this pulsar's precomputed template, ``(num_channels,
+        n_period_samples)`` complex128.
+    :param start_idx: this tick's starting offset into ``template``'s
+        period.
+    :param n_period_samples: samples per pulsar period.
+    :param delay_coeffs: this source's delay polynomial coefficients.
+    :param poly_t_rel_start: time relative to the polynomial's own
+        ``start_validity_sec``, at sample 0.
+    :param ypol_offset_ns: H-pol delay offset, in nanoseconds.
+    :param is_h_pol: whether this call is for the H polarisation.
+    :param base_freq_hz: channel 0's centre frequency.
+    :param channel_width_hz: channel spacing.
+    :param channel_output_rate: the per-channel output sample rate.
+    :param n_samples: samples in this tick.
+    :param num_channels: channels in ``template``/``out``.
+    """
     for i in prange(n_samples):
         idx = (start_idx + i) % n_period_samples
         t_poly = poly_t_rel_start + i / channel_output_rate
@@ -882,8 +853,11 @@ class DirectSynthesisStreamer:
         return np.arange(self.num_channels)
 
     def tick_n_samples(self) -> int:
-        """Per-channel output samples for one tick — HEAP_LEN by
-        construction (BLOCK_DURATION_S is defined for exactly this)."""
+        """Per-channel output samples for one tick — ``HEAP_LEN`` by
+        construction (``BLOCK_DURATION_S`` is defined for exactly this).
+
+        :returns: per-channel samples for one tick.
+        """
         return int(round(self.channel_output_rate * BLOCK_DURATION_S))
 
     def bank_memory_bytes(self) -> int:
@@ -893,21 +867,34 @@ class DirectSynthesisStreamer:
 
     @staticmethod
     def _coeffs_for(cache: dict, poly: DelayPolynomial) -> np.ndarray:
-        """Returns poly's coefficients as a float64 array, only rebuilding
-        it when `poly` (identity, not equality) actually changed since the
-        last call — same per-source cache backing every tone/pulsar entry,
-        so a source whose feed keeps returning the same poly object tick
-        after tick (the common case) pays no per-tick allocation for this."""
+        """Returns ``poly``'s coefficients as a float64 array, only
+        rebuilding it when ``poly`` (identity, not equality) actually
+        changed since the last call — same per-source cache backing every
+        tone/pulsar entry, so a source whose feed keeps returning the
+        same poly object tick after tick (the common case) pays no
+        per-tick allocation for this.
+
+        :param cache: this source's own cache dict (one per tone/pulsar
+            entry).
+        :param poly: the delay polynomial currently in effect.
+        :returns: ``poly.xypol_coeffs_ns`` as a float64 array.
+        """
         if cache.get("poly") is not poly:
             cache["poly"] = poly
             cache["coeffs"] = np.asarray(poly.xypol_coeffs_ns, dtype=np.float64)
         return cache["coeffs"]
 
     def generate_next_tick(self, t: float, n_samples: int) -> dict[str, np.ndarray]:
-        """n_samples is PER-CHANNEL time samples for this tick (at
-        channel_output_rate). See common.ScanRunner, which sizes this via
-        tick_n_samples() so it lines up with HeapAccumulator's HEAP_LEN
-        framing exactly."""
+        """See ``common.ScanRunner``, which sizes ``n_samples`` via
+        ``tick_n_samples()`` so it lines up with ``HeapAccumulator``'s
+        ``HEAP_LEN`` framing exactly.
+
+        :param t: absolute epoch time of this tick's first sample.
+        :param n_samples: PER-CHANNEL time samples for this tick (at
+            ``channel_output_rate``).
+        :returns: a dict mapping ``"V"``/``"H"`` to ``(n_samples,
+            num_channels)`` complex arrays.
+        """
         # t_local_rel_start (local clock for noise/tone/pulsar) must stay
         # small-magnitude — same precision requirement as everywhere else
         # in this codebase (see common.DelayPolynomial's docstring for why

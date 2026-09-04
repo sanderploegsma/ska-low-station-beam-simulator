@@ -1,40 +1,39 @@
 """
 Tango device server entry point for the SPS station-beam simulator.
 
-The actual signal-generation logic lives entirely in direct_synthesis.py
-(DirectSynthesisStreamer) — tone, per-pol station noise (a pre-generated
-tile bank), and pulsed/pulsar sources are all handled by direct,
-per-channel synthesis; there is no wideband+FFT fallback path anymore
-(the legacy wideband_streamer.py/StationStreamer this simulator used to
-fall back to for pulsed sources was removed once direct_synthesis.py
-gained a direct per-channel pulsar representation — see CLAUDE.md).
-Shared plumbing (delay polynomial, heap accumulation, SPEAD packetization,
-the producer/sender loop) lives in common.py, which direct_synthesis.py
-does not depend on beyond that shared plumbing.
+The actual signal-generation logic lives entirely in ``direct_synthesis.py``
+(``DirectSynthesisStreamer``) — tone, per-pol station noise (a
+pre-generated tile bank), and pulsed/pulsar sources are all handled by
+direct, per-channel synthesis; there is no wideband+FFT fallback path.
+Shared plumbing (delay polynomial, heap accumulation, SPEAD
+packetization, the producer/sender loop) lives in ``common.py``, which
+``direct_synthesis.py`` does not depend on beyond that shared plumbing.
 
-PER-SOURCE DELAY: `source_cfgs_json` (a device_property) describes the
+PER-SOURCE DELAY: ``source_cfgs_json`` (a device_property) describes the
 tones/pulsars this station simulates. EVERY entry MUST name a
-`delay_attr_uri` — a Tango attribute on CBF's delay-poly emulator that
+``delay_attr_uri`` — a Tango attribute on CBF's delay-poly emulator that
 publishes CHANGE_EVENTs for that one source's direction (RA/Dec, Az/El,
 or static; the emulator can expose several such directions, each on its
 own attribute). There is deliberately no default delay for a source
-missing one: DirectSynthesisStreamer refuses to construct a source with
-no real delay path, since silently applying zero delay would produce
-content that's trivially "perfectly aligned" and could mask a real CBF
-delay-tracking bug rather than exercise it. StartScan subscribes to each
-named attribute and feeds its updates into a common.DelayFeed, which
-DirectSynthesisStreamer then queries per source, per tick, instead of
-every source sharing one station-level delay.
+missing one: ``DirectSynthesisStreamer`` refuses to construct a source
+with no real delay path, since silently applying zero delay would
+produce content that's trivially "perfectly aligned" and could mask a
+real CBF delay-tracking bug rather than exercise it. ``StartScan``
+subscribes to each named attribute and feeds its updates into a
+``common.DelayFeed``, which ``DirectSynthesisStreamer`` then queries per
+source, per tick, instead of every source sharing one station-level
+delay.
 
 UNVERIFIED, same caveat as the rest of this file's Tango-facing bits: the
 exact attribute payload shape (see
-common.parse_delay_polynomial_from_attr_value) and whether AttributeProxy
-delivers an immediate CHANGE_EVENT with the attribute's current value on
-subscribe (rather than only on the next actual change) both depend on how
-the real delay-poly emulator's attributes are configured — confirm
-against it once available. Until a first event arrives for a source, its
-DelayFeed applies zero delay and logs a warning (see common.DelayFeed)
-rather than blocking scan start.
+``common.parse_delay_polynomial_from_attr_value``) and whether
+``AttributeProxy`` delivers an immediate CHANGE_EVENT with the
+attribute's current value on subscribe (rather than only on the next
+actual change) both depend on how the real delay-poly emulator's
+attributes are configured — confirm against it once available. Until a
+first event arrives for a source, its ``DelayFeed`` applies zero delay
+and logs a warning (see ``common.DelayFeed``) rather than blocking scan
+start.
 """
 
 from __future__ import annotations
@@ -161,12 +160,18 @@ class StationSimulatorDevice(Device):
         self.set_state(DevState.ON)
 
     def _make_delay_feed(self, attr_uri: str) -> DelayFeed:
-        """Subscribes to `attr_uri`'s CHANGE_EVENTs and returns a
-        DelayFeed that always reflects the most recently pushed value.
-        The subscription itself is torn down in
-        _teardown_delay_subscriptions (called from StartScan before
-        setting up the next scan's subscriptions, and from StopScan/
-        delete_device) — never left dangling across scans."""
+        """Subscribes to ``attr_uri``'s CHANGE_EVENTs and returns a
+        ``DelayFeed`` that always reflects the most recently pushed
+        value. The subscription itself is torn down in
+        ``_teardown_delay_subscriptions`` (called from ``StartScan``
+        before setting up the next scan's subscriptions, and from
+        ``StopScan``/``delete_device``) — never left dangling across
+        scans.
+
+        :param attr_uri: the Tango attribute to subscribe to.
+        :returns: a ``DelayFeed`` that ``DirectSynthesisStreamer`` can
+            query for this source's current delay polynomial.
+        """
         feed = DelayFeed(name=attr_uri)
         proxy = AttributeProxy(attr_uri)
 

@@ -793,6 +793,19 @@ reintroduce a regression into.
    hash + Box-Muller, used throughout `direct_synthesis.py` (tone, noise,
    and the pulsar's wideband "sky carrier" all share it). Statistically
    correct, deterministic, seekable, but NOT bit-identical to Philox.
+   `_splitmix64_hash` (the one piece of this still needed today, for
+   per-tick noise-tile-index selection — see the Noise section) was
+   deliberately kept as a hand-rolled `@njit` function rather than
+   switched to `Generator(Philox(key=seed, counter=tick_index))` once
+   Philox's own `counter=` constructor was found to support exactly the
+   "pure function of an arbitrary index" property this needs: benchmarked
+   at ~12.7us/call for a fresh `Philox`+`Generator` construction per call
+   vs. ~0.13us/call for the numba hash (~100x slower — Python/pybind11
+   object-construction overhead, not the underlying algorithm). The
+   `@njit` itself is also justified independent of that comparison: ~25x
+   faster than the equivalent plain-Python/numpy-scalar version (0.13us
+   vs. 3.3us/call), confirmed by direct measurement, not assumed from
+   "numba is usually faster."
 8. *(deleted-file history)* **`fftshift` was a full-array reorder every
    tick for no numerical reason**, in the legacy wideband channelizer —
    replaced there with natural FFT bin order + a fixed permutation

@@ -1,25 +1,30 @@
-"""Builds every entry in pulsar_catalog.CATALOG_ENTRIES and writes it to
-disk (`.npy` + catalog.json) for DirectSynthesisStreamer to load by name
-at construction instead of building at runtime -- see pulsar_catalog.py's
-module docstring for the full design (why full-band-width generation,
-why complex64 on disk, why the catalog records its own generation-time
-constants).
+"""Builds every entry in ``pulsar_catalog.CATALOG_ENTRIES`` and writes it
+to disk (``.npy`` + catalog.json) for ``DirectSynthesisStreamer`` to load
+by name at construction instead of building at runtime -- see
+``pulsar_catalog.py``'s module docstring for the full design (why
+full-band-width generation, why complex64 on disk, why the catalog
+records its own generation-time constants).
 
 This is deliberately the ONLY module that imports both
-direct_synthesis.py (for build_pulsar_template) and pulsar_catalog.py
-(for CATALOG_ENTRIES/save_pulsar_to_catalog) -- pulsar_catalog.py itself
-has no dependency on direct_synthesis.py, so DirectSynthesisStreamer can
-import pulsar_catalog.py (to load by name) without a cycle.
+``direct_synthesis.py`` (for ``build_pulsar_template``) and
+``pulsar_catalog.py`` (for ``CATALOG_ENTRIES``/``save_pulsar_to_catalog``)
+-- ``pulsar_catalog.py`` itself has no dependency on
+``direct_synthesis.py``, so ``DirectSynthesisStreamer`` can import
+``pulsar_catalog.py`` (to load by name) without a cycle.
 
-Run: python -m ska_low_station_beam_simulator.generate_pulsar_catalog [output_dir]
-(default output_dir: pulsar_catalog.DEFAULT_CATALOG_DIR, the directory
-bundled into the package/OCI image -- see pyproject.toml's wheel
-force-include).
+Run::
+
+    python -m ska_low_station_beam_simulator.generate_pulsar_catalog [output_dir]
+
+(default ``output_dir``: ``pulsar_catalog.DEFAULT_CATALOG_DIR`` -- meant
+to be populated as an OCI image build step, not committed to git or
+packaged into a wheel; see CLAUDE.md's "Pulsar catalog" section.)
 
 Some entries here (e.g. "slow_wide", 300ms) would blow this project's
 own one-time CONSTRUCTION budget (target 10s, hard limit 30s -- see
 CLAUDE.md) if built live at scan start. That's fine here: this script
-pays that cost once, offline, so DirectSynthesisStreamer never has to.
+pays that cost once, offline, so ``DirectSynthesisStreamer`` never has
+to.
 """
 
 from __future__ import annotations

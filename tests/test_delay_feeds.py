@@ -45,6 +45,12 @@ def _poly(**overrides):
 
 
 def test_delay_feed_defaults_to_zero_delay_before_first_update(caplog):
+    """Design decision documented in common.py: a feed with no polynomial
+    yet must default to zero delay rather than raising or blocking scan
+    start -- a startup-ordering gap (the external delay-poly device isn't
+    up yet), not the same thing as a source having no delay path
+    configured at all. The condition must also be visibly warned, not
+    silent."""
     feed = DelayFeed(name="test-source")
     with caplog.at_level(logging.WARNING, logger="cbf_sim"):
         poly = feed.get(1000.0)
@@ -54,6 +60,10 @@ def test_delay_feed_defaults_to_zero_delay_before_first_update(caplog):
 
 
 def test_delay_feed_warns_only_once_for_missing_poly(caplog):
+    """The zero-delay-default warning above must fire once per
+    missing-polynomial episode, not once per tick -- otherwise a genuine
+    startup-ordering issue would be buried under repeated identical log
+    spam instead of standing out."""
     feed = DelayFeed(name="test-source")
     with caplog.at_level(logging.WARNING, logger="cbf_sim"):
         feed.get(1000.0)
@@ -64,6 +74,9 @@ def test_delay_feed_warns_only_once_for_missing_poly(caplog):
 
 
 def test_delay_feed_applies_updated_polynomial():
+    """Baseline plumbing check: update() followed by get() must actually
+    return the given polynomial's coefficients, since every other test in
+    this module builds on that basic behaviour working correctly."""
     feed = DelayFeed(name="test-source")
     feed.update(_poly(xypol_coeffs_ns=[750.0]))
     assert feed.get(0.0).xypol_coeffs_ns == [750.0]
@@ -82,6 +95,11 @@ def test_delay_feed_keeps_applying_expired_polynomial_with_warning(caplog):
 
 
 def test_delay_feed_warns_once_per_staleness_episode(caplog):
+    """Mirrors the warn-once behaviour above, but for staleness: an
+    expired polynomial should be logged once per staleness episode, not
+    on every tick, while a fresh update() must reset that flag so a
+    LATER, independent expiry still produces its own warning instead of
+    being silently swallowed forever."""
     feed = DelayFeed(name="test-source")
     feed.update(_poly(start_validity_sec=0.0, validity_period_sec=10.0))
     with caplog.at_level(logging.WARNING, logger="cbf_sim"):
@@ -106,6 +124,11 @@ def test_delay_feed_warns_once_per_staleness_episode(caplog):
 
 
 def test_streamer_rejects_tone_without_delay_feed():
+    """Enforces the non-negotiable rule from direct_synthesis.py: a tone
+    source_cfg with no delay_feed must fail construction outright, since
+    a silently-zero-delay source would look trivially 'perfectly aligned'
+    and could mask a real CBF delay-tracking bug rather than exercise
+    it."""
     station = StationConfig(
         station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
     )
@@ -123,6 +146,9 @@ def test_streamer_rejects_tone_without_delay_feed():
 
 
 def test_streamer_rejects_pulsed_without_delay_feed():
+    """Same required-delay_feed rule as the tone case above, applied to
+    pulsed sources -- both source kinds must be rejected identically,
+    not just one of them guarded."""
     station = StationConfig(
         station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
     )
@@ -150,6 +176,11 @@ def test_streamer_rejects_pulsed_without_delay_feed():
 
 
 def test_parse_delay_polynomial_from_json_string():
+    """Pins down the JSON-string wire-format shape
+    parse_delay_polynomial_from_attr_value currently assumes a Tango
+    attribute push will use -- flagged UNVERIFIED against the real
+    ska-low-csp-delaymodel/1.0 schema, so this documents the assumption
+    rather than confirming it against the real ICD."""
     payload = json.dumps(
         {
             "start_validity_sec": 123.0,
@@ -166,6 +197,10 @@ def test_parse_delay_polynomial_from_json_string():
 
 
 def test_parse_delay_polynomial_from_mapping():
+    """Same UNVERIFIED wire-format assumption as the JSON-string case
+    above, but for a plain mapping payload -- both input shapes must
+    parse identically since it isn't yet confirmed which one the real
+    delay-poly device actually delivers."""
     data = {
         "start_validity_sec": 1.0,
         "validity_period_sec": 2.0,

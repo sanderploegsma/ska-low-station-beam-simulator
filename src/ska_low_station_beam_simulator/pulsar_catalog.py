@@ -1,38 +1,39 @@
 """Named pulsar catalog: pre-generated pulsar templates that can be
-embedded in the OCI image and loaded at `DirectSynthesisStreamer`
+embedded in the OCI image and loaded at ``DirectSynthesisStreamer``
 construction instead of built there, trading arbitrary
-`period_s`/`width_s`/`dm_pc_cm3` configurability for near-instant
-startup — see `generate_pulsar_catalog.py` for how these are actually
-built, and `direct_synthesis.py`'s `pulsar_name` source_cfg field for how
-a streamer loads one. Both source_cfg styles remain supported side by
-side: a client can reference a baked-in pulsar for fast setup, or still
-supply raw parameters and pay the (now-tighter, see CLAUDE.md) one-time
-construction cost for an arbitrary period/DM.
+``period_s``/``width_s``/``dm_pc_cm3`` configurability for near-instant
+startup — see ``generate_pulsar_catalog.py`` for how these are actually
+built, and ``direct_synthesis.py``'s ``pulsar_name`` source_cfg field for
+how a streamer loads one. Both source_cfg styles remain supported side
+by side: a client can reference a baked-in pulsar for fast setup, or
+still supply raw parameters and pay the (now-tighter, see CLAUDE.md)
+one-time construction cost for an arbitrary period/DM.
 
 Every catalog entry is generated at the FULL SKA-Low band width
-(`common.MAX_NUM_CHANNELS` channels, starting at `common.BASE_FREQ_HZ`,
+(``common.MAX_NUM_CHANNELS`` channels, starting at ``common.BASE_FREQ_HZ``,
 the band's lowest channel) — a station simulating a NARROWER sub-band
 just slices the columns it needs out of the same array (see
-`load_pulsar_from_catalog`'s `station_num_channels`/
-`station_base_freq_hz` arguments), matching this project's existing
+``load_pulsar_from_catalog``'s ``station_num_channels``/
+``station_base_freq_hz`` arguments), matching this project's existing
 principle that a pulsar's "sky carrier" is shared across every station
-observing it (see `direct_synthesis.py`'s module docstring) — one file
+observing it (see ``direct_synthesis.py``'s module docstring) — one file
 serves every valid station configuration, not one per
 (num_channels, first_channel_id) combination.
 
 Stored on disk as complex64 (halves image size vs. complex128 — no
 meaningful fidelity loss for this purpose, since content is quantized to
 int8 well downstream anyway); loaded back and upcast to complex128 so
-`add_pulsar_tick`'s numba kernel sees the exact same dtype regardless of
-whether a template was built at construction or loaded from the catalog.
+``add_pulsar_tick``'s numba kernel sees the exact same dtype regardless
+of whether a template was built at construction or loaded from the
+catalog.
 
-`catalog.json` records the exact constants each entry was generated
-under (`channel_width_hz`, `channel_output_rate`, `num_channels`,
-`base_freq_hz`) — checked against the CURRENT constants before trusting
-the array, so a catalog generated under since-corrected constants fails
-loudly instead of silently misapplying stale data. This isn't a
-hypothetical: this project has already been burned once by a wrong
-`channel_output_rate` assumption (see CLAUDE.md's "SPS-CBF ICD
+``catalog.json`` records the exact constants each entry was generated
+under (``channel_width_hz``, ``channel_output_rate``, ``num_channels``,
+``base_freq_hz``) — checked against the CURRENT constants before
+trusting the array, so a catalog generated under since-corrected
+constants fails loudly instead of silently misapplying stale data. This
+isn't a hypothetical: this project has already been burned once by a
+wrong ``channel_output_rate`` assumption (see CLAUDE.md's "SPS-CBF ICD
 channelization" section) — a catalog baked before that fix, loaded
 after it, is exactly the kind of drift this check exists to catch.
 """
@@ -52,10 +53,12 @@ from ska_low_station_beam_simulator.common import (
     MAX_NUM_CHANNELS,
 )
 
-# Bundled with the package (see pyproject.toml's wheel force-include) --
-# generate_pulsar_catalog.py writes here by default; DirectSynthesisStreamer
-# reads from here by default. A source_cfg's optional `catalog_dir`
-# overrides this per-source, e.g. for tests.
+# Not bundled via wheel packaging (see CLAUDE.md's "Pulsar catalog"
+# section for why: generated data this large shouldn't go through git or
+# a package index) -- generate_pulsar_catalog.py writes here by default,
+# meant to be populated as an OCI image build step instead;
+# DirectSynthesisStreamer reads from here by default. A source_cfg's
+# optional `catalog_dir` overrides this per-source, e.g. for tests.
 DEFAULT_CATALOG_DIR = Path(__file__).parent / "pulsar_catalog_data"
 
 CATALOG_FILENAME = "catalog.json"
@@ -112,10 +115,39 @@ def save_pulsar_to_catalog(
     channel_width_hz: float = CHANNEL_WIDTH_HZ,
     channel_output_rate: float = CHANNEL_OUTPUT_RATE_HZ,
 ) -> None:
-    """Writes `<name>.npy` (complex64) plus this entry's metadata into
-    `catalog_dir`'s shared catalog.json, merging with whatever entries
+    """Writes ``<name>.npy`` (complex64) plus this entry's metadata into
+    ``catalog_dir``'s shared catalog.json, merging with whatever entries
     are already there (so generate_pulsar_catalog.py can add one pulsar
-    at a time without clobbering the rest)."""
+    at a time without clobbering the rest).
+
+    :param catalog_dir: directory to write into; created if missing.
+    :param name: the catalog entry's name (e.g. ``"vela_like"``) --
+        becomes ``<name>.npy``'s filename and the key under which this
+        entry is stored in catalog.json.
+    :param template: the full-band-width ``(num_channels,
+        n_period_samples)`` complex template, as returned by
+        ``direct_synthesis.build_pulsar_template`` -- cast to complex64
+        before writing.
+    :param n_period_samples: samples per pulsar period, i.e.
+        ``template.shape[1]``.
+    :param period_s: the pulsar's rotation period, in seconds.
+    :param width_s: the pulse profile's FWHM, in seconds.
+    :param dm_pc_cm3: dispersion measure, in pc/cm^3.
+    :param sky_seed: the seed used for this pulsar's shared "sky carrier"
+        (see module docstring) -- recorded so a caller can reproduce the
+        exact same template independently if needed.
+    :param num_channels: how many channels ``template`` spans -- should
+        stay at the default (the full band) unless deliberately building
+        a narrower catalog entry.
+    :param base_freq_hz: the absolute frequency of ``template``'s
+        channel 0.
+    :param channel_width_hz: the channel spacing ``template`` was built
+        with -- recorded for the stale-catalog check in
+        ``load_pulsar_from_catalog``.
+    :param channel_output_rate: the per-channel sample rate
+        ``template`` was built with -- recorded for the same
+        stale-catalog check.
+    """
     catalog_dir.mkdir(parents=True, exist_ok=True)
     npy_filename = f"{name}.npy"
     np.save(catalog_dir / npy_filename, template.astype(np.complex64))
@@ -143,23 +175,33 @@ def load_pulsar_from_catalog(
     station_base_freq_hz: float,
     catalog_dir: Optional[Path] = None,
 ) -> dict:
-    """Loads `name`'s pre-generated template and slices out the channel
+    """Loads ``name``'s pre-generated template and slices out the channel
     range [station_base_freq_hz, station_base_freq_hz +
     station_num_channels*channel_width_hz) that this station actually
     needs -- see module docstring for why one catalog entry, generated
     at the full band width, serves every valid station sub-band.
 
-    Returns a dict with `template` (complex128, upcast from the on-disk
-    complex64 -- see module docstring), `period_s`, `n_period_samples`,
-    `width_s`, `dm_pc_cm3`, `sky_seed` -- everything
-    DirectSynthesisStreamer needs to treat this exactly like a template
-    it built itself.
-
-    Raises ValueError if: `name` isn't in the catalog; the catalog was
-    generated under channel_width_hz/channel_output_rate constants that
-    don't match the CURRENT ones (stale-catalog protection); or the
-    requested station sub-band doesn't fit inside, or isn't
-    channel-aligned with, the catalog entry's generated band.
+    :param name: the catalog entry's name, as given to
+        ``save_pulsar_to_catalog``.
+    :param station_num_channels: how many channels the requesting
+        station needs -- the returned template is sliced to exactly
+        this many columns.
+    :param station_base_freq_hz: the absolute frequency of the
+        requesting station's own channel 0 -- must fall on this catalog
+        entry's channel grid.
+    :param catalog_dir: directory to read from; defaults to
+        ``DEFAULT_CATALOG_DIR`` if not given.
+    :returns: a dict with ``template`` (complex128, upcast from the
+        on-disk complex64 -- see module docstring), ``period_s``,
+        ``n_period_samples``, ``width_s``, ``dm_pc_cm3``, ``sky_seed`` --
+        everything ``DirectSynthesisStreamer`` needs to treat this
+        exactly like a template it built itself.
+    :raises ValueError: if ``name`` isn't in the catalog; if the catalog
+        was generated under ``channel_width_hz``/``channel_output_rate``
+        constants that don't match the CURRENT ones (stale-catalog
+        protection); or if the requested station sub-band doesn't fit
+        inside, or isn't channel-aligned with, the catalog entry's
+        generated band.
     """
     catalog_dir = catalog_dir or DEFAULT_CATALOG_DIR
     catalog_path = catalog_dir / CATALOG_FILENAME

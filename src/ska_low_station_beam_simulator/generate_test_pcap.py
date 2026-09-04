@@ -1,38 +1,35 @@
 """
 Generates a small .pcap file containing a handful of heaps produced by
-DirectSynthesisStreamer's noise floor (content doesn't matter for testing
-SPEAD encoding — see below), for feeding into an external SPEAD unpacker.
+``DirectSynthesisStreamer``'s noise floor (content doesn't matter for
+testing SPEAD encoding — see below), for feeding into an external SPEAD
+unpacker.
 
-common.SpsPacketizer hand-rolls its own SPEAD-64-48 encoder rather than
-using spead2 (see common.py's module docstring for why: spead2's packet
-encoder always writes 4 reserved item pointers CBF's real 6-item ICD
-heap has no room for, and there's no way to configure it not to). One
-consequence of that: this file's output is NOT expected to be parseable
-by a generic SPEAD reader like spead2.recv — it deliberately omits
-HEAP_LENGTH and repurposes the payload-offset item's ID, exactly per the
-ICD, not per generic SPEAD. So this module does its own Ethernet/IPv4/
-UDP + pcap-record wrapping around SpsPacketizer.encode_channel_heap's
-raw bytes; verify the result with `tcpdump`/Wireshark or an external
-unpacker (this codebase's "rudimentary" one), not spead2.recv.
+``common.SpsPacketizer`` hand-rolls its own SPEAD-64-48 encoder rather
+than using spead2 (see common.py's module docstring for why: spead2's
+packet encoder always writes 4 reserved item pointers CBF's real 6-item
+ICD heap has no room for, and there's no way to configure it not to).
+One consequence of that: this file's output is NOT expected to be
+parseable by a generic SPEAD reader like ``spead2.recv`` — it
+deliberately omits HEAP_LENGTH and repurposes the payload-offset item's
+ID, exactly per the ICD, not per generic SPEAD. So this module does its
+own Ethernet/IPv4/UDP + pcap-record wrapping around
+``SpsPacketizer.encode_channel_heap``'s raw bytes; verify the result
+with ``tcpdump``/Wireshark or an external unpacker (this codebase's
+"rudimentary" one), not ``spead2.recv``.
 
 Only the noise floor is generated (no tone/pulsar, no delay_feed
 needed) — the point of this file is exercising the SPEAD encoding path
-(item packing, heap_counter, payload framing), not signal content.
-
-Building the ORIGINAL spead2-based version of this module caught a
-real, previously-undetected production bug (the heap_counter formula
-multiplied by CHANNEL_WIDTH_HZ, the SAMPLE rate, instead of dividing by
-BLOCK_DURATION_S, the correct per-HEAP rate — inflating it by 2048x,
-enough to overflow the 40-bit heap_counter field for any current-era
-timestamp and make every real send fail outright — see the fix and its
-comment in common.py). This had never been caught before because
-nothing exercised send_channel_heap()/encode_channel_heap() end-to-end
-until this module did.
+(item packing, heap_counter, payload framing), not signal content. This
+is the only thing in this project that exercises
+``send_channel_heap()``/``encode_channel_heap()`` end-to-end (see
+CLAUDE.md's bug #17 for a real production bug this caught).
 
 The output IS a correct, well-formed pcap — verified independently via
-`tcpdump -r`, not just by this module's own logic.
+``tcpdump -r``, not just by this module's own logic.
 
-Run: python -m ska_low_station_beam_simulator.generate_test_pcap [output.pcap] [n_heaps]
+Run::
+
+    python -m ska_low_station_beam_simulator.generate_test_pcap [output.pcap] [n_heaps]
 """
 
 from __future__ import annotations
@@ -66,7 +63,12 @@ LINKTYPE_ETHERNET = 1
 def _ipv4_checksum(header: bytes) -> int:
     """Standard one's-complement checksum over an IPv4 header (with the
     checksum field itself zeroed when called). Mandatory for a
-    well-formed IPv4 header, unlike the UDP checksum below."""
+    well-formed IPv4 header, unlike the UDP checksum below.
+
+    :param header: the raw IPv4 header bytes, with the checksum field
+        zeroed.
+    :returns: the 16-bit one's-complement checksum.
+    """
     if len(header) % 2:
         header += b"\x00"
     total = sum(struct.unpack(f"!{len(header) // 2}H", header))
@@ -78,7 +80,7 @@ def _ipv4_checksum(header: bytes) -> int:
 def _wrap_udp_frame(
     payload: bytes, src_ip: str, dst_ip: str, src_port: int, dst_port: int
 ) -> bytes:
-    """Wraps `payload` in a synthetic Ethernet + IPv4 + UDP frame.
+    """Wraps ``payload`` in a synthetic Ethernet + IPv4 + UDP frame.
 
     UDP checksum is left as 0 ("no checksum computed"), which is
     explicitly valid for IPv4 (RFC 768) — avoids needing the UDP
@@ -86,7 +88,17 @@ def _wrap_udp_frame(
     real-world corruption detection. The IPv4 header checksum IS
     computed correctly, since that one is mandatory for a well-formed
     header (some parsers, and spead2's own pcap reader, may reject or
-    warn on a bad one)."""
+    warn on a bad one).
+
+    :param payload: the UDP payload (a SPEAD-encoded heap, in this
+        module's usage).
+    :param src_ip: source IPv4 address, dotted-quad string.
+    :param dst_ip: destination IPv4 address, dotted-quad string.
+    :param src_port: source UDP port.
+    :param dst_port: destination UDP port.
+    :returns: the complete Ethernet + IPv4 + UDP frame, ready to write
+        as one pcap record.
+    """
     udp_len = 8 + len(payload)
     udp_header = struct.pack("!HHHH", src_port, dst_port, udp_len, 0)
 

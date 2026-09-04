@@ -1,10 +1,6 @@
-"""Correctness checks for DirectSynthesisStreamer and its kernels.
-
-Converted from direct_synthesis.py's old `if __name__ == "__main__":`
-block (see git history) into real pytest tests, one assertion-group per
-test instead of one long script, so a failure identifies exactly which
-property broke.
-"""
+"""Correctness checks for ``DirectSynthesisStreamer`` and its kernels,
+one assertion-group per test so a failure identifies exactly which
+property broke."""
 
 import numpy as np
 import pytest
@@ -54,6 +50,11 @@ def station():
 
 
 def test_tone_channel_placement():
+    """A tone's energy must land in the channel bin matching its actual
+    frequency -- the basic correctness check every other tone test
+    depends on, since a channel-placement bug would make the
+    delay/phase-accuracy checks below pass or fail for the wrong
+    reason."""
     test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0  # off-center within channel 42
     zero_coeffs = np.array([0.0], dtype=np.float64)
     ch_idx, _ = sim.synth_tone_channel(
@@ -64,6 +65,10 @@ def test_tone_channel_placement():
 
 
 def test_tone_zero_delay_accuracy():
+    """With zero delay applied, the synthesized tone must match the exact
+    analytic complex exponential at its residual frequency -- establishes
+    the undelayed baseline that test_tone_delay_as_phase_accuracy's
+    delayed case below is compared against."""
     test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0
     zero_coeffs = np.array([0.0], dtype=np.float64)
     _, samples = sim.synth_tone_channel(
@@ -102,6 +107,11 @@ def test_tone_delay_as_phase_accuracy():
 
 
 def test_noise_bank_statistics_and_cross_channel_independence():
+    """Confirms fill_noise_bank actually produces statistically-correct,
+    mutually-uncorrelated complex Gaussian noise across channels -- the
+    DFT-of-i.i.d.-Gaussian property the whole pre-generated tile-bank
+    design (see direct_synthesis.py's NOISE section) relies on holding in
+    practice, not just in theory."""
     bank = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=1, tile_n_samples=200_000, num_channels=96)
     noise = bank[0]
     assert abs(np.mean(noise)) < 0.01
@@ -111,12 +121,20 @@ def test_noise_bank_statistics_and_cross_channel_independence():
 
 
 def test_noise_bank_determinism():
+    """Generation must be a pure, reproducible function of its seed --
+    required by this codebase's deterministic, clock-independent sim_time
+    design (see CLAUDE.md), where any pod must be able to recompute the
+    same content independently, with no shared state."""
     n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
     n2 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
     assert np.array_equal(n1, n2)
 
 
 def test_noise_bank_different_seeds_differ():
+    """Complements the determinism check above: different seeds must
+    actually produce different noise, guarding against a degenerate
+    implementation that ignores the seed and always returns the same
+    bank content."""
     n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
     n2 = sim.fill_noise_bank(seed=99, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
     assert not np.array_equal(n1, n2)
@@ -128,6 +146,10 @@ def test_noise_bank_different_seeds_differ():
 
 
 def test_tile_bank_determinism(station):
+    """Same determinism requirement as the raw-kernel checks above, but
+    exercised through the full DirectSynthesisStreamer/tile-bank path:
+    re-requesting the same tick time must return byte-identical
+    content."""
     streamer = sim.DirectSynthesisStreamer(
         station=station, source_cfgs=[], noise_cfg={"std": 1.0, "seed": 7},
         obs_time_ref=OBS_TIME, num_channels=96, n_tiles=8,
@@ -242,6 +264,10 @@ def pulsar_streamer(station):
 
 
 def test_pulsar_determinism(pulsar_streamer):
+    """Same determinism requirement as the noise tile bank's, applied to
+    the pulsar path -- generate_next_tick must be a pure function of tick
+    time so any station pod can recompute a tick independently without
+    shared state or a wall clock."""
     n = pulsar_streamer.tick_n_samples()
     rp1 = pulsar_streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
     rp2 = pulsar_streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
@@ -309,6 +335,9 @@ def test_pulsar_cross_station_coherence_after_delay_compensation(pulsar_streamer
 
 
 def test_num_channels_above_max_rejected(station):
+    """The SPS-CBF ICD caps a beam at 384 channels -- a request above
+    that must be rejected at construction time rather than silently
+    producing an invalid beam configuration."""
     with pytest.raises(ValueError, match="not a valid SPS beam"):
         sim.DirectSynthesisStreamer(
             station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=448,
@@ -316,6 +345,9 @@ def test_num_channels_above_max_rejected(station):
 
 
 def test_num_channels_not_a_multiple_of_step_rejected(station):
+    """The ICD also requires num_channels to land on an 8-channel step --
+    an off-grid value must be rejected outright rather than silently
+    rounded or accepted."""
     with pytest.raises(ValueError, match="not a valid SPS beam"):
         sim.DirectSynthesisStreamer(
             station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=100,
@@ -323,6 +355,9 @@ def test_num_channels_not_a_multiple_of_step_rejected(station):
 
 
 def test_num_channels_at_max_accepted(station):
+    """Confirms the ICD's actual maximum (384) is itself a valid,
+    constructible configuration, not just that values above it are
+    rejected -- guards against an off-by-one in the validation bound."""
     sim.DirectSynthesisStreamer(
         station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=384,
     )
@@ -375,6 +410,10 @@ def small_catalog(tmp_path_factory):
 
 
 def test_pulsed_source_cfg_rejects_both_name_and_params(station):
+    """A pulsed source_cfg naming a catalog entry AND supplying direct
+    period_s/width_s/dm_pc_cm3 params is ambiguous about which should
+    win -- must be rejected rather than silently preferring one over the
+    other."""
     with pytest.raises(ValueError, match="both"):
         sim.DirectSynthesisStreamer(
             station=station,
@@ -387,6 +426,9 @@ def test_pulsed_source_cfg_rejects_both_name_and_params(station):
 
 
 def test_pulsed_source_cfg_rejects_neither_name_nor_params(station):
+    """A pulsed source_cfg giving neither a catalog name nor direct params
+    has no way to know what pulsar to build -- must fail loudly at
+    construction rather than produce undefined content."""
     with pytest.raises(ValueError, match="neither"):
         sim.DirectSynthesisStreamer(
             station=station,
@@ -396,6 +438,11 @@ def test_pulsed_source_cfg_rejects_neither_name_nor_params(station):
 
 
 def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
+    """Basic end-to-end check that loading a pulsar by catalog name
+    produces a working streamer: deterministic per-tick content, and
+    genuinely complex output -- v2's real-valued-only content couldn't be
+    coherently beamformed across stations (see the PULSED section), so
+    this is checked here too, not just on a directly-built template."""
     catalog_dir, _, _ = small_catalog
     streamer = sim.DirectSynthesisStreamer(
         station=station,
@@ -449,6 +496,10 @@ def test_pulsar_name_matches_directly_built_content(small_catalog, station):
 
 
 def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
+    """The by-name catalog path still needs to support scaling a stored
+    template's amplitude at load time -- confirms the override is applied
+    as a linear scale factor, rather than being silently ignored once a
+    template comes from disk instead of a direct build."""
     catalog_dir, _, _ = small_catalog
     streamer_default = sim.DirectSynthesisStreamer(
         station=station,

@@ -61,9 +61,15 @@ def _station() -> StationConfig:
 
 
 def _parse_item_pointers(raw: bytes, n_items: int) -> list[tuple[int, int]]:
-    """Parses `raw`'s SPEAD-64-48 header + item pointers back into
-    (item_id, value) pairs, independent of SpsPacketizer's own encoding
-    logic -- so a bug in the encoder can't also hide from its own test."""
+    """Parses ``raw``'s SPEAD-64-48 header + item pointers back into
+    ``(item_id, value)`` pairs, independent of ``SpsPacketizer``'s own
+    encoding logic -- so a bug in the encoder can't also hide from its
+    own test.
+
+    :param raw: the encoded heap bytes.
+    :param n_items: expected number of item pointers.
+    :returns: a list of ``(item_id, value)`` pairs.
+    """
     (header_word,) = struct.unpack(">Q", raw[:8])
     assert (header_word >> 48) == 0x5304  # magic 0x53, version 4
     assert (header_word >> 40) & 0xFF == 2  # item-ID field width in bytes
@@ -83,6 +89,12 @@ def _parse_item_pointers(raw: bytes, n_items: int) -> list[tuple[int, int]]:
 
 
 def test_encode_channel_heap_item_pointers_match_icd_spec():
+    """Checks that every one of the ICD's 6 heap items is encoded with
+    the exact item ID and value the spec requires, decoded independently
+    of SpsPacketizer's own encoding logic (see _parse_item_pointers) so a
+    bug in the encoder can't also hide from its own test -- CLAUDE.md
+    flags this bit-packing as the single highest-priority correctness gap
+    in the whole codebase."""
     station = _station()
     packetizer = SpsPacketizer(station)
     heap = _make_heap(channel_id=7, heap_start_time=time.time())
@@ -106,6 +118,10 @@ def test_encode_channel_heap_item_pointers_match_icd_spec():
 
 
 def test_encode_channel_heap_total_length_and_payload():
+    """Confirms the encoded heap has exactly the ICD's expected byte
+    length (header + 6 item pointers + payload, no more) and that the
+    payload itself matches the quantized V/H samples -- a length or
+    content mismatch here would produce a heap CBF can't parse."""
     station = _station()
     packetizer = SpsPacketizer(station)
     heap = _make_heap()
@@ -122,6 +138,10 @@ def test_encode_channel_heap_total_length_and_payload():
 
 
 def test_heap_counter_fits_within_icd_field_for_current_time():
+    """Regression guard for bug #17: the old heap_counter formula
+    inflated the value by HEAP_LEN (2048x) and would have overflowed the
+    ICD's 40-bit field for any present-day timestamp -- pins the fixed
+    formula to actually fit for 'now'."""
     heap_counter = int(round(unix_to_tai2000_seconds(time.time()) / BLOCK_DURATION_S))
     assert 0 <= heap_counter <= SPEAD_HEAP_COUNTER_MAX
 
@@ -178,6 +198,9 @@ def test_send_channel_heap_sends_encoded_bytes_to_dest_addr():
 
 
 def test_send_channel_heap_without_destination_raises():
+    """A packetizer with no destination configured has nowhere to
+    actually send a heap -- must raise clearly rather than silently
+    dropping it or failing with an unrelated error."""
     station = _station()
     packetizer = SpsPacketizer(station)  # no dest_ip, no sock
     try:
@@ -193,6 +216,12 @@ def test_send_channel_heap_without_destination_raises():
 
 
 def test_generate_test_pcap_writes_well_formed_pcap(tmp_path):
+    """Checks the pcap file's own header and per-record framing (magic
+    number, link type, record count, no truncated/trailing bytes) are
+    well-formed, independent of what's inside each record --
+    generate_test_pcap.py exists specifically because spead2 has no pcap
+    writer of its own (see module docstring), so this format has to be
+    hand-verified rather than trusted from a library."""
     output = tmp_path / "test.pcap"
     gen_pcap.generate_test_pcap(str(output), n_heaps=3)
 

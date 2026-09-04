@@ -52,6 +52,11 @@ def _save(tmp_path, name="test_pulsar", **overrides):
 
 
 def test_load_full_range_matches_saved_template(tmp_path):
+    """Baseline round-trip check: loading a catalog entry across its full
+    channel range must reproduce exactly what was saved (modulo the
+    expected complex64-storage precision) -- every other test in this
+    module exercises narrower slices or failure modes built on top of
+    this working correctly."""
     template = _save(tmp_path)
     loaded = load_pulsar_from_catalog(
         "test_pulsar", CATALOG_NUM_CHANNELS, BASE_FREQ_HZ, catalog_dir=tmp_path
@@ -67,6 +72,11 @@ def test_load_full_range_matches_saved_template(tmp_path):
 
 
 def test_load_slices_correct_channel_range(tmp_path):
+    """Loading a sub-band from a wider catalog entry must slice the
+    correct CHANNELS, not just the correct count of them -- uses the
+    synthetic template's per-channel-is-its-own-index content so a
+    wrong-offset slice is immediately obvious rather than needing a
+    numerically-close comparison."""
     _save(tmp_path)
     slice_start = 50
     n_channels = 32
@@ -84,6 +94,9 @@ def test_load_slices_correct_channel_range(tmp_path):
 
 
 def test_load_rejects_misaligned_base_freq(tmp_path):
+    """A requested base_freq_hz that doesn't land on a channel boundary
+    can't be sliced unambiguously -- must be rejected rather than
+    silently rounded to some nearby channel."""
     _save(tmp_path)
     with pytest.raises(ValueError, match="not aligned"):
         load_pulsar_from_catalog(
@@ -92,6 +105,9 @@ def test_load_rejects_misaligned_base_freq(tmp_path):
 
 
 def test_load_rejects_out_of_range_slice(tmp_path):
+    """A requested channel range extending past the end of the saved
+    catalog entry has no data to serve -- must fail loudly rather than
+    silently returning a short or wrapped-around slice."""
     _save(tmp_path)
     with pytest.raises(ValueError, match="doesn't fit"):
         load_pulsar_from_catalog(
@@ -103,6 +119,9 @@ def test_load_rejects_out_of_range_slice(tmp_path):
 
 
 def test_load_rejects_below_catalog_band(tmp_path):
+    """Same out-of-range guard as test_load_rejects_out_of_range_slice
+    above, for a request starting below the catalog entry's stored band
+    -- both directions of out-of-range must be caught, not just one."""
     _save(tmp_path)
     with pytest.raises(ValueError, match="doesn't fit"):
         load_pulsar_from_catalog(
@@ -123,6 +142,11 @@ def test_load_rejects_stale_channel_output_rate(tmp_path):
 
 
 def test_load_rejects_stale_channel_width(tmp_path):
+    """A catalog entry baked under a different channel_width_hz than the
+    caller now uses would misalign every channel's frequency if loaded
+    anyway -- must be rejected, the same class of drift
+    test_load_rejects_stale_channel_output_rate guards against for the
+    sample rate."""
     _save(tmp_path, channel_width_hz=CHANNEL_WIDTH_HZ * 2)
     with pytest.raises(ValueError, match="channel_width_hz"):
         load_pulsar_from_catalog(
@@ -131,12 +155,18 @@ def test_load_rejects_stale_channel_width(tmp_path):
 
 
 def test_load_rejects_unknown_name(tmp_path):
+    """Requesting a pulsar name that was never saved to this catalog must
+    fail with a clear, specific error, not an obscure KeyError or a
+    silently-empty result."""
     _save(tmp_path)
     with pytest.raises(ValueError, match="not in catalog"):
         load_pulsar_from_catalog("nonexistent", 32, BASE_FREQ_HZ, catalog_dir=tmp_path)
 
 
 def test_load_rejects_missing_catalog(tmp_path):
+    """Loading from a directory with no catalog.json at all (e.g. a
+    fresh or misconfigured deployment) must fail with a clear, specific
+    message rather than a generic file-not-found traceback."""
     with pytest.raises(ValueError, match="no pulsar catalog found"):
         load_pulsar_from_catalog("anything", 32, BASE_FREQ_HZ, catalog_dir=tmp_path)
 
