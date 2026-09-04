@@ -95,31 +95,30 @@ def test_tone_delay_as_phase_accuracy():
 
 
 # ============================================================
-# NOISE KERNEL (Box-Muller, before it's tiled into a bank)
+# NOISE — fill_noise_bank (plain numpy Generator, one-time construction
+# call; see module docstring's NUMBA section for why this isn't numba)
 # ============================================================
 
 
-def test_noise_statistics_and_cross_channel_independence():
-    noise = sim.synth_noise_all_channels(
-        seed=7, std=1.0, sample_index_start=0, num_channels=96, n_samples=200_000
-    )
+def test_noise_bank_statistics_and_cross_channel_independence():
+    bank = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=1, tile_n_samples=200_000, num_channels=96)
+    noise = bank[0]
     assert abs(np.mean(noise)) < 0.01
     assert abs(np.std(noise[:, 0].real) - 1.0) < 0.01
     corr = np.corrcoef(noise[:, 0].real, noise[:, 1].real)[0, 1]
     assert abs(corr) < 0.02
 
 
-def test_noise_kernel_determinism():
-    n1 = sim.synth_noise_all_channels(7, 1.0, 1000, 96, 500)
-    n2 = sim.synth_noise_all_channels(7, 1.0, 1000, 96, 500)
+def test_noise_bank_determinism():
+    n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
+    n2 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
     assert np.array_equal(n1, n2)
 
 
-def test_noise_in_place_kernel_matches_allocating_kernel():
-    n1 = sim.synth_noise_all_channels(7, 1.0, 1000, 96, 500)
-    into_buf = np.full((500, 96), 999.0 + 999.0j, dtype=np.complex128)
-    sim.synth_noise_all_channels_into(into_buf, 7, 1.0, 1000, 96, 500)
-    assert np.array_equal(n1, into_buf)
+def test_noise_bank_different_seeds_differ():
+    n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
+    n2 = sim.fill_noise_bank(seed=99, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
+    assert not np.array_equal(n1, n2)
 
 
 # ============================================================

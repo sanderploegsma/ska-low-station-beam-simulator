@@ -118,15 +118,48 @@ tick, and an earlier version of this codebase needed ~24-48 threads to
 clear budget doing it that way (see Benchmarking). The noise strategy
 actually used now is a **pre-generated tile bank**: `n_tiles` tiles of
 `tile_n_samples` ("tile width", both configurable on
-`DirectSynthesisStreamer`) are generated once at construction (still
-using the same Box-Muller kernel, just called `n_tiles` times upfront
-instead of once per tick); each tick does an O(1) per-(station, pol)
-index draw plus a memcopy instead. Noise never enters a delay pipeline
-either way — physically correct, since receiver noise originates locally
-per station, after any signal-path delay would apply (this was a real
-bug in the deleted wideband path: `shared` and `noise` were summed
-*before* its delay/channelization pipeline, delay-correcting noise that
-should never have been delay-corrected at all).
+`DirectSynthesisStreamer`) are generated once at construction; each tick
+does an O(1) per-(station, pol) index draw plus a memcopy instead. Noise
+never enters a delay pipeline either way — physically correct, since
+receiver noise originates locally per station, after any signal-path
+delay would apply (this was a real bug in the deleted wideband path:
+`shared` and `noise` were summed *before* its delay/channelization
+pipeline, delay-correcting noise that should never have been
+delay-corrected at all).
+
+**Filling the bank is plain `numpy.random.Generator`, not custom numba
+Box-Muller, as of this session.** The original hand-rolled splitmix64
+hash + Box-Muller kernel existed specifically because live PER-TICK
+generation under numba needed it (numba's nopython mode doesn't support
+numpy's own Philox/PCG64 — bug #7). Once noise moved to "generate once,
+replay per tick" (this section), that constraint stopped applying to the
+BUILD step — only the per-tick tile-index pick still needs custom numba
+(`_splitmix64_hash`, kept: it's a single integer hash, not a statistical
+distribution, and must run with zero allocation from inside
+`generate_next_tick`). `fill_noise_bank` now parallelizes across a plain
+`ThreadPoolExecutor` over independent `numpy.random.SeedSequence`
+children — numpy's Generator releases the GIL during generation, so this
+is genuine multi-core speedup with no custom numerical code at all.
+**Measured faster than the numba version it replaced, not just
+"acceptable"**: 0.67s vs. numba's 2.2s at n_tiles=256, 2.5s vs. 8.8s at
+n_tiles=1024 (both pols, 448 channels) — see the updated table below.
+`_copy_tile_into` (an optional numba-parallel per-tick memcopy) was
+deleted outright as dead weight: `parallel_copy` was never set `True` in
+production or the benchmark, and the plain `out[:] = bank[idx]` path
+below was already known to be sufficient.
+
+**A real memory bug was caught here, not just a design choice** (bug #16
+below): the first replacement had each worker thread return a freshly
+allocated chunk array, concatenated at the end — this peaked at several
+times the bank's own footprint (chunk arrays + concatenate's
+source-and-destination all alive simultaneously) and OOM-killed the
+process (and, since this ran on a shared node, other tenants' pods along
+with it) building a realistically-sized bank. Fixed by having each
+worker write directly into its slice of one preallocated bank array, one
+TILE AT A TIME (bounding transient memory to a handful of tiles
+regardless of total bank size) — confirmed via `/usr/bin/time -v` under
+a `ulimit -v` safety net: peak RSS now matches the bank's own size almost
+exactly, no multiplier.
 
 **Correctness constraint, non-negotiable:** the tile index MUST be drawn
 from each station's own (station, pol) noise seed — never from a value
@@ -145,11 +178,12 @@ paradox, a station's own tile-index sequence hits its first repeat after
 ~1.25×√n_tiles ticks. Measured on the 2-socket EPYC 9254 target hardware,
 448 channels, 8 threads:
 
-| n_tiles | bank size (both pols) | build time | first repeat (~ticks) | ~scan time |
-|---|---|---|---|---|
-| 256 | 7.0 GB | 2.2s | 20 | 52ms |
-| 1024 | 28.0 GB | 8.8s | 40 | 105ms |
-| 2048 | 56.0 GB | 31.9s | 57 | 148ms |
+| n_tiles | bank size (both pols) | build time (numba, historical) | build time (numpy Generator, current) | first repeat (~ticks) | ~scan time |
+|---|---|---|---|---|---|
+| 256 | 7.0 GB | 2.2s | **0.67s** | 20 | 52ms |
+| 512 | 15.0 GB | — | **1.29s** | 28 | 73ms |
+| 1024 | 28.0 GB | 8.8s | **2.54s** | 40 | 105ms |
+| 2048 | 56.0 GB | 31.9s | not re-measured | 57 | 148ms |
 
 Going another order of magnitude in `n_tiles` (well past feasible
 per-pod memory) would still only push the first repeat into the
@@ -164,21 +198,23 @@ periodicity.
 
 **CPU cost turned out to be a non-issue — this is the headline result.**
 Once the bank exists, per-tick cost is just an index hash + a ~14.7MB
-memcopy, at 448 channels:
-- Plain `out[:] = bank[idx]` (single-threaded numpy, ignores thread
-  count entirely): **1.51ms/tick (57.5% of budget) regardless of core
-  count** — even 1 core is enough.
-- A numba `prange`-parallelized copy does better still: 0.36ms (13.9%)
-  at just 8 threads, versus 1.38ms (52.6%) single-threaded.
+memcopy, at 448 channels: plain `out[:] = bank[idx]` (single-threaded
+numpy, ignores thread count entirely) is **1.51ms/tick (57.5% of
+budget) regardless of core count** — even 1 core is enough. (An earlier,
+now-deleted `_copy_tile_into` numba-parallel variant got this down to
+0.36ms/13.9% at 8 threads, but was never actually used — `parallel_copy`
+defaulted `False` everywhere — so it was removed as unused custom code
+rather than kept "just in case"; revisit only if the plain-numpy copy
+above is ever shown to be the actual per-tick bottleneck, which it isn't
+at 448 channels.)
 
 So **the target of ~8 CPU cores/pod is not just achievable but massively
 over-provisioned for this approach's steady-state cost** — 1-2 cores
 would already clear budget. The actual per-pod resource question this
 approach shifts onto is **memory** (linear in `n_tiles`, ~27MB/tile
-across both pols at 448 channels) and **one-time startup latency**
-(scales with `n_tiles`, improves with more threads at build time only —
-8 threads builds a 256-tile/7GB bank in 2.2s, a 1024-tile/28GB bank in
-8.8s).
+across both pols at 448 channels) and **one-time startup latency** (see
+the build-time columns above — comfortably inside the 10s construction
+target even at n_tiles=1024, now that the fill is plain numpy).
 
 **Bottom line**: if CBF's tests tolerate per-station noise periodicity on
 the order of tens to hundreds of milliseconds repeating throughout a
@@ -305,13 +341,33 @@ because each station's receiver is a physically separate noise source.
 
 **Resource cost, benchmarked on the EPYC target hardware, 448 channels,
 DM=2, 100ms period, 5ms FWHM:**
-- One-time build cost is now plain numpy (wideband generate + FFT
-  dispersion + channelize), not numba — thread count isn't the lever,
-  period length is, since it scales with the wideband FFT length
-  (`num_channels × n_period_samples`): 0.16s at a 1ms period, 4.5s at
-  100ms, 46.7s at 1000ms (roughly 2x the older, wrong sub-frequency-averaging
-  approach's build cost at the same period — a fair trade for actually
-  being correct on two counts).
+- One-time build cost (wideband generate + FFT dispersion + channelize)
+  is ALL plain numpy as of this session — `generate_wideband_pulse_train`
+  (the wideband sky-carrier step) was custom numba until this session
+  (the same splitmix64+Box-Muller kernel the noise tile bank used to use
+  — see the Noise section above for why that constraint no longer
+  applies once generation is one-time, not per-tick); replaced with a
+  fully vectorized numpy version, measured FASTER at every period length
+  tried (e.g. 6.2s vs. numba's 9.6s at a 1s period, 448 channels) — no
+  tradeoff to make, unlike the per-tick kernels below. FFT
+  dispersion+channelize was already plain numpy before this session.
+  Thread count isn't the lever for any of this — period length is, since
+  it scales with the wideband FFT length (`num_channels ×
+  n_period_samples`): 0.48s at a 10ms period, 4.4s at 100ms, **46.2s at
+  1000ms**.
+- **The 1000ms-period figure ALREADY EXCEEDS this project's one-time
+  construction budget (target 10s, hard limit 30s) — a pre-existing cost,
+  newly relevant now that a hard budget exists, and NOT something the
+  numba→numpy replacement above fixes.** Isolating the wideband-generate
+  substep alone confirms it's cheap either way (numpy: 6.2s of the 46.2s
+  total, numba: 9.6s) — the dominant, ~37-40s cost is the FFT/dispersion
+  step itself (`build_pulsar_template`'s `np.fft.fft`/`ifft` calls on a
+  ~350M-element array at a 1s period), likely because that size doesn't
+  factor into small primes (plain `numpy.fft` has no control over this).
+  Not fixed in this pass — candidates if a real deployment needs
+  multi-second pulsar periods: padding the FFT length to a fast/composite
+  size, `scipy.fft` with `workers=`, or simply documenting a maximum
+  supported pulsar period. See "Immediate next steps."
 - **Steady-state per-tick cost clears the ~8-core target with room to
   spare**: 1.36ms/tick (51.8% of the 2.621ms budget) at 8 threads; even
   4 threads clears budget (1.93ms, 73.7%). This isolated the pulsar cost
@@ -493,12 +549,16 @@ reintroduce a regression into.
 13. **`DirectSynthesisStreamer.generate_next_tick` allocated a fresh
     14.7MB complex128 array (`np.zeros`) plus another fresh array from
     `synth_noise_all_channels` plus a separate full-array `+=`, twice per
-    tick (once per pol)** — this allocation/copy churn, not Box-Muller
-    math, was the dominant per-tick cost at high channel counts (~30ms of
-    a ~33ms tick at 448 channels). Misdiagnosed at first as a
-    compute/thread-dispatch problem — see "Target server results" below
-    for the full investigation trail. **Fixed**: `synth_noise_all_channels_into`
-    writes noise directly into a persistent, reused per-pol buffer
+    tick (once per pol)** *(`synth_noise_all_channels`/`_into` — the
+    numba Box-Muller kernels named here — no longer exist; noise
+    generation moved to plain numpy this session, see the Noise section
+    and bug #16, but the reused-output-buffer fix this bug describes is
+    still exactly how `generate_next_tick` works)* — this allocation/copy
+    churn, not Box-Muller math, was the dominant per-tick cost at high
+    channel counts (~30ms of a ~33ms tick at 448 channels). Misdiagnosed
+    at first as a compute/thread-dispatch problem — see "Target server
+    results" below for the full investigation trail. **Fixed**: noise is
+    written directly into a persistent, reused per-pol buffer
     (`DirectSynthesisStreamer._get_output_buffer`); tone then adds on top.
     Verified bit-identical to the old path for the same seed/index. Safe
     to mutate in place because `ScanRunner._run` calls `generate_next_tick`
@@ -525,6 +585,29 @@ reintroduce a regression into.
     expensive part" lesson as bug #13's noise-allocation fix, applied to
     a different hot spot — check any new per-channel kernel against this
     before assuming a `cos`/`sin` call per channel is free.
+16. **`fill_noise_bank`'s first version (this session) returned one
+    freshly allocated array per worker thread and `np.concatenate`'d
+    them** — peaked at several times the bank's own memory footprint
+    (per-worker return arrays + concatenate's source-and-destination all
+    alive at once) and OOM-killed the process building a realistically
+    sized bank (n_tiles=1024, 448 channels) — on a SHARED node, this took
+    other tenants' pods down with it (`oom.group` kill), not just our own
+    process. Caught only by actually running it at realistic size under
+    `/usr/bin/time -v`, not by reasoning about the code — the same
+    "measure, don't assume" lesson as the allocation-overhead
+    investigation in bug #13, now applied to memory instead of time.
+    Fixed by having each worker write directly into its slice of ONE
+    preallocated bank array, one tile at a time (bounding transient
+    memory to a handful of tiles regardless of total bank size) — a first
+    attempt at this fix tried using `numpy.random.Generator`'s `out=`
+    parameter directly against `bank[start:end].real`/`.imag`, which
+    fails outright (`out=` requires a C-contiguous target, and `.real`/
+    `.imag` views of a complex array are strided) — caught immediately as
+    a clear error, not a silent one. Plain assignment (`bank[i].real =
+    arr`), unlike `out=`, does accept a strided target, which is what the
+    final per-tile version relies on. Verified: peak RSS now matches the
+    bank's own size almost exactly, confirmed via a `ulimit -v` safety
+    net before trusting it on this shared node again.
 
 ## Benchmarking
 
@@ -683,6 +766,36 @@ real deployment needs the full comfort margin at exactly 8 cores, revisit
 of them trade memory and noise-repeat frequency for a bit more per-tick
 headroom, though the effect size hasn't been swept here.
 
+### One-time construction budget (new this session: target 10s, hard limit 30s)
+
+Distinct from the per-TICK budget above — this is the one-time cost of
+`DirectSynthesisStreamer.__init__` itself, before a scan can start.
+Noise-bank fill and the pulsar's wideband sky-carrier generation are the
+only non-trivial construction-time costs (tone is instant; the delay
+feed setup is a dict lookup). Measured in isolation via
+`benchmark_direct_synthesis.py`, NUMA-pinned, 448 channels:
+
+| noise n_tiles | build (both pols) |
+|---|---|
+| 256 | 0.67s |
+| 512 | 1.29s |
+| 1024 | 2.54s |
+
+| pulsar period | build (wideband generate + FFT dispersion + channelize) |
+|---|---|
+| 10ms | 0.48s |
+| 100ms | 4.44s |
+| 1000ms | **46.17s — OVER the 30s hard limit** |
+
+Noise easily clears the 10s target at every tested size. **The
+1000ms-period pulsar does not** — see the Pulsed sources section above
+for why (FFT size, not the noise-kernel work this session was actually
+about) and candidate fixes, none applied yet. Not tested combined at
+their largest settings simultaneously (n_tiles=1024 + a 1s-period pulsar
+at once) — an earlier attempt at that combination used enough transient
+memory to threaten node stability on this shared host (see bug #16); if
+a real test scenario needs both large at once, budget memory as
+carefully as time before trying it.
 ### Historical hardware notes (legacy wideband path only, from earlier sessions)
 
 - **Apple M5** (4P+6E cores): `ThreadPoolExecutor` threading plateaus at
@@ -788,6 +901,27 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    without a restart.
 7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
+8. **Long-period pulsars (≥~1s) violate the one-time construction budget
+   (target 10s, hard limit 30s)** — measured 46.2s at a 1s period, 448
+   channels, dominated by `build_pulsar_template`'s FFT dispersion step
+   (~37-40s of it), not the wideband-generate substep this session moved
+   off numba (that part alone is only ~6s, and is now numpy either way).
+   Candidates, untried: pad the wideband FFT length to a fast/composite
+   size, switch to `scipy.fft` with `workers=` for multi-threading, or
+   just document/enforce a maximum supported pulsar period if sub-second
+   periods cover every real test case CBF actually needs.
+9. ~~Minimize custom numba/RNG code where the per-tick budget doesn't
+   require it~~ **Done this session for noise and the pulsar's wideband
+   carrier** (see the Noise and Pulsed sources sections, and bug #16 for
+   a real memory bug caught along the way) — both are now plain
+   (thread-parallelized, for noise) numpy, measured FASTER than the numba
+   they replaced, not just "acceptable." What's still numba, deliberately:
+   `synth_tone_channel` and `add_pulsar_tick` (genuinely per-tick,
+   2.621ms budget, already needed real numerical tricks — NCO
+   phase-accumulator, bug #15 — just to clear it) and `_splitmix64_hash`
+   (a single per-tick integer hash for tile-index selection, not a
+   statistical distribution, kept small and separate from the
+   Box-Muller machinery it used to feed).
 
 ## Setup
 

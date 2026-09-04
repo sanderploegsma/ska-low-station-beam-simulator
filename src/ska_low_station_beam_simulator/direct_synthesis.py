@@ -56,8 +56,24 @@ Once the bank exists, per-tick cost is an index hash + a memcopy —
 independent of channel count and, past a couple of threads, independent
 of CPU budget too (benchmarked: ~8 cores clears the 448-channel budget
 with room to spare; even 1-2 would). This is NOT a free upgrade over
-live Box-Muller generation — it is a deliberate fidelity/resource
-tradeoff, and the tradeoff is REPEATS, not noise or CPU cost:
+live per-tick generation — it is a deliberate fidelity/resource tradeoff,
+and the tradeoff is REPEATS, not noise or CPU cost:
+
+Filling the bank itself is plain `numpy.random.Generator` (see
+DirectSynthesisStreamer.__init__), not custom RNG code — an earlier
+version of this module used a hand-rolled splitmix64 hash + Box-Muller
+kernel here specifically because it needed per-tick, per-sample live
+generation under numba (which doesn't support numpy's Philox/PCG64 in
+nopython mode — see bug #7). Once noise moved to "generate once at
+construction, replay per tick" (this section), that constraint no longer
+applies: bank-filling is a ONE-TIME, offline call, so there's no reason
+to avoid numpy's own (better-tested) Generator there. Parallelized via a
+plain `ThreadPoolExecutor` over independent `SeedSequence.spawn()`
+children — numpy's Generator releases the GIL during generation, so this
+is genuine multi-core speedup with zero custom numerical code, not
+numba's kind of parallelism. See CLAUDE.md's Benchmarking section for
+the one-time construction-time budget this needs to fit (target 10s,
+hard limit 30s) and measurements confirming it does.
 
   - By the birthday paradox, a station's OWN tile-index sequence hits
     its first repeat after roughly 1.25*sqrt(n_tiles) ticks. For any
@@ -165,27 +181,31 @@ detect the injected pulsar as a candidate, not just exercising
 delay-tracking.
 
 ============================================================
-NUMBA
+NUMBA — only where the PER-TICK budget actually requires it
 ============================================================
-Benchmarked directly against plain numpy alternatives before committing
-to it (see CLAUDE.md's benchmarking notes) — this earns its complexity:
-    - Noise-bank build (Box-Muller): numba+prange is the only way to
-      actually parallelize this (numpy's Generator has no built-in
-      multi-threading).
-    - Tone and per-tick tile-bank/pulsar serving: numba's fused loops
-      avoid full-array temporaries; the pulsar per-tick kernel
-      specifically needed a phase-accumulator (NCO-style) recurrence
-      rather than calling cos/sin per (sample, channel) — that mistake
-      alone needed 4x the threads to clear budget, the same
-      "per-element transcendental calls are expensive" lesson the noise
-      kernel work already established.
-Philox isn't used for the RNG (not supported in numba nopython mode) —
-an independent splitmix64-style hash + Box-Muller implementation is used
-instead throughout.
+numba is deliberately NOT used for anything that only runs once at
+construction anymore (noise-bank fill, the pulsar's wideband sky-carrier
+generation — both now plain/parallelized numpy, see their sections
+above). It earns its complexity only for genuinely per-tick, hot-path
+work, benchmarked directly against plain numpy alternatives before
+committing to it (see CLAUDE.md's benchmarking notes):
+    - `synth_tone_channel` / `add_pulsar_tick`: fused per-(sample,
+      channel) loops that avoid full-array temporaries — the pulsar
+      kernel specifically needed a phase-accumulator (NCO-style)
+      recurrence rather than calling cos/sin per (sample, channel); that
+      mistake alone needed 4x the threads to clear budget.
+    - `_splitmix64_hash`: the ONLY RNG-shaped code left as custom numba —
+      used solely for picking each tick's noise tile index (a single
+      integer hash + modulo, not a statistical distribution), because it
+      must be callable per-tick with zero allocation from inside
+      `generate_next_tick`. Deliberately kept small and separate from the
+      (now-removed) Box-Muller machinery it used to feed.
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import numpy as np
@@ -228,7 +248,9 @@ DEFAULT_SKY_SEED = 0x5AB1E5EED
 
 
 # ============================================================
-# CORE KERNELS: splitmix64 hash + Box-Muller, delay-polynomial eval, tone
+# CORE KERNELS: splitmix64 hash (per-tick tile-index selection only),
+# delay-polynomial eval, tone. No Box-Muller/statistical RNG lives in
+# numba anymore -- see module docstring's NUMBA section.
 # ============================================================
 
 
@@ -241,21 +263,6 @@ def _splitmix64_hash(seed, index):
     z = ((z ^ (z >> np.uint64(27))) * np.uint64(0x94D049BB133111EB)) & MASK64
     z = z ^ (z >> np.uint64(31))
     return z
-
-
-@njit(cache=True)
-def _uniform_from_hash(h):
-    return np.float64(h >> np.uint64(11)) * (1.0 / 9007199254740992.0)
-
-
-@njit(cache=True)
-def _gaussian_pair(seed, index):
-    u1 = _uniform_from_hash(_splitmix64_hash(seed, 2 * index))
-    u2 = _uniform_from_hash(_splitmix64_hash(seed, 2 * index + 1))
-    u1 = max(u1, 1e-300)
-    r = np.sqrt(-2.0 * np.log(u1))
-    theta = 2.0 * np.pi * u2
-    return r * np.cos(theta), r * np.sin(theta)
 
 
 @njit(cache=True)
@@ -309,58 +316,76 @@ def synth_tone_channel(
 
 
 # ============================================================
-# NOISE — Box-Muller kernels, used to fill the tile bank (once, at
-# construction) rather than per tick. See module docstring.
+# NOISE — tile bank fill, ONCE at construction. Plain numpy, not numba:
+# this only runs once (unlike the per-tick replay it feeds), so there's
+# no reason to avoid numpy's own Generator here. See module docstring.
 # ============================================================
 
 
-@njit(parallel=True, cache=True)
-def synth_noise_all_channels(seed, std, sample_index_start, num_channels, n_samples):
-    """
-    Independent complex Gaussian directly at (n_samples, num_channels)
-    resolution — statistically exact equivalent of "wideband noise, then
-    FFT channelized" (DFT of i.i.d. Gaussian is i.i.d. Gaussian). NO
-    delay applied — physically correct for receiver noise.
-    """
-    out_real = np.empty((n_samples, num_channels), dtype=np.float64)
-    out_imag = np.empty((n_samples, num_channels), dtype=np.float64)
-    for i in prange(n_samples):
-        for ch in range(num_channels):
-            flat_index = (sample_index_start + i) * num_channels + ch
-            g_real, g_imag = _gaussian_pair(seed, flat_index)
-            out_real[i, ch] = g_real * std
-            out_imag[i, ch] = g_imag * std
-    return out_real + 1j * out_imag
+def fill_noise_bank(seed: int, std: float, n_tiles: int, tile_n_samples: int, num_channels: int) -> np.ndarray:
+    """Fills a (n_tiles, tile_n_samples, num_channels) complex128 bank of
+    independent complex Gaussian noise — statistically exact equivalent
+    of "wideband noise, then FFT channelized" (DFT of i.i.d. Gaussian is
+    i.i.d. Gaussian). NO delay applied — physically correct for receiver
+    noise (see module docstring).
 
+    Parallelized across a plain ThreadPoolExecutor over independent
+    numpy.random.SeedSequence children — numpy's Generator releases the
+    GIL during generation, so this genuinely uses multiple cores despite
+    being plain Python/numpy, no numba required. Deterministic given
+    (seed, n_tiles, tile_n_samples, num_channels): unlike the per-tick
+    tile REPLAY (which must be a pure function of tick index so the same
+    tick can be regenerated identically), the BANK ITSELF is built
+    exactly once and never regenerated mid-scan, so it only needs to be
+    reproducible run-to-run, not seekable to an arbitrary offset — a
+    single seeded Generator stream is sufficient.
 
-@njit(parallel=True, cache=True)
-def synth_noise_all_channels_into(out, seed, std, sample_index_start, num_channels, n_samples):
-    """Same statistics as synth_noise_all_channels, but WRITES directly
-    into a caller-provided (n_samples, num_channels) complex128 buffer
-    instead of allocating fresh arrays — used to fill each tile bank
-    entry once, at construction. Writes (not +=) every cell."""
-    for i in prange(n_samples):
-        for ch in range(num_channels):
-            flat_index = (sample_index_start + i) * num_channels + ch
-            g_real, g_imag = _gaussian_pair(seed, flat_index)
-            out[i, ch] = (g_real * std) + 1j * (g_imag * std)
+    Each worker writes directly into its slice of a single preallocated
+    `bank` array, ONE TILE AT A TIME — the same "avoid full-array
+    temporaries, write in place" discipline as bug #13 elsewhere in this
+    codebase, applied here to bound transient memory to a handful of
+    tiles (a few tens of MB) regardless of the bank's total size. Two
+    earlier versions of this function got this wrong, in different ways,
+    both caught only by actually running them at realistic bank size —
+    not by reasoning about the code:
+      - v1 returned one freshly allocated array per WORKER CHUNK and
+        np.concatenate'd them at the end, peaking at several times the
+        bank's own footprint (chunk return arrays + concatenate's
+        source-and-destination all alive at once) and OOM-killing the
+        process building a large bank.
+      - v2 tried writing generation output directly into (bank[start:
+        end]).real/.imag via numpy.random.Generator's out= parameter to
+        avoid v1's copies -- numpy's out= requires a C-contiguous target,
+        and .real/.imag views of a complex array are strided (not
+        contiguous), so this fails outright with a clear error (caught
+        immediately, not silently wrong).
+    Plain assignment (`bank[i].real = arr`, unlike out=) DOES accept a
+    strided target, which is what makes the per-tile version below work.
+    """
+    n_workers = max(1, min(n_tiles, os.cpu_count() or 8, 16))
+    seed_seq = np.random.SeedSequence(seed)
+    child_seqs = seed_seq.spawn(n_workers)
+    base = n_tiles // n_workers
+    remainder = n_tiles % n_workers
+    chunk_sizes = [base + (1 if i < remainder else 0) for i in range(n_workers)]
+    starts = np.cumsum([0] + chunk_sizes[:-1])
+
+    bank = np.empty((n_tiles, tile_n_samples, num_channels), dtype=np.complex128)
+
+    def _fill_range(child_seq, start, n_tiles_chunk):
+        rng = np.random.default_rng(child_seq)
+        for i in range(start, start + n_tiles_chunk):
+            bank[i].real = rng.standard_normal((tile_n_samples, num_channels)) * std
+            bank[i].imag = rng.standard_normal((tile_n_samples, num_channels)) * std
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        list(executor.map(_fill_range, child_seqs, starts, chunk_sizes))
+    return bank
 
 
 def bank_memory_bytes(n_tiles: int, tile_n_samples: int, num_channels: int, n_pols: int = 2) -> int:
     """Total resident memory for the noise bank across both pols."""
     return n_tiles * tile_n_samples * num_channels * 16 * n_pols  # complex128 = 16 bytes
-
-
-@njit(parallel=True, cache=True)
-def _copy_tile_into(out, bank, tile_idx):
-    """out[:] = bank[tile_idx], parallelized over rows -- lets the
-    benchmark test whether spreading the copy across threads matters at
-    all once generation itself is no longer in the per-tick path."""
-    n_samples = out.shape[0]
-    num_channels = out.shape[1]
-    for i in prange(n_samples):
-        for ch in range(num_channels):
-            out[i, ch] = bank[tile_idx, i, ch]
 
 
 # ============================================================
@@ -374,36 +399,27 @@ def dispersion_delay_s(freq_hz: float, dm_pc_cm3: float) -> float:
     return DISPERSION_CONST_S_MHZ2_PER_DM * dm_pc_cm3 / (freq_mhz**2)
 
 
-@njit(cache=True)
-def _real_gaussian(seed, index):
-    g_real, _ = _gaussian_pair(seed, index)
-    return g_real
-
-
-@njit(cache=True)
-def _gaussian_envelope(t, peak, period_s, sigma, amplitude):
-    d = t - peak
-    d = d - period_s * np.floor(d / period_s + 0.5)  # wrap into [-period/2, period/2)
-    return amplitude * np.exp(-0.5 * (d / sigma) ** 2)
-
-
-@njit(cache=True)
 def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_rate, n_wide):
     """The shared 'sky carrier': one period of a real, wideband (spans
     the WHOLE band as a single time series), UNDISPERSED pulse train.
     Physically: incoherent broadband radio emission (noise-like),
     power-modulated by the pulsar's rotation -- amplitude = envelope(t)
-    * a real Gaussian draw, same model PsrSigSim's _make_amp_pulses
-    uses. Deterministic/seekable from (seed, sample index) alone, same
-    property every other kernel in this codebase relies on."""
+    * a real Gaussian draw, same model PsrSigSim's _make_amp_pulses uses.
+
+    Plain vectorized numpy, not numba: this is a ONE-TIME construction
+    call (see build_pulsar_template), and benchmarked faster than the
+    equivalent hand-rolled numba loop it replaced at every period length
+    tried (e.g. ~6.2s vs ~9.6s at a 1s period, 448 channels) — there was
+    no tradeoff to make here, unlike the per-tick kernels below.
+    """
     sigma = width_s / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # width_s = FWHM
     peak = period_s / 2.0
-    v = np.empty(n_wide, dtype=np.float64)
-    for i in range(n_wide):
-        t = i / wideband_rate
-        env = _gaussian_envelope(t, peak, period_s, sigma, amplitude)
-        v[i] = env * _real_gaussian(seed, i)
-    return v
+    t = np.arange(n_wide) / wideband_rate
+    d = t - peak
+    d = d - period_s * np.floor(d / period_s + 0.5)  # wrap into [-period/2, period/2)
+    env = amplitude * np.exp(-0.5 * (d / sigma) ** 2)
+    g = np.random.default_rng(seed).standard_normal(n_wide)
+    return env * g
 
 
 def _channelize_once(v: np.ndarray, num_channels: int) -> np.ndarray:
@@ -556,7 +572,6 @@ class DirectSynthesisStreamer:
         channel_width_hz: float = CHANNEL_WIDTH_HZ,
         n_tiles: int = DEFAULT_N_TILES,
         tile_n_samples: Optional[int] = None,
-        parallel_copy: bool = False,
     ):
         for cfg in source_cfgs:
             if cfg["kind"] not in ("tone", "pulsed"):
@@ -616,23 +631,12 @@ class DirectSynthesisStreamer:
         # --- noise tile bank (see module docstring for the tradeoff) ---
         self.n_tiles = n_tiles
         self.tile_n_samples = tile_n_samples or self.tick_n_samples()
-        self.parallel_copy = parallel_copy
         self._banks: dict[str, np.ndarray] = {}
         if noise_cfg is not None:
             for pol, seed in (("V", self._noise_seed_v), ("H", self._noise_seed_h)):
-                bank = np.empty(
-                    (self.n_tiles, self.tile_n_samples, self.num_channels), dtype=np.complex128
+                self._banks[pol] = fill_noise_bank(
+                    seed, self._noise_std, self.n_tiles, self.tile_n_samples, self.num_channels
                 )
-                for tile_idx in range(self.n_tiles):
-                    synth_noise_all_channels_into(
-                        bank[tile_idx],
-                        seed,
-                        self._noise_std,
-                        tile_idx * self.tile_n_samples,  # each tile is independent content
-                        self.num_channels,
-                        self.tile_n_samples,
-                    )
-                self._banks[pol] = bank
 
         # --- pulsar templates: one (template, period_s, n_period_samples)
         # tuple per pulsed source cfg, built ONCE here. sky_seed is shared
@@ -725,10 +729,7 @@ class DirectSynthesisStreamer:
                 # Per-(station, pol) independent draw -- NEVER shared
                 # across stations. See module docstring.
                 tile_idx = int(_splitmix64_hash(noise_seed, tick_index) % self.n_tiles)
-                if self.parallel_copy:
-                    _copy_tile_into(out, bank, tile_idx)
-                else:
-                    out[:] = bank[tile_idx]
+                out[:] = bank[tile_idx]
             else:
                 out.fill(0)
 

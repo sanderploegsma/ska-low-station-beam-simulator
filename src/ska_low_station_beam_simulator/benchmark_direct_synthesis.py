@@ -176,6 +176,46 @@ print(
 print(f"noise tile-bank memory (both pols): {streamer.bank_memory_bytes()/1e9:.3f} GB")
 
 # %%
+# --- ONE-TIME CONSTRUCTION budget check ---
+# Target 10s, hard limit 30s, per-station, before a scan can start.
+# Noise-bank fill and the pulsar's wideband sky-carrier are now plain
+# (parallelized) numpy rather than numba -- see direct_synthesis.py's
+# NUMBA section -- so this checks that replacement actually meets budget.
+#
+# Kept deliberately ISOLATED (noise-only sweep, then pulsar-only sweep)
+# rather than combined at the largest sizes of both at once: a combined
+# n_tiles=1024 + period_s=1.0 run was tried and used enough transient
+# memory (large retained noise banks + a large pulsar wideband/FFT
+# working set, concurrently) to threaten node stability on this shared
+# host -- caught by a 50GB `ulimit -v` safety net, not by reasoning about
+# it beforehand. Revisit together only under a memory budget, not just a
+# time budget, if a real deployment actually needs both large at once.
+print("=" * 70)
+print("ONE-TIME CONSTRUCTION BUDGET (target 10s, hard limit 30s), 448 channels")
+print("=" * 70)
+
+print("-- noise tile-bank fill only (fill_noise_bank, both pols) --")
+for n_tiles_check in (256, 512, 1024):
+    t0 = time.perf_counter()
+    for _seed in (7, 1_000_010):  # V, H -- same as DirectSynthesisStreamer's two calls
+        sim.fill_noise_bank(_seed, 0.05, n_tiles_check, HEAP_LEN, 448)
+    build_s = time.perf_counter() - t0
+    mem_gb = sim.bank_memory_bytes(n_tiles_check, HEAP_LEN, 448) / 1e9
+    flag = "OK" if build_s <= 10.0 else ("OVER 10s TARGET" if build_s <= 30.0 else "OVER 30s HARD LIMIT")
+    print(f"n_tiles={n_tiles_check:>4}  bank_mem={mem_gb:6.2f}GB  build={build_s:7.3f}s  [{flag}]")
+
+print("\n-- pulsar wideband sky-carrier + dispersion + channelize only (build_pulsar_template) --")
+for period_s in (0.01, 0.1, 1.0):
+    t0 = time.perf_counter()
+    sim.build_pulsar_template(
+        448, sim.CHANNEL_WIDTH_HZ, sim.DEFAULT_PULSAR_BASE_FREQ_HZ, sim.CHANNEL_WIDTH_HZ,
+        period_s, period_s * 0.05, 1.0, PULSAR_DM,
+    )
+    build_s = time.perf_counter() - t0
+    flag = "OK" if build_s <= 10.0 else ("OVER 10s TARGET" if build_s <= 30.0 else "OVER 30s HARD LIMIT")
+    print(f"period={period_s*1000:>6.0f}ms  build={build_s:7.3f}s  [{flag}]")
+
+# %%
 # --- Repeatability check at the best config for EACH channel count ---
 # Single-pass sweep results have not been trustworthy on this class of
 # hardware without repeat checks (see CLAUDE.md) — confirm before
