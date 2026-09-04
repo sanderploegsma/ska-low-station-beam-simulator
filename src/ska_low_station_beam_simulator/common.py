@@ -1,16 +1,19 @@
 """
-Shared plumbing used by BOTH streamer backends (wideband_streamer.py's
-legacy FFT-based StationStreamer, and direct_synthesis.py's
-DirectSynthesisStreamer): config constants that are genuinely ICD-fixed
-(not backend-specific), delay polynomial handling, station/heap data
-structures, SPEAD packetization, and the producer/sender plumbing that
-drives either backend identically via ScanRunner.
+Shared plumbing used by direct_synthesis.py's DirectSynthesisStreamer
+(the sole signal-generation backend — the legacy wideband+FFT
+StationStreamer this simulator used to fall back to for pulsed sources
+has been removed, see CLAUDE.md): config constants, delay polynomial
+handling, station/heap data structures, SPEAD packetization, and the
+producer/sender plumbing driven by ScanRunner.
 
-Deliberately backend-agnostic: this module never imports either streamer
-module, so it has no idea which backend is in use. Each streamer class
-exposes a small uniform surface (channel_id_map, num_channels,
-tick_n_samples(), generate_next_tick()) that ScanRunner relies on instead
-of importing/isinstance-checking a concrete class — see ScanRunner below.
+Deliberately backend-agnostic: this module never imports
+direct_synthesis.py. The streamer class exposes a small uniform surface
+(channel_id_map, num_channels, tick_n_samples(), generate_next_tick())
+that ScanRunner relies on instead of importing/isinstance-checking a
+concrete class — see ScanRunner below. Kept this way (rather than
+importing DirectSynthesisStreamer directly, now that it's the only
+implementation) so common.py stays testable and reusable independent of
+which generation strategy is behind it.
 
 ===========================================================================
 FIELDS READ OFF A SCREENSHOT OF THE ICD DIAGRAM — NOT THE SOURCE DOCUMENT.
@@ -49,10 +52,8 @@ log = logging.getLogger("cbf_sim")
 
 
 # ============================================================
-# CONFIG — genuinely ICD-fixed / backend-independent. Backend-specific
-# tuning constants (FFT_LEN, SAMPLE_RATE_HZ, FFT_WORKERS, ...) live in
-# wideband_streamer.py instead, since direct_synthesis.py has no use for
-# them at all (no FFT, no wideband sample rate).
+# CONFIG — genuinely ICD-fixed constants shared by every source type
+# direct_synthesis.py generates.
 # ============================================================
 
 CHANNEL_WIDTH_HZ = 781_250.0  # per SPS-CBF ICD coarse channel spacing — CONFIRM
@@ -62,11 +63,10 @@ BASE_FREQ_HZ = 0.0  # PLACEHOLDER — real band start frequency, get from ICD
 HEAP_LEN = 2048  # time samples per heap per channel, per ICD
 
 # Per-tick time budget, FIXED regardless of channel count — this is the
-# real-time constraint both backends are racing against. (Equal to
-# HEAP_LEN / channel_output_rate for a critically sampled channelizer;
-# defined directly here rather than derived from wideband-specific
-# quantities like FFT_LEN/SAMPLE_RATE_HZ, since it's a property of the
-# ICD's channel width, not of how a backend gets there.)
+# real-time constraint generation is racing against. Equal to
+# HEAP_LEN / channel_output_rate for a critically sampled channelizer —
+# a property of the ICD's channel width, not of any particular
+# generation strategy.
 BLOCK_DURATION_S = HEAP_LEN / CHANNEL_WIDTH_HZ
 
 OVERRUN_TOLERANCE = 2.0
@@ -192,10 +192,11 @@ class HeapAccumulator:
         self._samples_consumed = 0  # total samples already popped, for timestamping
         # Maps a column index in the arriving (n_new, num_channels) chunks
         # to the external channel_id to label it with. Identity for
-        # DirectSynthesisStreamer (already external order); the legacy
-        # WidebandChannelizer's natural-FFT-bin-order permutation for
-        # StationStreamer. Applied only to the small integer id here, per
-        # heap — not to any bulk array — so this costs nothing meaningful.
+        # DirectSynthesisStreamer, which always produces already-external-
+        # order columns. Kept as an explicit, overridable map (rather than
+        # assuming identity) so a future generation strategy with its own
+        # internal channel ordering (e.g. one built on an FFT-bin-order
+        # intermediate) wouldn't require changing this class.
         self._channel_id_map = (
             channel_id_map if channel_id_map is not None else np.arange(num_channels)
         )
@@ -358,13 +359,16 @@ class SpsPacketizer:
 
 
 # ============================================================
-# PRODUCER / SENDER — drives either streamer backend identically.
+# PRODUCER / SENDER — drives the streamer via a small structural
+# protocol rather than importing a concrete class.
 #
 # Backend-agnostic on purpose: a Streamer only needs to provide
 # `channel_id_map`, `num_channels`, `tick_n_samples()`, and
-# `generate_next_tick(t, n)` — this module never imports a concrete
-# streamer class. See wideband_streamer.StationStreamer and
-# direct_synthesis.DirectSynthesisStreamer for the two implementations.
+# `generate_next_tick(t, n)` — this module never imports
+# direct_synthesis.DirectSynthesisStreamer, the sole implementation.
+# Kept as a Protocol (not a direct import) so this module stays testable
+# independent of the generation strategy, and so a future alternative
+# implementation wouldn't require changing this file.
 # ============================================================
 
 
@@ -376,20 +380,18 @@ class Streamer(Protocol):
     def num_channels(self) -> int: ...
 
     def tick_n_samples(self) -> int:
-        """How many samples generate_next_tick's second argument should be
-        for one tick, in whatever units that backend's generate_next_tick
-        expects (wideband input samples for the legacy backend,
-        per-channel output samples for direct synthesis) — sized so one
-        tick produces close to exactly one heap's worth of per-channel
+        """How many per-channel output samples generate_next_tick's
+        second argument should be for one tick — sized so one tick
+        produces close to exactly one heap's worth of per-channel
         samples (BLOCK_DURATION_S is defined for exactly this)."""
         ...
 
     # Positional-only (`/`) so implementations can use their own, more
     # descriptive parameter names without tripping Protocol structural
     # matching on name. Mapping (not dict) for the return type since it's
-    # covariant in the value type — DirectSynthesisStreamer's arrays are
-    # never None, StationStreamer's sometimes are, and both should
-    # satisfy this protocol.
+    # covariant in the value type, allowing a future implementation to
+    # return None for a channel with no data yet without breaking this
+    # protocol.
     def generate_next_tick(
         self, t: float, n: int, /
     ) -> Mapping[str, Optional[np.ndarray]]: ...

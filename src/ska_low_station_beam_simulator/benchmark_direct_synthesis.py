@@ -1,25 +1,23 @@
 # %% [markdown]
-# # Benchmark: `DirectSynthesisStreamer.generate_next_tick`
+# # Benchmark: `DirectSynthesisStreamer` — combined tone + noise + pulsar
 #
-# Companion to benchmark.py, which benchmarks the LEGACY wideband+FFT
-# StationStreamer (wideband_streamer.py). This one targets
-# direct_synthesis.DirectSynthesisStreamer — no ring buffer, no FFT
-# channelization, tone delay applied as a continuous phase term. Per the
-# handoff doc, the whole point of this path is that its per-tick cost
-# should scale much more weakly with NUM_CHANNELS than the legacy path's
-# does — this script benchmarks BOTH 96 (current, 75 MHz) and 448 (full
-# band, 350 MHz) channel counts specifically to check that claim on real
-# multi-core hardware, not just the single-threaded sandbox comparison
-# baked into direct_synthesis.py's __main__ block.
+# DirectSynthesisStreamer is now the sole backend, converging what used
+# to be three separate prototypes (tone from this module's original
+# scope, a pre-generated noise tile bank, and a coherent per-channel
+# pulsar) plus deleting the legacy wideband+FFT StationStreamer entirely.
+# Each piece was benchmarked in isolation in earlier sessions (see
+# CLAUDE.md's Benchmarking section) and individually cleared an ~8-core
+# target at 448 channels -- this benchmark checks whether that still
+# holds when all three run TOGETHER in one streamer, which is the
+# combination a real scan is likely to actually use.
 #
 # Per-tick TIME BUDGET is fixed regardless of channel count
-# (HEAP_LEN / CHANNEL_WIDTH_HZ ~= 2.621ms) — see CLAUDE.md's "Scaling math"
-# note. n_samples per tick for this streamer is always HEAP_LEN, by the same
-# construction ScanRunner relies on.
+# (HEAP_LEN / CHANNEL_WIDTH_HZ ~= 2.621ms). n_samples per tick is always
+# HEAP_LEN, by construction (ScanRunner relies on this).
 #
 # Uses a fake delay polynomial (the real fetch_delay_model_from_cbf is a
-# stub that raises NotImplementedError) — benchmarks generation cost only,
-# not a real Tango delay-poly client's latency.
+# stub that raises NotImplementedError) — benchmarks generation cost
+# only, not a real Tango delay-poly client's latency.
 
 # %%
 import statistics
@@ -43,23 +41,38 @@ def _fake_fetch_delay_model(station_id: int, at_time: float) -> sim.DelayPolynom
 
 sim.fetch_delay_model_from_cbf = _fake_fetch_delay_model
 
+# Modest pulsar/tile-bank settings so streamer CONSTRUCTION (rebuilt once
+# per sweep point below) stays fast -- period_s and n_tiles both trade
+# one-time build time for fidelity (see CLAUDE.md); this benchmark cares
+# about per-tick STEADY-STATE cost, so construction is kept cheap on
+# purpose, not tuned for realism here.
+PULSAR_PERIOD_S = 0.01  # 10ms
+PULSAR_WIDTH_S = 0.0005
+PULSAR_DM = 2.0
+N_TILES = 256
 
-# %%
+
 def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
     station = sim.StationConfig(
         station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=99
     )
-    # One tone per channel-count case, deliberately off-center within a
-    # channel (matches direct_synthesis.py's own correctness-check
-    # convention) — not load-bearing for the timing measurement, just avoids
-    # a suspiciously "nice" freq_hz that happens to land exactly on a bin edge.
-    tone_freq = 20 * sim.CHANNEL_WIDTH_HZ + 150_000.0
+    # Offset from base_freq_hz, NOT absolute -- the streamer's channel
+    # mapping is round((freq_hz - base_freq_hz) / channel_width_hz), and
+    # this benchmark uses DEFAULT_PULSAR_BASE_FREQ_HZ (50MHz) as the band
+    # start, not 0, since pulsed sources require a nonzero base_freq_hz.
+    tone_freq = sim.DEFAULT_PULSAR_BASE_FREQ_HZ + 20 * sim.CHANNEL_WIDTH_HZ + 150_000.0
     return sim.DirectSynthesisStreamer(
         station=station,
-        source_cfgs=[{"kind": "tone", "freq_hz": tone_freq, "amplitude": 1.0}],
+        source_cfgs=[
+            {"kind": "tone", "freq_hz": tone_freq, "amplitude": 1.0},
+            {"kind": "pulsed", "period_s": PULSAR_PERIOD_S, "width_s": PULSAR_WIDTH_S,
+             "amplitude": 1.0, "dm_pc_cm3": PULSAR_DM},
+        ],
         noise_cfg={"std": 0.05, "seed": 7},
         obs_time_ref=1_800_000_000.0,
         num_channels=num_channels,
+        base_freq_hz=sim.DEFAULT_PULSAR_BASE_FREQ_HZ,  # required for pulsed sources
+        n_tiles=N_TILES,
     )
 
 
@@ -70,7 +83,7 @@ def benchmark_tick(
     n_measured: int = 30,
 ) -> dict:
     """n_warmup also absorbs numba JIT compilation cost for the first call
-    to each kernel — same discipline as benchmark.py's benchmark_tick."""
+    to each kernel."""
     obs_time = 1_800_000_000.0
     tick_dt = n_samples / streamer.channel_output_rate
 
@@ -93,25 +106,28 @@ def benchmark_tick(
 
 
 # %%
-# --- Sweep numba thread count, at each of the two target channel counts ---
+# --- Sweep numba thread count, at each of the two target channel counts,
+# with tone + tiled noise + pulsar all active together ---
 
-n_samples = HEAP_LEN  # fixed by construction, independent of channel count
+n_samples = HEAP_LEN
 budget_ms = (HEAP_LEN / sim.CHANNEL_WIDTH_HZ) * 1000
 max_numba_threads = numba.config.NUMBA_NUM_THREADS
 
 print(
     f"n_samples/tick: {n_samples}   budget: {budget_ms:.3f} ms/tick   "
     f"numba thread ceiling: {max_numba_threads}\n"
+    f"pulsar: period={PULSAR_PERIOD_S*1000:.0f}ms width={PULSAR_WIDTH_S*1000:.2f}ms DM={PULSAR_DM}   "
+    f"noise: n_tiles={N_TILES}\n"
 )
 
-candidate_counts = sorted(set([1, 2, 4, 8, max_numba_threads // 2, max_numba_threads]))
+candidate_counts = sorted(set([1, 2, 4, 8, 16, 24, 32, max_numba_threads // 2, max_numba_threads]))
 candidate_counts = [n for n in candidate_counts if 1 <= n <= max_numba_threads]
 
 all_results: dict[int, dict[int, dict]] = {}
 for num_channels, label in [(96, "current (75 MHz)"), (448, "full band (350 MHz)")]:
-    print("=" * 60)
-    print(f"{label}, NUM_CHANNELS={num_channels}")
-    print("=" * 60)
+    print("=" * 70)
+    print(f"{label}, NUM_CHANNELS={num_channels} -- tone + tiled noise + pulsar combined")
+    print("=" * 70)
 
     results = {}
     for n_threads in candidate_counts:
@@ -139,29 +155,30 @@ for num_channels, label in [(96, "current (75 MHz)"), (448, "full band (350 MHz)
     )
 
 # %%
-# --- Cross-channel-count comparison at the same thread count, to check the
-# "flat cost vs. channel count" scaling claim directly on this hardware ---
-
-print("=" * 60)
-print("SCALING CHECK: 96 -> 448 channels, at each numba_threads value")
-print("=" * 60)
-for n_threads in candidate_counts:
-    m96 = all_results[96][n_threads]["mean_ms"]
-    m448 = all_results[448][n_threads]["mean_ms"]
-    print(
-        f"numba_threads={n_threads:>3}  96ch={m96:7.3f} ms  448ch={m448:7.3f} ms  "
-        f"ratio={m448 / m96:.2f}x  (legacy wideband+FFT path would be ~4.67x+ here)"
-    )
+# --- ~8-core target check, 448 channels, combined workload ---
+print("=" * 70)
+print("TARGET CHECK: ~8 CPU cores/pod, 448 channels, tone+noise+pulsar combined")
+print("=" * 70)
+numba.set_num_threads(8)
+streamer = build_streamer(448)
+stats = benchmark_tick(streamer, n_samples, n_warmup=10, n_measured=50)
+pct = stats["mean_ms"] / budget_ms * 100
+flag = "OK" if stats["mean_ms"] <= budget_ms else "OVER BUDGET"
+print(
+    f"8 threads: mean={stats['mean_ms']:.4f}ms ({pct:.1f}% of budget), "
+    f"max={stats['max_ms']:.4f}ms  [{flag}]"
+)
+print(f"noise tile-bank memory (both pols): {streamer.bank_memory_bytes()/1e9:.3f} GB")
 
 # %%
 # --- Repeatability check at the best config for EACH channel count ---
 # Single-pass sweep results have not been trustworthy on this class of
-# hardware in earlier rounds of benchmarking (see CLAUDE.md) — confirm
-# before treating any of the above as a real number.
+# hardware without repeat checks (see CLAUDE.md) — confirm before
+# treating any of the above as a real number.
 
-print("\n" + "=" * 60)
+print("\n" + "=" * 70)
 print("REPEATABILITY CHECK")
-print("=" * 60)
+print("=" * 70)
 
 n_repeats = 5
 for num_channels in (96, 448):

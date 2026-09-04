@@ -1,23 +1,22 @@
 """
 Tango device server entry point for the SPS station-beam simulator.
 
-The actual signal-generation logic lives in two SEPARATE, deliberately
-non-sharing modules (see each for why they're kept apart rather than
-merged):
-    - direct_synthesis.py — DirectSynthesisStreamer, the fast path used by
-      default (tone + station noise only).
-    - wideband_streamer.py — StationStreamer, the legacy wideband+FFT path,
-      kept only as a fallback for pulsed sources.
+The actual signal-generation logic lives entirely in direct_synthesis.py
+(DirectSynthesisStreamer) — tone, per-pol station noise (a pre-generated
+tile bank), and pulsed/pulsar sources are all handled by direct,
+per-channel synthesis; there is no wideband+FFT fallback path anymore
+(the legacy wideband_streamer.py/StationStreamer this simulator used to
+fall back to for pulsed sources was removed once direct_synthesis.py
+gained a direct per-channel pulsar representation — see CLAUDE.md).
 Shared plumbing (delay polynomial, heap accumulation, SPEAD packetization,
-the producer/sender loop) lives in common.py, which neither streamer
-module depends on the other to use.
+the producer/sender loop) lives in common.py, which direct_synthesis.py
+does not depend on beyond that shared plumbing.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from ska_low_station_beam_simulator.common import (
@@ -30,10 +29,6 @@ from ska_low_station_beam_simulator.common import (
     sender_loop,
 )
 from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStreamer
-from ska_low_station_beam_simulator.wideband_streamer import (
-    NUM_WORKER_THREADS,
-    StationStreamer,
-)
 
 try:
     from tango import DevState
@@ -87,7 +82,6 @@ class StationSimulatorDevice(Device):
     first_channel_id = device_property(dtype=int, default_value=0)
     dest_ip = device_property(dtype=str, default_value="127.0.0.1")
     dest_port = device_property(dtype=int, default_value=8000)
-    num_worker_threads = device_property(dtype=int, default_value=NUM_WORKER_THREADS)
 
     def init_device(self):
         super().init_device()
@@ -96,18 +90,6 @@ class StationSimulatorDevice(Device):
         )
         self._shutdown_event = threading.Event()
         self._scan_runner: Optional[ScanRunner] = None
-
-        # Persistent thread pool — created once here, lives for the
-        # device's whole lifetime, reused across scans. NOT recreated
-        # per tick or per scan (thread creation overhead would defeat
-        # the purpose). Only used by the legacy wideband StationStreamer
-        # (pulsed-source fallback) — DirectSynthesisStreamer doesn't need
-        # it at all. Size this against your real target hardware's core
-        # count — the default is unverified beyond a laptop-scale sandbox.
-        self._executor = ThreadPoolExecutor(
-            max_workers=self.num_worker_threads,
-            thread_name_prefix=f"station-{self.station_id}-worker",
-        )
 
         self._station_cfg = StationConfig(
             station_id=self.station_id,
@@ -138,26 +120,12 @@ class StationSimulatorDevice(Device):
         source_cfgs = [{"kind": "tone", "freq_hz": 150_000.0, "amplitude": 1.0}]
         noise_cfg = {"std": 0.05, "seed": self.station_id}
 
-        # Direct synthesis is the fast path (see direct_synthesis.py's
-        # module docstring) but only covers tone+noise — fall back to the
-        # legacy wideband+FFT StationStreamer only if a pulsed source is
-        # configured (pulsed sources are explicitly parked for direct
-        # synthesis).
-        if any(cfg["kind"] == "pulsed" for cfg in source_cfgs):
-            streamer = StationStreamer(
-                station=self._station_cfg,
-                source_cfgs=source_cfgs,
-                noise_cfg=noise_cfg,
-                executor=self._executor,
-                obs_time_ref=obs_time,
-            )
-        else:
-            streamer = DirectSynthesisStreamer(
-                station=self._station_cfg,
-                source_cfgs=source_cfgs,
-                noise_cfg=noise_cfg,
-                obs_time_ref=obs_time,
-            )
+        streamer = DirectSynthesisStreamer(
+            station=self._station_cfg,
+            source_cfgs=source_cfgs,
+            noise_cfg=noise_cfg,
+            obs_time_ref=obs_time,
+        )
         self._scan_runner = ScanRunner(
             streamer=streamer,
             send_queue=self._send_queue,
@@ -182,7 +150,6 @@ class StationSimulatorDevice(Device):
             self._scan_runner.stop()
         self._shutdown_event.set()
         self._sender_thread.join(timeout=5.0)
-        self._executor.shutdown(wait=True, cancel_futures=True)
         super().delete_device()
 
 

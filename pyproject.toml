@@ -7,7 +7,6 @@ requires-python = ">=3.10"
 dependencies = [
     "astropy>=6.1.7",
     "numba>=0.67.0",
-    "scipy>=1.15.3",
     "ska-tango-base>=1.7.0",
     "spead2>=4.4.1",
 ]
