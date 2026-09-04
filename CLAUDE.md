@@ -40,7 +40,7 @@ is the full SKA-Low band, 448 channels (350 MHz) — **not yet viable at
   phase, noise sample index, delay polynomial evaluation) is a pure
   function of a small, `obs_time`-relative `t`, specifically so any pod
   can independently compute any tick without shared state.
-- **Kubernetes Indexed Job, one pod per station**, self-sufficient after
+- **Each station is represented by one Tango device server, each running in a Kubernetes Pod**, self-sufficient after
   receiving `obs_time` at scan start.
 - **TAI2000 is the SKA epoch** for `heap_counter`. Unix→TAI2000 uses
   `astropy` (`common.unix_to_tai2000_seconds`) — a hardcoded-leap-second
@@ -57,6 +57,8 @@ src/ska_low_station_beam_simulator/
   simulator.py                 Tango device server (StationSimulatorDevice)
   benchmark.py                 benchmarks wideband_streamer.StationStreamer
   benchmark_direct_synthesis.py  benchmarks direct_synthesis.DirectSynthesisStreamer
+  tiled_noise_streamer.py       EXPERIMENTAL: pre-generated noise bank variant, not wired into simulator.py
+  benchmark_tiled_noise_streamer.py  benchmarks tiled_noise_streamer.TiledNoiseStreamer
 resources/notebooks/benchmark.ipynb   STALE — predates the numba port, ignore/delete
 ```
 
@@ -138,6 +140,79 @@ signal-path delay would apply. `DirectSynthesisStreamer` fixes this by
 construction (noise never touches the delay pipeline). Only fix it here
 too if this legacy path ends up seeing real use beyond pulsed-only
 fallback duty — not worth the restructuring otherwise.
+
+### `tiled_noise_streamer.TiledNoiseStreamer` — EXPERIMENTAL, not wired into `simulator.py`
+
+Explored to answer a specific question: could each station pod get by
+with far fewer CPU cores (~8, to fit more stations per node) than
+`DirectSynthesisStreamer` needs, by pre-generating a bank of `n_tiles`
+noise tiles once at scan setup and having each tick do an O(1)
+per-(station, pol) index draw + memcopy instead of fresh Box-Muller
+generation? Reuses `direct_synthesis.py`'s tone/noise kernels rather than
+forking them again — this is an experimental variant OF the
+direct-synthesis backend, not a third independent backend in the sense
+`wideband_streamer.py` and `direct_synthesis.py` are kept apart.
+
+**Correctness constraint, non-negotiable:** the tile index MUST be drawn
+from each station's own (station, pol) noise seed — never from a value
+shared across stations (e.g. seeded only from `obs_time`). Sharing it
+would make every station emit byte-identical "noise" for a given tick,
+silently breaking any test that depends on receiver noise being
+uncorrelated across the array (beamforming-SNR gain, cross-correlation
+baseline noise floor). `TiledNoiseStreamer` gets this right by
+construction; its own `__main__` includes a cross-station-independence
+check specifically to guard against a future edit "simplifying" this
+back to a shared seed.
+
+**The real cost of this approach is fidelity, not CPU or memory usage,
+and no bank size that fits in memory fixes it.** By the birthday
+paradox, a station's own tile-index sequence hits its first repeat after
+~1.25×√n_tiles ticks. Measured on the 2-socket EPYC 9254 target hardware,
+448 channels, 8 threads:
+
+| n_tiles | bank size (both pols) | build time | first repeat (~ticks) | ~scan time |
+|---|---|---|---|---|
+| 256 | 7.0 GB | 2.2s | 20 | 52ms |
+| 1024 | 28.0 GB | 8.8s | 40 | 105ms |
+| 2048 | 56.0 GB | 31.9s | 57 | 148ms |
+
+Going another order of magnitude in `n_tiles` (well past feasible
+per-pod memory) would still only push the first repeat into the
+low-single-digit seconds — nowhere near long enough for a test that
+checks a single station's long-integration noise-floor behavior (total
+power should keep averaging down with more integration time; past the
+repeat cycle, it won't). **Only use this in place of
+`DirectSynthesisStreamer` if CBF's test suite doesn't rely on that** —
+per-tick and cross-station statistics (delay-tracking, correlation,
+beamforming functional tests) are unaffected by one station's own
+periodicity.
+
+**CPU cost turned out to be a non-issue — this is the headline result.**
+Once the bank exists, per-tick cost is just an index hash + a ~14.7MB
+memcopy, at 448 channels:
+- Plain `out[:] = bank[idx]` (single-threaded numpy, ignores thread
+  count entirely): **1.51ms/tick (57.5% of budget) regardless of core
+  count** — even 1 core is enough.
+- A numba `prange`-parallelized copy does better still: 0.36ms (13.9%)
+  at just 8 threads, versus 1.38ms (52.6%) single-threaded.
+
+So **the target of ~8 CPU cores/pod is not just achievable but massively
+over-provisioned for this approach's steady-state cost** — 1-2 cores
+would already clear budget. The actual per-pod resource question this
+approach shifts onto is **memory** (linear in `n_tiles`, ~27MB/tile
+across both pols at 448 channels) and **one-time startup latency**
+(scales with `n_tiles`, improves with more threads at build time only —
+8 threads builds a 256-tile/7GB bank in 2.2s, a 1024-tile/28GB bank in
+8.8s).
+
+**Bottom line**: if CBF's tests tolerate per-station noise periodicity on
+the order of tens to hundreds of milliseconds repeating throughout a
+scan, this approach trades a small, one-time memory/startup cost for an
+essentially-free steady-state CPU footprint — a very different profile
+from `DirectSynthesisStreamer`, which needs ~24-48 threads for headroom
+at 448 channels (see Benchmarking) but has no periodicity at all. Pick
+based on what the test suite actually needs, not on which one benchmarks
+better in isolation.
 
 ## SPS-CBF ICD heap structure — HIGHEST-PRIORITY UNVERIFIED ITEM
 
@@ -440,6 +515,8 @@ uv sync                                              # installs everything, incl
 python -m ska_low_station_beam_simulator.direct_synthesis   # kernel correctness checks + cost comparison
 python -m ska_low_station_beam_simulator.benchmark_direct_synthesis  # real multi-core timing, 96 + 448 channels
 python -m ska_low_station_beam_simulator.benchmark   # legacy wideband path timing, 96 channels
+python -m ska_low_station_beam_simulator.tiled_noise_streamer   # EXPERIMENTAL noise-bank variant: correctness checks
+python -m ska_low_station_beam_simulator.benchmark_tiled_noise_streamer  # EXPERIMENTAL: memory/startup/per-tick cost sweep, 448 channels
 ```
 
 `pytango` and `spead2` aren't required to run the above — `simulator.py`
