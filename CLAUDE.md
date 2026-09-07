@@ -63,11 +63,15 @@ Benchmarking below for updated resource/timing numbers at the real
 ```
 src/ska_low_station_beam_simulator/
   common.py                    shared plumbing, backend-agnostic
+  spead.py                      hand-rolled SPEAD-64-48 heap encoding (SpsPacketizer) -- not spead2,
+                                see the ICD section below and bug #17 -- split out of common.py so
+                                the SPEAD wire-format concern doesn't live alongside common.py's
+                                config/delay/producer-sender plumbing
   direct_synthesis.py          the SOLE backend: DirectSynthesisStreamer (tone + tiled noise + pulsar)
   simulator.py                 Tango device server (StationSimulatorDevice)
   benchmark_direct_synthesis.py  benchmarks DirectSynthesisStreamer, incl. tone+noise+pulsar combined
   generate_test_pcap.py        writes a real pcap of a few SPEAD-encoded heaps, for testing the
-                                encoding path against an external unpacker (see common.py's
+                                encoding path against an external unpacker (see spead.py's
                                 hand-rolled SPEAD-64-48 encoder -- not spead2, see the ICD section
                                 below -- and bug #17)
   pulsar_catalog.py             named pulsar catalog: save/load pre-generated templates by name
@@ -762,7 +766,7 @@ for bit, once confirmed — no change needed there, just the "VERIFY"
 caveats removed.
 
 **A real architectural problem surfaced trying to send this via spead2,
-and it's why `common.SpsPacketizer` no longer uses spead2 at all.**
+and it's why `SpsPacketizer` (now in `spead.py`) no longer uses spead2 at all.**
 Testing the SPEAD encoding path end-to-end (see the pcap section below)
 showed every heap coming out with 8 items instead of the ICD's 6.
 Checked directly against spead2==4.4.1's C++ source (`send_packet.cpp::
@@ -1533,7 +1537,7 @@ unit test the actual Tango device server layer).
 `pytango` isn't required to run the above — `simulator.py` degrades to
 stub Tango classes if `pytango` isn't installed (importable, not
 deployable). `spead2` is no longer a dependency at all (see the SPS-CBF
-ICD section and bug #18 above): `common.SpsPacketizer` hand-rolls its
+ICD section and bug #18 above): `spead.SpsPacketizer` hand-rolls its
 own minimal SPEAD-64-48 encoder instead, since spead2's own packet
 encoder cannot produce CBF's real 6-item heap format.
 

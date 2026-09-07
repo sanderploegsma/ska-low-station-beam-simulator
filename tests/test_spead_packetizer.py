@@ -1,4 +1,4 @@
-"""Tests for common.SpsPacketizer's hand-rolled SPEAD-64-48 encoding, and
+"""Tests for spead.SpsPacketizer's hand-rolled SPEAD-64-48 encoding, and
 for generate_test_pcap.py's pcap output.
 
 SpsPacketizer does NOT use spead2 -- spead2's own packet encoder always
@@ -7,7 +7,7 @@ PAYLOAD_LENGTH) with no way to suppress any of them (confirmed directly
 against spead2==4.4.1's C++ source), but CBF's real ICD heap has exactly
 6 items total -- fewer than that mandatory minimum. So this module
 hand-encodes the SPEAD-64-48 wire format itself, scoped to exactly the
-6 items the ICD specifies. See common.py's module docstring and
+6 items the ICD specifies. See spead.py's module docstring and
 SpsPacketizer's docstring for the full item layout.
 
 Regression coverage for a real bug from an earlier (spead2-based)
@@ -31,16 +31,18 @@ from ska_low_station_beam_simulator.common import (
     BLOCK_DURATION_S,
     CHANNEL_START,
     HEAP_LEN,
+    ChannelHeap,
+    StationConfig,
+    unix_to_tai2000_seconds,
+)
+from ska_low_station_beam_simulator.spead import (
     PAYLOAD_LENGTH_BYTES,
     SPEAD_HEAP_ADDRESS_BITS,
-    ChannelHeap,
     SpsPacketizer,
-    StationConfig,
     build_heap_payload_bytes,
     pack_antenna_info,
     pack_channel_info,
     quantize_8bit,
-    unix_to_tai2000_seconds,
 )
 
 SPEAD_HEAP_COUNTER_MAX = 2**40 - 1

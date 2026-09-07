@@ -4,8 +4,8 @@ Generates a small .pcap file containing a handful of heaps produced by
 testing SPEAD encoding — see below), for feeding into an external SPEAD
 unpacker.
 
-``common.SpsPacketizer`` hand-rolls its own SPEAD-64-48 encoder rather
-than using spead2 (see common.py's module docstring for why: spead2's
+``spead.SpsPacketizer`` hand-rolls its own SPEAD-64-48 encoder rather
+than using spead2 (see spead.py's module docstring for why: spead2's
 packet encoder always writes 4 reserved item pointers CBF's real 6-item
 ICD heap has no room for, and there's no way to configure it not to).
 One consequence of that: this file's output is NOT expected to be
@@ -42,13 +42,13 @@ import time
 from ska_low_station_beam_simulator.common import (
     ChannelHeap,
     HeapAccumulator,
-    SpsPacketizer,
     StationConfig,
 )
 from ska_low_station_beam_simulator.direct_synthesis import (
     DirectSynthesisStreamer,
     NoiseConfig,
 )
+from ska_low_station_beam_simulator.spead import SpsPacketizer
 
 # Synthetic network addressing -- arbitrary, content doesn't matter for
 # testing SPEAD encoding, just needs to be well-formed.

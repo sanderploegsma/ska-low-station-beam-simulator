@@ -58,7 +58,6 @@ from ska_low_station_beam_simulator.common import (
     ChannelHeap,
     DelayFeed,
     ScanRunner,
-    SpsPacketizer,
     StationConfig,
     log,
     parse_delay_polynomial_from_attr_value,
@@ -72,6 +71,7 @@ from ska_low_station_beam_simulator.direct_synthesis import (
     SourceConfig,
     ToneSourceConfig,
 )
+from ska_low_station_beam_simulator.spead import SpsPacketizer
 
 
 def build_source_cfg(spec: dict, delay_feed: DelayFeed) -> SourceConfig:
