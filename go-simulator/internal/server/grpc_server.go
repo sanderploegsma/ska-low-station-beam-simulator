@@ -52,8 +52,9 @@ func (q *heapQueue) Send(heap *common.ChannelHeap) bool {
 type Server struct {
 	pb.UnimplementedStationSimulatorServer
 
-	destIP   string
-	destPort int
+	destIP          string
+	destPort        int
+	sourceInterface string // "" -- let the OS pick the outbound interface/address
 
 	mu         sync.Mutex
 	stationCfg *common.StationConfig
@@ -69,10 +70,20 @@ type Server struct {
 // both static for the pod's lifetime, matching simulator.py's device
 // properties (subarray_id/beam_id/source_cfgs vary per scan instead, see
 // StartScan).
-func NewServer(stationID, substationID int32, destIP string, destPort int) *Server {
+//
+// sourceInterface, if non-empty, names a local network interface (e.g.
+// "net1" for a Multus-attached secondary NIC) whose IPv4 address the
+// outbound SPEAD/UDP socket is bound to, forcing that traffic out over
+// that interface rather than whatever the OS's default route would pick
+// -- see Start(), which resolves the interface's address at socket-dial
+// time (it isn't known ahead of time: a Multus secondary interface's
+// address comes from an IPAM pool assigned at pod start). Pass "" to
+// leave this to the OS, as before.
+func NewServer(stationID, substationID int32, destIP string, destPort int, sourceInterface string) *Server {
 	return &Server{
-		destIP:   destIP,
-		destPort: destPort,
+		destIP:          destIP,
+		destPort:        destPort,
+		sourceInterface: sourceInterface,
 		stationCfg: &common.StationConfig{
 			StationID:    stationID,
 			SubstationID: substationID,
@@ -86,7 +97,21 @@ func NewServer(stationID, substationID int32, destIP string, destPort int) *Serv
 // goroutine (the equivalent of Python's sender_loop). Call once before
 // serving gRPC traffic.
 func (s *Server) Start() error {
-	conn, err := net.Dial("udp", net.JoinHostPort(s.destIP, fmt.Sprintf("%d", s.destPort)))
+	var localAddr *net.UDPAddr
+	if s.sourceInterface != "" {
+		ip, err := interfaceIPv4Addr(s.sourceInterface)
+		if err != nil {
+			return fmt.Errorf("resolving source_interface %q for outbound SPEAD/UDP: %w", s.sourceInterface, err)
+		}
+		localAddr = &net.UDPAddr{IP: ip}
+		log.Printf("binding outbound SPEAD/UDP socket to interface %q (%s)", s.sourceInterface, ip)
+	}
+
+	destAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(s.destIP, fmt.Sprintf("%d", s.destPort)))
+	if err != nil {
+		return fmt.Errorf("resolving SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
+	}
+	conn, err := net.DialUDP("udp", localAddr, destAddr)
 	if err != nil {
 		return fmt.Errorf("dialing SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
 	}

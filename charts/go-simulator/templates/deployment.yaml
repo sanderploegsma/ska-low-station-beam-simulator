@@ -44,6 +44,9 @@ spec:
             - -substation-id={{ .Values.simulator.substationId }}
             - -dest-ip={{ .Values.simulator.destIp }}
             - -dest-port={{ .Values.simulator.destPort }}
+            {{- if .Values.simulator.sourceInterface }}
+            - -spead-interface={{ .Values.simulator.sourceInterface }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.simulator.grpcPort }}

@@ -35,6 +35,17 @@ simulator:
   # gRPC control-plane port -- the container's -listen flag and the
   # Service's targetPort both derive from this.
   grpcPort: 50051
+  # Optional: force outbound SPEAD/UDP to bind to a specific network
+  # interface's IP address rather than letting the OS pick via its
+  # default route -- e.g. "net1", the interface name Multus gives a
+  # pod's secondary NIC (see podAnnotations' k8s.v1.cni.cncf.io/networks
+  # below, which is what attaches that NIC in the first place). The
+  # interface's address doesn't need to be known here -- it's resolved
+  # at container startup from the interface itself, since a
+  # Multus-attached NIC's address normally comes from an IPAM pool
+  # assigned at pod start, not a fixed value. Leave empty to use the
+  # OS's default outbound interface/address selection.
+  sourceInterface: net1
 
 serviceAccount:
   # Whether a ServiceAccount should be created.
@@ -45,6 +56,9 @@ serviceAccount:
   name: ""
 
 podAnnotations:
+  # Attaches the secondary NIC (Multus), which appears inside the pod as
+  # net1 -- see simulator.sourceInterface above, which tells the
+  # container to bind its outbound SPEAD/UDP socket to it.
   k8s.v1.cni.cncf.io/networks: kube-system/cbf-sdp-1
 podLabels: {}
 

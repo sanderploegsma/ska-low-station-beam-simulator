@@ -24,7 +24,7 @@ import (
 // plane (StartScan/StopScan/PushDelayUpdate/GetStatus) in isolation.
 func newTestClient(t *testing.T) (pb.StationSimulatorClient, *Server, func()) {
 	t.Helper()
-	srv := NewServer(1, 0, "127.0.0.1", 19999)
+	srv := NewServer(1, 0, "127.0.0.1", 19999, "")
 	if err := srv.Start(); err != nil {
 		t.Fatalf("srv.Start(): %v", err)
 	}

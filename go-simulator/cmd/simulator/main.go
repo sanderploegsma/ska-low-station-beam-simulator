@@ -23,9 +23,10 @@ func main() {
 	substationID := flag.Int("substation-id", 0, "this pod's substation ID")
 	destIP := flag.String("dest-ip", "127.0.0.1", "CBF SPEAD/UDP destination IP")
 	destPort := flag.Int("dest-port", 8000, "CBF SPEAD/UDP destination port")
+	sourceInterface := flag.String("spead-interface", "", "network interface to bind the outbound SPEAD/UDP socket to (e.g. net1 for a Multus-attached secondary NIC); empty leaves this to the OS's default route selection")
 	flag.Parse()
 
-	srv := server.NewServer(int32(*stationID), int32(*substationID), *destIP, *destPort)
+	srv := server.NewServer(int32(*stationID), int32(*substationID), *destIP, *destPort, *sourceInterface)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("starting server: %v", err)
 	}
