@@ -148,10 +148,10 @@ def test_streamer_rejects_tone_without_delay_feed():
             obs_time_ref=0.0,
             num_channels=32,
         )
-    except ValueError as exc:
+    except TypeError as exc:
         assert "delay_feed" in str(exc)
     else:
-        raise AssertionError("expected ValueError for a source_cfg missing delay_feed")
+        raise AssertionError("expected TypeError for a source_cfg missing delay_feed")
 
 
 def test_streamer_rejects_pulsed_without_delay_feed():
@@ -182,10 +182,10 @@ def test_streamer_rejects_pulsed_without_delay_feed():
             num_channels=32,
             base_freq_hz=sim.BASE_FREQ_HZ,
         )
-    except ValueError as exc:
+    except TypeError as exc:
         assert "delay_feed" in str(exc)
     else:
-        raise AssertionError("expected ValueError for a source_cfg missing delay_feed")
+        raise AssertionError("expected TypeError for a source_cfg missing delay_feed")
 
 
 # ============================================================
