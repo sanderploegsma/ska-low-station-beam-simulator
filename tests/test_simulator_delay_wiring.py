@@ -26,7 +26,7 @@ class _FakeEvent:
 
 
 class _FakeAttributeProxy:
-    instances = []
+    instances = []  # noqa: RUF012
 
     def __init__(self, attr_uri):
         self.attr_uri = attr_uri
@@ -50,7 +50,9 @@ class _FakeAttributeProxy:
 def _fake_attribute_proxy(monkeypatch):
     _FakeAttributeProxy.instances = []
     monkeypatch.setattr(sim, "AttributeProxy", _FakeAttributeProxy)
-    monkeypatch.setattr(sim, "EventType", types.SimpleNamespace(CHANGE_EVENT="CHANGE_EVENT"))
+    monkeypatch.setattr(
+        sim, "EventType", types.SimpleNamespace(CHANGE_EVENT="CHANGE_EVENT")
+    )
 
 
 def _fake_device():
@@ -76,7 +78,9 @@ def test_make_delay_feed_subscribes_and_applies_pushed_value():
     returned DelayFeed -- the mechanism StartScan relies on to get real
     delay polynomials into a running streamer."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    feed = sim.StationSimulatorDevice._make_delay_feed(
+        dev, "sys/delaypoly/1/direction0"
+    )
 
     assert len(dev._delay_subscriptions) == 1
     proxy, event_id = dev._delay_subscriptions[0]
@@ -95,7 +99,9 @@ def test_make_delay_feed_ignores_error_events(caplog):
     zero-delay default rather than applying whatever garbage an error
     event's payload happens to carry."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    feed = sim.StationSimulatorDevice._make_delay_feed(
+        dev, "sys/delaypoly/1/direction0"
+    )
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(err=True, errors=["boom"]))
@@ -111,7 +117,9 @@ def test_make_delay_feed_survives_unparseable_payload():
     (which would silently kill all future updates too), and a later,
     well-formed push must still be applied normally afterward."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    feed = sim.StationSimulatorDevice._make_delay_feed(
+        dev, "sys/delaypoly/1/direction0"
+    )
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(value="not valid json"))
@@ -153,7 +161,10 @@ def test_teardown_survives_unsubscribe_failure():
         def unsubscribe_event(self, event_id):
             raise RuntimeError("connection lost")
 
-    dev._delay_subscriptions = [(_BrokenAttributeProxy("x"), 1), (_FakeAttributeProxy("y"), 1)]
+    dev._delay_subscriptions = [
+        (_BrokenAttributeProxy("x"), 1),
+        (_FakeAttributeProxy("y"), 1),
+    ]
     # must not raise even though the first proxy's unsubscribe fails
     sim.StationSimulatorDevice._teardown_delay_subscriptions(dev)
     assert dev._delay_subscriptions == []

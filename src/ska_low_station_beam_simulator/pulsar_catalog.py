@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 
@@ -173,7 +172,7 @@ def load_pulsar_from_catalog(
     name: str,
     station_num_channels: int,
     station_base_freq_hz: float,
-    catalog_dir: Optional[Path] = None,
+    catalog_dir: Path | None = None,
 ) -> dict:
     """Loads ``name``'s pre-generated template and slices out the channel
     range [station_base_freq_hz, station_base_freq_hz +
@@ -250,7 +249,9 @@ def load_pulsar_from_catalog(
             f"{station_base_freq_hz}Hz is not aligned to that catalog's "
             f"channel grid ({channel_width_hz}Hz spacing)."
         )
-    if not (0 <= slice_start and slice_start + station_num_channels <= catalog_num_channels):
+    if not (
+        0 <= slice_start and slice_start + station_num_channels <= catalog_num_channels
+    ):
         raise ValueError(
             f"pulsar_name={name!r}'s catalog covers {catalog_num_channels} "
             f"channels starting at {catalog_base_freq_hz}Hz -- station's "
@@ -260,7 +261,9 @@ def load_pulsar_from_catalog(
 
     full_template = np.load(catalog_dir / entry["npy_filename"])
     template = np.ascontiguousarray(
-        full_template[slice_start : slice_start + station_num_channels].astype(np.complex128)
+        full_template[slice_start : slice_start + station_num_channels].astype(
+            np.complex128
+        )
     )
 
     return {

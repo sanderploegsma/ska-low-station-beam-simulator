@@ -41,11 +41,13 @@ from __future__ import annotations
 import json
 import queue
 import threading
-from typing import Optional
+
+from tango import AttributeProxy, DevState, EventType
+from tango.server import Device, attribute, command, device_property, run
 
 from ska_low_station_beam_simulator.common import (
-    ChannelHeap,
     QUEUE_MAXSIZE,
+    ChannelHeap,
     DelayFeed,
     ScanRunner,
     SpsPacketizer,
@@ -55,52 +57,6 @@ from ska_low_station_beam_simulator.common import (
     sender_loop,
 )
 from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStreamer
-
-try:
-    from tango import AttributeProxy, DevState, EventType
-    from tango.server import Device, attribute, command, device_property, run
-
-    TANGO_AVAILABLE = True
-except ImportError:
-    TANGO_AVAILABLE = False
-    log.warning(
-        "pytango not installed — device server class will be importable "
-        "but NOT deployable."
-    )
-
-    class DevState:
-        ON = "ON"
-        RUNNING = "RUNNING"
-
-    class EventType:
-        CHANGE_EVENT = "CHANGE_EVENT"
-
-    class AttributeProxy:  # pragma: no cover - stub, not deployable
-        def __init__(self, *_a, **_kw):
-            raise RuntimeError("pytango is required to subscribe to a delay-poly attribute")
-
-    def command(*_a, **_kw):
-        def deco(f):
-            return f
-
-        return deco
-
-    def attribute(*_a, **_kw):
-        def deco(f):
-            return f
-
-        return deco
-
-    def device_property(*_a, **_kw):
-        return None
-
-    class Device:
-        def set_state(self, *_a, **_kw):
-            pass
-
-        def init_device(self):
-            pass
-
 
 # ============================================================
 # TANGO DEVICE SERVER
@@ -133,12 +89,10 @@ class StationSimulatorDevice(Device):
 
     def init_device(self):
         super().init_device()
-        self._send_queue: "queue.Queue[ChannelHeap]" = queue.Queue(
-            maxsize=QUEUE_MAXSIZE
-        )
+        self._send_queue: queue.Queue[ChannelHeap] = queue.Queue(maxsize=QUEUE_MAXSIZE)
         self._shutdown_event = threading.Event()
-        self._scan_runner: Optional[ScanRunner] = None
-        self._delay_subscriptions: list[tuple["AttributeProxy", int]] = []
+        self._scan_runner: ScanRunner | None = None
+        self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
 
         self._station_cfg = StationConfig(
             station_id=self.station_id,
@@ -179,17 +133,16 @@ class StationSimulatorDevice(Device):
             if event.err:
                 log.warning(
                     "delay-poly attribute event error for %s: %s",
-                    attr_uri, event.errors,
+                    attr_uri,
+                    event.errors,
                 )
                 return
             try:
                 poly = parse_delay_polynomial_from_attr_value(
                     event.attr_value.value, self.station_id
                 )
-            except Exception:
-                log.exception(
-                    "failed to parse delay polynomial pushed by %s", attr_uri
-                )
+            except Exception:  # noqa: BLE001
+                log.exception("failed to parse delay polynomial pushed by %s", attr_uri)
                 return
             feed.update(poly)
 
@@ -201,7 +154,7 @@ class StationSimulatorDevice(Device):
         for proxy, event_id in self._delay_subscriptions:
             try:
                 proxy.unsubscribe_event(event_id)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 log.exception("failed to unsubscribe from a delay-poly attribute")
         self._delay_subscriptions = []
 
@@ -213,7 +166,9 @@ class StationSimulatorDevice(Device):
 
         self._station_cfg.scan_id = int(scan_id)
 
-        source_specs = json.loads(self.source_cfgs_json) if self.source_cfgs_json else []
+        source_specs = (
+            json.loads(self.source_cfgs_json) if self.source_cfgs_json else []
+        )
         noise_cfg = {"std": 0.05, "seed": self.station_id}
 
         self._teardown_delay_subscriptions()
@@ -267,6 +222,4 @@ class StationSimulatorDevice(Device):
 
 
 if __name__ == "__main__":
-    if not TANGO_AVAILABLE:
-        raise SystemExit("pytango is required to run this as a device server")
     run((StationSimulatorDevice,))

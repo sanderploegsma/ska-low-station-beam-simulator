@@ -49,7 +49,9 @@ from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStrea
 
 # Synthetic network addressing -- arbitrary, content doesn't matter for
 # testing SPEAD encoding, just needs to be well-formed.
-SRC_MAC = bytes.fromhex("020000000001")  # locally-administered, avoids clashing with a real vendor OUI
+SRC_MAC = bytes.fromhex(
+    "020000000001"
+)  # locally-administered, avoids clashing with a real vendor OUI
 DST_MAC = bytes.fromhex("020000000002")
 SRC_IP = "10.0.0.1"
 DST_IP = "10.0.0.2"
@@ -107,14 +109,30 @@ def _wrap_udp_frame(
     dst_addr = socket.inet_aton(dst_ip)
     ip_header_no_checksum = struct.pack(
         "!BBHHHBBH4s4s",
-        0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_UDP, 0,
-        src_addr, dst_addr,
+        0x45,
+        0,
+        total_len,
+        0,
+        0,
+        64,
+        socket.IPPROTO_UDP,
+        0,
+        src_addr,
+        dst_addr,
     )
     checksum = _ipv4_checksum(ip_header_no_checksum)
     ip_header = struct.pack(
         "!BBHHHBBH4s4s",
-        0x45, 0, total_len, 0, 0, 64, socket.IPPROTO_UDP, checksum,
-        src_addr, dst_addr,
+        0x45,
+        0,
+        total_len,
+        0,
+        0,
+        64,
+        socket.IPPROTO_UDP,
+        checksum,
+        src_addr,
+        dst_addr,
     )
 
     eth_header = DST_MAC + SRC_MAC + struct.pack("!H", 0x0800)  # 0x0800 = IPv4
@@ -129,20 +147,27 @@ def _pcap_global_header() -> bytes:
 
 def _pcap_record(frame: bytes, timestamp: float) -> bytes:
     ts_sec = int(timestamp)
-    ts_usec = int(round((timestamp - ts_sec) * 1_000_000))
+    ts_usec = round((timestamp - ts_sec) * 1_000_000)
     return struct.pack("<IIII", ts_sec, ts_usec, len(frame), len(frame)) + frame
 
 
 def generate_test_pcap(output_path: str, n_heaps: int = 5) -> None:
-    station = StationConfig(station_id=1, substation_id=0, subarray_id=1, beam_id=1, scan_id=1)
+    station = StationConfig(
+        station_id=1, substation_id=0, subarray_id=1, beam_id=1, scan_id=1
+    )
     obs_time = time.time()
     noise_cfg = {"std": 0.05, "seed": station.station_id}
 
     streamer = DirectSynthesisStreamer(
-        station=station, source_cfgs=[], noise_cfg=noise_cfg, obs_time_ref=obs_time,
+        station=station,
+        source_cfgs=[],
+        noise_cfg=noise_cfg,
+        obs_time_ref=obs_time,
     )
     accumulator = HeapAccumulator(
-        streamer.num_channels, obs_time, streamer.channel_output_rate,
+        streamer.num_channels,
+        obs_time,
+        streamer.channel_output_rate,
         channel_id_map=streamer.channel_id_map,
     )
     # No dest_ip/sock needed -- this module only calls encode_channel_heap,

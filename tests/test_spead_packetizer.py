@@ -45,7 +45,9 @@ from ska_low_station_beam_simulator.common import (
 SPEAD_HEAP_COUNTER_MAX = 2**40 - 1
 
 
-def _make_heap(channel_id: int = 0, heap_start_time: float | None = None) -> ChannelHeap:
+def _make_heap(
+    channel_id: int = 0, heap_start_time: float | None = None
+) -> ChannelHeap:
     rng = np.random.default_rng(0)
     samples = (rng.standard_normal(HEAP_LEN) + 1j * rng.standard_normal(HEAP_LEN)) * 0.1
     return ChannelHeap(
@@ -57,7 +59,9 @@ def _make_heap(channel_id: int = 0, heap_start_time: float | None = None) -> Cha
 
 
 def _station() -> StationConfig:
-    return StationConfig(station_id=1, substation_id=2, subarray_id=3, beam_id=4, scan_id=99)
+    return StationConfig(
+        station_id=1, substation_id=2, subarray_id=3, beam_id=4, scan_id=99
+    )
 
 
 def _parse_item_pointers(raw: bytes, n_items: int) -> list[tuple[int, int]]:
@@ -102,8 +106,8 @@ def test_encode_channel_heap_item_pointers_match_icd_spec():
     raw = packetizer.encode_channel_heap(heap)
     pointers = dict(_parse_item_pointers(raw, n_items=6))
 
-    expected_counter = int(
-        round(unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S)
+    expected_counter = round(
+        unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S
     )
     assert pointers[0x0001] == expected_counter
     assert pointers[0x0004] == PAYLOAD_LENGTH_BYTES
@@ -142,7 +146,7 @@ def test_heap_counter_fits_within_icd_field_for_current_time():
     inflated the value by HEAP_LEN (2048x) and would have overflowed the
     ICD's 40-bit field for any present-day timestamp -- pins the fixed
     formula to actually fit for 'now'."""
-    heap_counter = int(round(unix_to_tai2000_seconds(time.time()) / BLOCK_DURATION_S))
+    heap_counter = round(unix_to_tai2000_seconds(time.time()) / BLOCK_DURATION_S)
     assert 0 <= heap_counter <= SPEAD_HEAP_COUNTER_MAX
 
 
@@ -150,7 +154,9 @@ def test_heap_counter_still_fits_decades_from_now():
     """Headroom check: the fixed formula should comfortably outlive this
     codebase, not just barely fit today."""
     thirty_years_from_now = time.time() + 30 * 365.25 * 86400
-    heap_counter = int(round(unix_to_tai2000_seconds(thirty_years_from_now) / BLOCK_DURATION_S))
+    heap_counter = round(
+        unix_to_tai2000_seconds(thirty_years_from_now) / BLOCK_DURATION_S
+    )
     assert 0 <= heap_counter <= SPEAD_HEAP_COUNTER_MAX
 
 
@@ -185,7 +191,9 @@ def test_send_channel_heap_sends_encoded_bytes_to_dest_addr():
 
     station = _station()
     fake_sock = FakeSocket()
-    packetizer = SpsPacketizer(station, dest_ip="10.0.0.5", dest_port=8001, sock=fake_sock)
+    packetizer = SpsPacketizer(
+        station, dest_ip="10.0.0.5", dest_port=8001, sock=fake_sock
+    )
     heap = _make_heap()
 
     expected = packetizer.encode_channel_heap(heap)
@@ -226,8 +234,8 @@ def test_generate_test_pcap_writes_well_formed_pcap(tmp_path):
     gen_pcap.generate_test_pcap(str(output), n_heaps=3)
 
     data = output.read_bytes()
-    magic, ver_major, ver_minor, thiszone, sigfigs, snaplen, network = struct.unpack(
-        "<IHHiIII", data[:24]
+    magic, _ver_major, _ver_minor, _thiszone, _sigfigs, _snaplen, network = (
+        struct.unpack("<IHHiIII", data[:24])
     )
     assert magic == gen_pcap.PCAP_MAGIC_MICROSECONDS
     assert network == gen_pcap.LINKTYPE_ETHERNET
@@ -235,7 +243,9 @@ def test_generate_test_pcap_writes_well_formed_pcap(tmp_path):
     offset = 24
     n_records = 0
     while offset < len(data):
-        ts_sec, ts_usec, incl_len, orig_len = struct.unpack("<IIII", data[offset : offset + 16])
+        _ts_sec, _ts_usec, incl_len, orig_len = struct.unpack(
+            "<IIII", data[offset : offset + 16]
+        )
         assert incl_len == orig_len
         offset += 16 + incl_len
         n_records += 1
@@ -254,7 +264,9 @@ def test_generate_test_pcap_frames_are_valid_udp_over_ipv4():
     assert eth_type == 0x0800  # IPv4
 
     ip_header = frame[14:34]
-    assert gen_pcap._ipv4_checksum(ip_header) == 0  # a correct checksum sums to 0 over the whole header
+    assert (
+        gen_pcap._ipv4_checksum(ip_header) == 0
+    )  # a correct checksum sums to 0 over the whole header
     version_ihl = ip_header[0]
     assert version_ihl == 0x45  # IPv4, 20-byte header (no options)
 

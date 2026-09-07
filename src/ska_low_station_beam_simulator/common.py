@@ -51,8 +51,9 @@ import socket
 import struct
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Mapping, Optional, Protocol
+from typing import Protocol
 
 import numpy as np
 
@@ -118,7 +119,9 @@ HEAP_LEN = 2048  # time samples per heap per channel, per ICD
 # 1 / (CHANNEL_WIDTH_HZ * 32/27) = 1.08e-6 s = 1080ns exactly.
 OVERSAMPLING_NUMERATOR = 32
 OVERSAMPLING_DENOMINATOR = 27
-CHANNEL_OUTPUT_RATE_HZ = CHANNEL_WIDTH_HZ * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
+CHANNEL_OUTPUT_RATE_HZ = (
+    CHANNEL_WIDTH_HZ * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
+)
 
 # Per-tick time budget, FIXED regardless of channel count — this is the
 # real-time constraint generation is racing against. Equal to
@@ -257,9 +260,9 @@ class DelayFeed:
 
     def __init__(self, name: str):
         self.name = name
-        self._poly: Optional[DelayPolynomial] = None
+        self._poly: DelayPolynomial | None = None
         self._warned_no_poly = False
-        self._warned_stale_valid_until: Optional[float] = None
+        self._warned_stale_valid_until: float | None = None
 
     def update(self, poly: DelayPolynomial) -> None:
         self._poly = poly
@@ -364,7 +367,7 @@ class HeapAccumulator:
         num_channels: int,
         obs_time: float,
         sample_rate_per_channel: float,
-        channel_id_map: Optional[np.ndarray] = None,
+        channel_id_map: np.ndarray | None = None,
     ):
         self.num_channels = num_channels
         self.obs_time = obs_time
@@ -585,8 +588,8 @@ class SpsPacketizer:
     def __init__(
         self,
         station: StationConfig,
-        dest_ip: Optional[str] = None,
-        dest_port: Optional[int] = None,
+        dest_ip: str | None = None,
+        dest_port: int | None = None,
         sock=None,
     ):
         """
@@ -639,8 +642,8 @@ class SpsPacketizer:
         # for the first time (generate_test_pcap.py) -- this had never
         # been exercised before. Fixed formula keeps heap_counter
         # comfortably within 40 bits until roughly year 2091.
-        heap_counter = int(
-            round(unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S)
+        heap_counter = round(
+            unix_to_tai2000_seconds(heap.heap_start_time) / BLOCK_DURATION_S
         )
         if not (0 <= heap_counter <= _SPEAD_HEAP_COUNTER_MASK):
             raise ValueError(
@@ -670,7 +673,9 @@ class SpsPacketizer:
             ),
             (0x3300, 0x0),
         )
-        pointers = b"".join(_spead_item_pointer(item_id, value) for item_id, value in items)
+        pointers = b"".join(
+            _spead_item_pointer(item_id, value) for item_id, value in items
+        )
         return _spead_header_bytes(len(items)) + pointers + payload
 
     def send_channel_heap(self, heap: ChannelHeap):
@@ -722,14 +727,14 @@ class Streamer(Protocol):
     # protocol.
     def generate_next_tick(
         self, t: float, n: int, /
-    ) -> Mapping[str, Optional[np.ndarray]]: ...
+    ) -> Mapping[str, np.ndarray | None]: ...
 
 
 class ScanRunner:
     def __init__(
         self,
         streamer: Streamer,
-        send_queue: "queue.Queue[ChannelHeap]",
+        send_queue: queue.Queue[ChannelHeap],
         obs_time: float,
         scan_duration_s: float,
     ):
@@ -738,7 +743,7 @@ class ScanRunner:
         self.obs_time = obs_time
         self.scan_duration_s = scan_duration_s
         self.stop_event = threading.Event()
-        self.thread: Optional[threading.Thread] = None
+        self.thread: threading.Thread | None = None
 
         # Fixed by the ICD (the OVERSAMPLED per-channel sample rate --
         # see CHANNEL_OUTPUT_RATE_HZ's definition above for why this is
@@ -806,7 +811,7 @@ class ScanRunner:
 
 
 def sender_loop(
-    send_queue: "queue.Queue[ChannelHeap]",
+    send_queue: queue.Queue[ChannelHeap],
     packetizer: SpsPacketizer,
     shutdown_event: threading.Event,
 ):

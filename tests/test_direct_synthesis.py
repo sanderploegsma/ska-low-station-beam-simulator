@@ -24,13 +24,13 @@ def _delay_feed(name: str, **poly_overrides) -> DelayFeed:
     no default/fallback delay (see common.py). Builds one already
     populated via update(), matching how a real source would look once
     its Tango attribute subscription has delivered a first value."""
-    defaults = dict(
-        station_id=1,
-        start_validity_sec=OBS_TIME,
-        validity_period_sec=600.0,
-        xypol_coeffs_ns=[750.0, 0.0046, 0.0, 0.0, 0.0, 0.0],
-        ypol_offset_ns=2.0,
-    )
+    defaults = {
+        "station_id": 1,
+        "start_validity_sec": OBS_TIME,
+        "validity_period_sec": 600.0,
+        "xypol_coeffs_ns": [750.0, 0.0046, 0.0, 0.0, 0.0, 0.0],
+        "ypol_offset_ns": 2.0,
+    }
     defaults.update(poly_overrides)
     feed = DelayFeed(name=name)
     feed.update(DelayPolynomial(**defaults))
@@ -40,7 +40,12 @@ def _delay_feed(name: str, **poly_overrides) -> DelayFeed:
 @pytest.fixture
 def station():
     return StationConfig(
-        station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
+        station_id=1,
+        substation_id=0,
+        subarray_id=1,
+        beam_id=1,
+        first_channel_id=0,
+        scan_id=1,
     )
 
 
@@ -55,11 +60,22 @@ def test_tone_channel_placement():
     depends on, since a channel-placement bug would make the
     delay/phase-accuracy checks below pass or fail for the wrong
     reason."""
-    test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0  # off-center within channel 42
+    test_freq = (
+        BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0
+    )  # off-center within channel 42
     zero_coeffs = np.array([0.0], dtype=np.float64)
     ch_idx, _ = sim.synth_tone_channel(
-        test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, zero_coeffs,
-        0.0, 0.0, False, 0.0, SAMPLE_RATE_PER_CHANNEL, 2048,
+        test_freq,
+        1.0,
+        BASE_FREQ_HZ,
+        CHANNEL_WIDTH_HZ,
+        zero_coeffs,
+        0.0,
+        0.0,
+        False,
+        0.0,
+        SAMPLE_RATE_PER_CHANNEL,
+        2048,
     )
     assert ch_idx == 42
 
@@ -72,8 +88,17 @@ def test_tone_zero_delay_accuracy():
     test_freq = BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ + 150_000.0
     zero_coeffs = np.array([0.0], dtype=np.float64)
     _, samples = sim.synth_tone_channel(
-        test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, zero_coeffs,
-        0.0, 0.0, False, 0.0, SAMPLE_RATE_PER_CHANNEL, 2048,
+        test_freq,
+        1.0,
+        BASE_FREQ_HZ,
+        CHANNEL_WIDTH_HZ,
+        zero_coeffs,
+        0.0,
+        0.0,
+        False,
+        0.0,
+        SAMPLE_RATE_PER_CHANNEL,
+        2048,
     )
     residual = test_freq - (BASE_FREQ_HZ + 42 * CHANNEL_WIDTH_HZ)
     t = np.arange(2048) / SAMPLE_RATE_PER_CHANNEL
@@ -93,10 +118,21 @@ def test_tone_delay_as_phase_accuracy():
     known_tau_ns = 750.0
     coeffs = np.array([known_tau_ns], dtype=np.float64)
     _, samples_delayed = sim.synth_tone_channel(
-        test_freq, 1.0, BASE_FREQ_HZ, CHANNEL_WIDTH_HZ, coeffs,
-        0.0, 0.0, False, 0.0, SAMPLE_RATE_PER_CHANNEL, 2048,
+        test_freq,
+        1.0,
+        BASE_FREQ_HZ,
+        CHANNEL_WIDTH_HZ,
+        coeffs,
+        0.0,
+        0.0,
+        False,
+        0.0,
+        SAMPLE_RATE_PER_CHANNEL,
+        2048,
     )
-    expected_delayed = expected * np.exp(-1j * 2 * np.pi * test_freq * known_tau_ns * 1e-9)
+    expected_delayed = expected * np.exp(
+        -1j * 2 * np.pi * test_freq * known_tau_ns * 1e-9
+    )
     assert np.max(np.abs(samples_delayed - expected_delayed)) < 1e-9
 
 
@@ -112,7 +148,9 @@ def test_noise_bank_statistics_and_cross_channel_independence():
     DFT-of-i.i.d.-Gaussian property the whole pre-generated tile-bank
     design (see direct_synthesis.py's NOISE section) relies on holding in
     practice, not just in theory."""
-    bank = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=1, tile_n_samples=200_000, num_channels=96)
+    bank = sim.fill_noise_bank(
+        seed=7, std=1.0, n_tiles=1, tile_n_samples=200_000, num_channels=96
+    )
     noise = bank[0]
     assert abs(np.mean(noise)) < 0.01
     assert abs(np.std(noise[:, 0].real) - 1.0) < 0.01
@@ -125,8 +163,12 @@ def test_noise_bank_determinism():
     required by this codebase's deterministic, clock-independent sim_time
     design (see CLAUDE.md), where any pod must be able to recompute the
     same content independently, with no shared state."""
-    n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
-    n2 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
+    n1 = sim.fill_noise_bank(
+        seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96
+    )
+    n2 = sim.fill_noise_bank(
+        seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96
+    )
     assert np.array_equal(n1, n2)
 
 
@@ -135,8 +177,12 @@ def test_noise_bank_different_seeds_differ():
     actually produce different noise, guarding against a degenerate
     implementation that ignores the seed and always returns the same
     bank content."""
-    n1 = sim.fill_noise_bank(seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
-    n2 = sim.fill_noise_bank(seed=99, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96)
+    n1 = sim.fill_noise_bank(
+        seed=7, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96
+    )
+    n2 = sim.fill_noise_bank(
+        seed=99, std=1.0, n_tiles=4, tile_n_samples=500, num_channels=96
+    )
     assert not np.array_equal(n1, n2)
 
 
@@ -151,8 +197,12 @@ def test_tile_bank_determinism(station):
     re-requesting the same tick time must return byte-identical
     content."""
     streamer = sim.DirectSynthesisStreamer(
-        station=station, source_cfgs=[], noise_cfg={"std": 1.0, "seed": 7},
-        obs_time_ref=OBS_TIME, num_channels=96, n_tiles=8,
+        station=station,
+        source_cfgs=[],
+        noise_cfg={"std": 1.0, "seed": 7},
+        obs_time_ref=OBS_TIME,
+        num_channels=96,
+        n_tiles=8,
     )
     n = streamer.tick_n_samples()
     r1 = streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
@@ -164,8 +214,12 @@ def test_tile_bank_first_repeat_is_early_for_small_n_tiles(station):
     """Not a fidelity bug -- the birthday-paradox tradeoff this bank
     deliberately makes (see direct_synthesis.py's NOISE section)."""
     streamer = sim.DirectSynthesisStreamer(
-        station=station, source_cfgs=[], noise_cfg={"std": 1.0, "seed": 7},
-        obs_time_ref=OBS_TIME, num_channels=96, n_tiles=8,
+        station=station,
+        source_cfgs=[],
+        noise_cfg={"std": 1.0, "seed": 7},
+        obs_time_ref=OBS_TIME,
+        num_channels=96,
+        n_tiles=8,
     )
     n = streamer.tick_n_samples()
     tick_dt = n / streamer.channel_output_rate
@@ -185,13 +239,27 @@ def test_tile_bank_cross_station_independence(station):
     """Non-negotiable per the module docstring: stations must NEVER emit
     byte-identical noise for the same tick."""
     streamer_a = sim.DirectSynthesisStreamer(
-        station=station, source_cfgs=[], noise_cfg={"std": 1.0, "seed": 7},
-        obs_time_ref=OBS_TIME, num_channels=96, n_tiles=8,
+        station=station,
+        source_cfgs=[],
+        noise_cfg={"std": 1.0, "seed": 7},
+        obs_time_ref=OBS_TIME,
+        num_channels=96,
+        n_tiles=8,
     )
     streamer_b = sim.DirectSynthesisStreamer(
-        station=StationConfig(station_id=2, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1),
-        source_cfgs=[], noise_cfg={"std": 1.0, "seed": 99},
-        obs_time_ref=OBS_TIME, num_channels=96, n_tiles=8,
+        station=StationConfig(
+            station_id=2,
+            substation_id=0,
+            subarray_id=1,
+            beam_id=1,
+            first_channel_id=0,
+            scan_id=1,
+        ),
+        source_cfgs=[],
+        noise_cfg={"std": 1.0, "seed": 99},
+        obs_time_ref=OBS_TIME,
+        num_channels=96,
+        n_tiles=8,
     )
     n = streamer_a.tick_n_samples()
     out_a = streamer_a.generate_next_tick(OBS_TIME, n)["V"]
@@ -215,7 +283,9 @@ def test_pulsar_channelize_once_channel_mapping():
     n_wide = 256 * num_channels
     test_channel = 7
     band_center_hz = base_f + wideband_rate / 2.0
-    test_freq = base_f + test_channel * chw + 0.15 * chw  # off-center within the channel
+    test_freq = (
+        base_f + test_channel * chw + 0.15 * chw
+    )  # off-center within the channel
     f_offset = test_freq - band_center_hz
     t_wide = np.arange(n_wide) / wideband_rate
     v_tone = np.exp(1j * 2 * np.pi * f_offset * t_wide)
@@ -236,7 +306,9 @@ def test_dispersion_constant_matches_psrsigsim():
     section for why PsrSigSim itself wasn't taken as a dependency."""
     psrsigsim_dm_k = 1.0 / 2.41e-4
     rel_diff = abs(sim.DISPERSION_CONST_S_MHZ2_PER_DM - psrsigsim_dm_k) / psrsigsim_dm_k
-    assert rel_diff < 0.001  # ~0.014% in practice -- standard literature-precision variation
+    assert (
+        rel_diff < 0.001
+    )  # ~0.014% in practice -- standard literature-precision variation
 
 
 # ============================================================
@@ -254,8 +326,14 @@ def pulsar_streamer(station):
     return sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "period_s": PULSAR_PERIOD_S, "width_s": PULSAR_WIDTH_S,
-             "amplitude": 1.0, "dm_pc_cm3": PULSAR_DM, "delay_feed": _delay_feed("pulsar-a")}
+            {
+                "kind": "pulsed",
+                "period_s": PULSAR_PERIOD_S,
+                "width_s": PULSAR_WIDTH_S,
+                "amplitude": 1.0,
+                "dm_pc_cm3": PULSAR_DM,
+                "delay_feed": _delay_feed("pulsar-a"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
@@ -282,24 +360,40 @@ def test_pulsar_content_is_genuinely_complex(pulsar_streamer):
     assert np.max(np.abs(out.imag)) > 1e-6
 
 
-def test_pulsar_cross_station_coherence_after_delay_compensation(pulsar_streamer, station):
+def test_pulsar_cross_station_coherence_after_delay_compensation(
+    pulsar_streamer, station
+):
     """The concrete confirmation that v3 supports coherent multi-station
     beamforming: two streamers with different DelayPolynomials, same
     pulsar, same tick -- after each applies its OWN delay-compensating
     phase correction (what a beamformer does), content must correlate
     at ~1.0."""
     n = pulsar_streamer.tick_n_samples()
-    station_b = StationConfig(station_id=2, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1)
+    station_b = StationConfig(
+        station_id=2,
+        substation_id=0,
+        subarray_id=1,
+        beam_id=1,
+        first_channel_id=0,
+        scan_id=1,
+    )
 
     pulsar_streamer_b = sim.DirectSynthesisStreamer(
         station=station_b,
         source_cfgs=[
-            {"kind": "pulsed", "period_s": PULSAR_PERIOD_S, "width_s": PULSAR_WIDTH_S,
-             "amplitude": 1.0, "dm_pc_cm3": PULSAR_DM,
-             "delay_feed": _delay_feed(
-                 "pulsar-b", station_id=2,
-                 xypol_coeffs_ns=[300.0, 0.002, 0.0, 0.0, 0.0, 0.0], ypol_offset_ns=1.0,
-             )}
+            {
+                "kind": "pulsed",
+                "period_s": PULSAR_PERIOD_S,
+                "width_s": PULSAR_WIDTH_S,
+                "amplitude": 1.0,
+                "dm_pc_cm3": PULSAR_DM,
+                "delay_feed": _delay_feed(
+                    "pulsar-b",
+                    station_id=2,
+                    xypol_coeffs_ns=[300.0, 0.002, 0.0, 0.0, 0.0, 0.0],
+                    ypol_offset_ns=1.0,
+                ),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
@@ -340,7 +434,10 @@ def test_num_channels_above_max_rejected(station):
     producing an invalid beam configuration."""
     with pytest.raises(ValueError, match="not a valid SPS beam"):
         sim.DirectSynthesisStreamer(
-            station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=448,
+            station=station,
+            source_cfgs=[],
+            obs_time_ref=OBS_TIME,
+            num_channels=448,
         )
 
 
@@ -350,7 +447,10 @@ def test_num_channels_not_a_multiple_of_step_rejected(station):
     rounded or accepted."""
     with pytest.raises(ValueError, match="not a valid SPS beam"):
         sim.DirectSynthesisStreamer(
-            station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=100,
+            station=station,
+            source_cfgs=[],
+            obs_time_ref=OBS_TIME,
+            num_channels=100,
         )
 
 
@@ -359,7 +459,10 @@ def test_num_channels_at_max_accepted(station):
     constructible configuration, not just that values above it are
     rejected -- guards against an off-by-one in the validation bound."""
     sim.DirectSynthesisStreamer(
-        station=station, source_cfgs=[], obs_time_ref=OBS_TIME, num_channels=384,
+        station=station,
+        source_cfgs=[],
+        obs_time_ref=OBS_TIME,
+        num_channels=384,
     )
 
 
@@ -418,8 +521,14 @@ def test_pulsed_source_cfg_rejects_both_name_and_params(station):
         sim.DirectSynthesisStreamer(
             station=station,
             source_cfgs=[
-                {"kind": "pulsed", "pulsar_name": "x", "period_s": 0.01, "width_s": 0.001,
-                 "dm_pc_cm3": 2.0, "delay_feed": _delay_feed("both")}
+                {
+                    "kind": "pulsed",
+                    "pulsar_name": "x",
+                    "period_s": 0.01,
+                    "width_s": 0.001,
+                    "dm_pc_cm3": 2.0,
+                    "delay_feed": _delay_feed("both"),
+                }
             ],
             obs_time_ref=OBS_TIME,
         )
@@ -447,8 +556,12 @@ def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
     streamer = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
-             "delay_feed": _delay_feed("catalog-pulsar")}
+            {
+                "kind": "pulsed",
+                "pulsar_name": "test_catalog_pulsar",
+                "catalog_dir": catalog_dir,
+                "delay_feed": _delay_feed("catalog-pulsar"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -458,7 +571,9 @@ def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
     out1 = streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
     out2 = streamer.generate_next_tick(OBS_TIME, n)["V"].copy()
     assert np.array_equal(out1, out2), "same t must give identical content"
-    assert np.max(np.abs(out1.imag)) > 1e-6, "loaded template must still be genuinely complex"
+    assert np.max(np.abs(out1.imag)) > 1e-6, (
+        "loaded template must still be genuinely complex"
+    )
 
 
 def test_pulsar_name_matches_directly_built_content(small_catalog, station):
@@ -471,8 +586,12 @@ def test_pulsar_name_matches_directly_built_content(small_catalog, station):
     streamer_by_name = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
-             "delay_feed": _delay_feed("by-name")}
+            {
+                "kind": "pulsed",
+                "pulsar_name": "test_catalog_pulsar",
+                "catalog_dir": catalog_dir,
+                "delay_feed": _delay_feed("by-name"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -481,8 +600,13 @@ def test_pulsar_name_matches_directly_built_content(small_catalog, station):
     streamer_direct = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "period_s": CATALOG_TEST_PERIOD_S, "width_s": CATALOG_TEST_WIDTH_S,
-             "dm_pc_cm3": CATALOG_TEST_DM, "delay_feed": _delay_feed("direct")}
+            {
+                "kind": "pulsed",
+                "period_s": CATALOG_TEST_PERIOD_S,
+                "width_s": CATALOG_TEST_WIDTH_S,
+                "dm_pc_cm3": CATALOG_TEST_DM,
+                "delay_feed": _delay_feed("direct"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -504,8 +628,12 @@ def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
     streamer_default = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
-             "delay_feed": _delay_feed("amp-default")}
+            {
+                "kind": "pulsed",
+                "pulsar_name": "test_catalog_pulsar",
+                "catalog_dir": catalog_dir,
+                "delay_feed": _delay_feed("amp-default"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -514,8 +642,13 @@ def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
     streamer_scaled = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "pulsed", "pulsar_name": "test_catalog_pulsar", "catalog_dir": catalog_dir,
-             "amplitude": 2.5, "delay_feed": _delay_feed("amp-scaled")}
+            {
+                "kind": "pulsed",
+                "pulsar_name": "test_catalog_pulsar",
+                "catalog_dir": catalog_dir,
+                "amplitude": 2.5,
+                "delay_feed": _delay_feed("amp-scaled"),
+            }
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,

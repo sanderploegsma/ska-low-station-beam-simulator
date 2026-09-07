@@ -35,17 +35,17 @@ def _make_synthetic_template() -> np.ndarray:
 
 def _save(tmp_path, name="test_pulsar", **overrides):
     template = overrides.pop("template", _make_synthetic_template())
-    kwargs = dict(
-        n_period_samples=N_PERIOD_SAMPLES,
-        period_s=0.05,
-        width_s=0.002,
-        dm_pc_cm3=10.0,
-        sky_seed=1234,
-        num_channels=CATALOG_NUM_CHANNELS,
-        base_freq_hz=BASE_FREQ_HZ,
-        channel_width_hz=CHANNEL_WIDTH_HZ,
-        channel_output_rate=CHANNEL_OUTPUT_RATE_HZ,
-    )
+    kwargs = {
+        "n_period_samples": N_PERIOD_SAMPLES,
+        "period_s": 0.05,
+        "width_s": 0.002,
+        "dm_pc_cm3": 10.0,
+        "sky_seed": 1234,
+        "num_channels": CATALOG_NUM_CHANNELS,
+        "base_freq_hz": BASE_FREQ_HZ,
+        "channel_width_hz": CHANNEL_WIDTH_HZ,
+        "channel_output_rate": CHANNEL_OUTPUT_RATE_HZ,
+    }
     kwargs.update(overrides)
     save_pulsar_to_catalog(tmp_path, name, template, **kwargs)
     return template
@@ -90,7 +90,9 @@ def test_load_slices_correct_channel_range(tmp_path):
     assert template.shape == (n_channels, N_PERIOD_SAMPLES)
     # channel c's content is literally its GLOBAL channel index -- so a
     # slice starting at channel 50 should read 50, 51, 52, ...
-    assert np.array_equal(template[:, 0], np.arange(slice_start, slice_start + n_channels))
+    assert np.array_equal(
+        template[:, 0], np.arange(slice_start, slice_start + n_channels)
+    )
 
 
 def test_load_rejects_misaligned_base_freq(tmp_path):
@@ -100,7 +102,10 @@ def test_load_rejects_misaligned_base_freq(tmp_path):
     _save(tmp_path)
     with pytest.raises(ValueError, match="not aligned"):
         load_pulsar_from_catalog(
-            "test_pulsar", 32, BASE_FREQ_HZ + 0.3 * CHANNEL_WIDTH_HZ, catalog_dir=tmp_path
+            "test_pulsar",
+            32,
+            BASE_FREQ_HZ + 0.3 * CHANNEL_WIDTH_HZ,
+            catalog_dir=tmp_path,
         )
 
 
@@ -113,7 +118,8 @@ def test_load_rejects_out_of_range_slice(tmp_path):
         load_pulsar_from_catalog(
             "test_pulsar",
             CATALOG_NUM_CHANNELS,
-            BASE_FREQ_HZ + 10 * CHANNEL_WIDTH_HZ,  # pushes the end past the catalog's range
+            BASE_FREQ_HZ
+            + 10 * CHANNEL_WIDTH_HZ,  # pushes the end past the catalog's range
             catalog_dir=tmp_path,
         )
 
@@ -125,7 +131,10 @@ def test_load_rejects_below_catalog_band(tmp_path):
     _save(tmp_path)
     with pytest.raises(ValueError, match="doesn't fit"):
         load_pulsar_from_catalog(
-            "test_pulsar", 32, BASE_FREQ_HZ - 10 * CHANNEL_WIDTH_HZ, catalog_dir=tmp_path
+            "test_pulsar",
+            32,
+            BASE_FREQ_HZ - 10 * CHANNEL_WIDTH_HZ,
+            catalog_dir=tmp_path,
         )
 
 

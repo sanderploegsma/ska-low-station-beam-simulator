@@ -225,7 +225,6 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import numpy as np
 import scipy.fft
@@ -368,7 +367,7 @@ def synth_tone_channel(
     :param n_samples: how many samples to synthesize.
     :returns: a ``(channel_index, samples)`` tuple.
     """
-    channel_idx = int(round((freq_hz - base_freq_hz) / channel_width_hz))
+    channel_idx = round((freq_hz - base_freq_hz) / channel_width_hz)
     channel_center = base_freq_hz + channel_idx * channel_width_hz
     residual_freq = freq_hz - channel_center
 
@@ -392,7 +391,9 @@ def synth_tone_channel(
 # ============================================================
 
 
-def fill_noise_bank(seed: int, std: float, n_tiles: int, tile_n_samples: int, num_channels: int) -> np.ndarray:
+def fill_noise_bank(
+    seed: int, std: float, n_tiles: int, tile_n_samples: int, num_channels: int
+) -> np.ndarray:
     """Fills a ``(n_tiles, tile_n_samples, num_channels)`` complex128 bank
     of independent complex Gaussian noise — statistically exact
     equivalent of "wideband noise, then FFT channelized" (DFT of i.i.d.
@@ -448,7 +449,9 @@ def fill_noise_bank(seed: int, std: float, n_tiles: int, tile_n_samples: int, nu
     return bank
 
 
-def bank_memory_bytes(n_tiles: int, tile_n_samples: int, num_channels: int, n_pols: int = 2) -> int:
+def bank_memory_bytes(
+    n_tiles: int, tile_n_samples: int, num_channels: int, n_pols: int = 2
+) -> int:
     """Total resident memory for the noise bank across both pols.
 
     :param n_tiles: number of tiles in the bank.
@@ -457,7 +460,9 @@ def bank_memory_bytes(n_tiles: int, tile_n_samples: int, num_channels: int, n_po
     :param n_pols: how many per-pol banks to account for.
     :returns: total bytes.
     """
-    return n_tiles * tile_n_samples * num_channels * 16 * n_pols  # complex128 = 16 bytes
+    return (
+        n_tiles * tile_n_samples * num_channels * 16 * n_pols
+    )  # complex128 = 16 bytes
 
 
 # ============================================================
@@ -471,7 +476,9 @@ def dispersion_delay_s(freq_hz: float, dm_pc_cm3: float) -> float:
     return DISPERSION_CONST_S_MHZ2_PER_DM * dm_pc_cm3 / (freq_mhz**2)
 
 
-def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_rate, n_wide):
+def generate_wideband_pulse_train(
+    seed, period_s, width_s, amplitude, wideband_rate, n_wide
+):
     """The shared 'sky carrier': one period of a real, wideband (spans
     the WHOLE band as a single time series), UNDISPERSED pulse train.
     Physically: incoherent broadband radio emission (noise-like),
@@ -503,7 +510,9 @@ def generate_wideband_pulse_train(seed, period_s, width_s, amplitude, wideband_r
     return env * g
 
 
-def _channelize_once(v: np.ndarray, num_channels: int, workers: int = PULSAR_FFT_WORKERS) -> np.ndarray:
+def _channelize_once(
+    v: np.ndarray, num_channels: int, workers: int = PULSAR_FFT_WORKERS
+) -> np.ndarray:
     """One-shot FFT channelization of a complex 1D array of length
     ``n = k*num_channels`` into ``(k, num_channels)``, EXTERNAL
     ascending-channel-id order (channel c's center frequency is
@@ -570,11 +579,13 @@ def build_pulsar_template(
         FFT-bin permutation logic.
     """
     wideband_rate = num_channels * channel_width_hz
-    n_period_samples = int(round(period_s * channel_output_rate))
+    n_period_samples = round(period_s * channel_output_rate)
     n_wide = n_period_samples * num_channels  # exact multiple of num_channels,
     # required so _channelize_once's reshape doesn't drop a partial block.
 
-    v = generate_wideband_pulse_train(sky_seed, period_s, width_s, amplitude, wideband_rate, n_wide)
+    v = generate_wideband_pulse_train(
+        sky_seed, period_s, width_s, amplitude, wideband_rate, n_wide
+    )
 
     # Full complex FFT, NOT rfft -- this project's own convention (see
     # _channelize_once) treats negative fftfreq bins as meaningful,
@@ -583,28 +594,47 @@ def build_pulsar_template(
     # expected, not a bug, and what gives the template real carrier
     # phase.
     V = scipy.fft.fft(v, workers=PULSAR_FFT_WORKERS)
-    u = scipy.fft.fftfreq(n_wide, d=1.0 / wideband_rate)  # natural bin order, [-wideband_rate/2, wideband_rate/2)
+    u = scipy.fft.fftfreq(
+        n_wide, d=1.0 / wideband_rate
+    )  # natural bin order, [-wideband_rate/2, wideband_rate/2)
     band_center_hz = base_freq_hz + wideband_rate / 2.0
     f_offset_mhz = u / 1e6
     f0_mhz = band_center_hz / 1e6
     # Lorimer & Kramer 2006, eq. 5.21 -- coherent dispersion transfer
     # function, cross-validated against PsrSigSim's ISM._disperse_baseband.
     H = np.exp(
-        1j * 2 * np.pi * DISPERSION_CONST_S_MHZ2_PER_DM
-        / ((f_offset_mhz + f0_mhz) * f0_mhz**2) * dm_pc_cm3 * f_offset_mhz**2
+        1j
+        * 2
+        * np.pi
+        * DISPERSION_CONST_S_MHZ2_PER_DM
+        / ((f_offset_mhz + f0_mhz) * f0_mhz**2)
+        * dm_pc_cm3
+        * f_offset_mhz**2
     )
     v_dispersed = scipy.fft.ifft(V * H, workers=PULSAR_FFT_WORKERS)
 
-    channelized = _channelize_once(v_dispersed, num_channels)  # (n_period_samples, num_channels), external order
+    channelized = _channelize_once(
+        v_dispersed, num_channels
+    )  # (n_period_samples, num_channels), external order
     template = np.ascontiguousarray(channelized.T)  # (num_channels, n_period_samples)
     return template, n_period_samples
 
 
 @njit(parallel=True, cache=True)
 def add_pulsar_tick(
-    out, template, start_idx, n_period_samples,
-    delay_coeffs, poly_t_rel_start, ypol_offset_ns, is_h_pol,
-    base_freq_hz, channel_width_hz, channel_output_rate, n_samples, num_channels,
+    out,
+    template,
+    start_idx,
+    n_period_samples,
+    delay_coeffs,
+    poly_t_rel_start,
+    ypol_offset_ns,
+    is_h_pol,
+    base_freq_hz,
+    channel_width_hz,
+    channel_output_rate,
+    n_samples,
+    num_channels,
 ):
     """Adds this tick's contribution into ``out`` (``n_samples,
     num_channels`` complex128), reading the precomputed template
@@ -674,12 +704,12 @@ class DirectSynthesisStreamer:
         station: StationConfig,
         source_cfgs: list[dict],
         obs_time_ref: float,
-        noise_cfg: Optional[dict] = None,
+        noise_cfg: dict | None = None,
         num_channels: int = NUM_CHANNELS,
         base_freq_hz: float = BASE_FREQ_HZ,
         channel_width_hz: float = CHANNEL_WIDTH_HZ,
         n_tiles: int = DEFAULT_N_TILES,
-        tile_n_samples: Optional[int] = None,
+        tile_n_samples: int | None = None,
     ):
         if not (
             MIN_NUM_CHANNELS <= num_channels <= MAX_NUM_CHANNELS
@@ -702,7 +732,7 @@ class DirectSynthesisStreamer:
                     f"('tone', 'pulsed') in source_cfgs; got kind={cfg['kind']!r}."
                 )
             if not isinstance(cfg.get("delay_feed"), DelayFeed):
-                raise ValueError(
+                raise TypeError(
                     f"source_cfg kind={cfg['kind']!r} is missing a required "
                     f"'delay_feed' (a common.DelayFeed instance). There is no "
                     f"default/fallback delay for a source — a source with no "
@@ -765,7 +795,9 @@ class DirectSynthesisStreamer:
         # common.CHANNEL_OUTPUT_RATE_HZ's docstring for the ICD reference
         # and the derivation (32/27 oversampling factor -> 1080ns per
         # sample, not the naive 1280ns critical-sampling period).
-        self.channel_output_rate = channel_width_hz * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
+        self.channel_output_rate = (
+            channel_width_hz * OVERSAMPLING_NUMERATOR / OVERSAMPLING_DENOMINATOR
+        )
 
         self._obs_time_ref = obs_time_ref
 
@@ -792,7 +824,11 @@ class DirectSynthesisStreamer:
         if noise_cfg is not None:
             for pol, seed in (("V", self._noise_seed_v), ("H", self._noise_seed_h)):
                 self._banks[pol] = fill_noise_bank(
-                    seed, self._noise_std, self.n_tiles, self.tile_n_samples, self.num_channels
+                    seed,
+                    self._noise_std,
+                    self.n_tiles,
+                    self.tile_n_samples,
+                    self.num_channels,
                 )
 
         # --- pulsar templates: one (template, period_s, n_period_samples)
@@ -831,7 +867,9 @@ class DirectSynthesisStreamer:
                     cfg.get("sky_seed", DEFAULT_SKY_SEED),
                 )
                 period_s = cfg["period_s"]
-            self._pulsars.append((template, period_s, n_period_samples, cfg["delay_feed"], {}))
+            self._pulsars.append(
+                (template, period_s, n_period_samples, cfg["delay_feed"], {})
+            )
 
         # Reused across ticks (per pol) so generate_next_tick doesn't
         # allocate a fresh (n_samples, num_channels) complex128 array
@@ -858,12 +896,14 @@ class DirectSynthesisStreamer:
 
         :returns: per-channel samples for one tick.
         """
-        return int(round(self.channel_output_rate * BLOCK_DURATION_S))
+        return round(self.channel_output_rate * BLOCK_DURATION_S)
 
     def bank_memory_bytes(self) -> int:
         if not self._banks:
             return 0
-        return bank_memory_bytes(self.n_tiles, self.tile_n_samples, self.num_channels, len(self._banks))
+        return bank_memory_bytes(
+            self.n_tiles, self.tile_n_samples, self.num_channels, len(self._banks)
+        )
 
     @staticmethod
     def _coeffs_for(cache: dict, poly: DelayPolynomial) -> np.ndarray:
@@ -915,7 +955,9 @@ class DirectSynthesisStreamer:
             # buffer.
             if self._noise_cfg is not None:
                 bank = self._banks[pol]
-                tick_index = int(round(t_local_rel_start * self.channel_output_rate)) // max(n_samples, 1)
+                tick_index = round(t_local_rel_start * self.channel_output_rate) // max(
+                    n_samples, 1
+                )
                 # Per-(station, pol) independent draw -- NEVER shared
                 # across stations. See module docstring.
                 tile_idx = int(_splitmix64_hash(noise_seed, tick_index) % self.n_tiles)
@@ -923,18 +965,35 @@ class DirectSynthesisStreamer:
             else:
                 out.fill(0)
 
-            for template, period_s, n_period_samples, delay_feed, coeffs_cache in self._pulsars:
+            for (
+                template,
+                period_s,
+                n_period_samples,
+                delay_feed,
+                coeffs_cache,
+            ) in self._pulsars:
                 poly = delay_feed.get(t)
                 delay_coeffs = self._coeffs_for(coeffs_cache, poly)
                 poly_t_rel_start = t - poly.start_validity_sec
 
                 phase_in_period = t_local_rel_start % period_s
-                start_idx = int(round(phase_in_period * self.channel_output_rate)) % n_period_samples
+                start_idx = (
+                    round(phase_in_period * self.channel_output_rate) % n_period_samples
+                )
                 add_pulsar_tick(
-                    out, template, start_idx, n_period_samples,
-                    delay_coeffs, poly_t_rel_start, poly.ypol_offset_ns, is_h_pol,
-                    self.base_freq_hz, self.channel_width_hz, self.channel_output_rate,
-                    n_samples, self.num_channels,
+                    out,
+                    template,
+                    start_idx,
+                    n_period_samples,
+                    delay_coeffs,
+                    poly_t_rel_start,
+                    poly.ypol_offset_ns,
+                    is_h_pol,
+                    self.base_freq_hz,
+                    self.channel_width_hz,
+                    self.channel_output_rate,
+                    n_samples,
+                    self.num_channels,
                 )
 
             for cfg, delay_feed, coeffs_cache in self._tone_cfgs:

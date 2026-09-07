@@ -28,13 +28,13 @@ from ska_low_station_beam_simulator.common import (
 
 
 def _poly(**overrides):
-    defaults = dict(
-        station_id=1,
-        start_validity_sec=0.0,
-        validity_period_sec=600.0,
-        xypol_coeffs_ns=[100.0],
-        ypol_offset_ns=0.0,
-    )
+    defaults = {
+        "station_id": 1,
+        "start_validity_sec": 0.0,
+        "validity_period_sec": 600.0,
+        "xypol_coeffs_ns": [100.0],
+        "ypol_offset_ns": 0.0,
+    }
     defaults.update(overrides)
     return DelayPolynomial(**defaults)
 
@@ -69,7 +69,9 @@ def test_delay_feed_warns_only_once_for_missing_poly(caplog):
         feed.get(1000.0)
         feed.get(1001.0)
         feed.get(1002.0)
-    warnings = [r for r in caplog.records if "has not received a polynomial yet" in r.message]
+    warnings = [
+        r for r in caplog.records if "has not received a polynomial yet" in r.message
+    ]
     assert len(warnings) == 1
 
 
@@ -87,7 +89,9 @@ def test_delay_feed_keeps_applying_expired_polynomial_with_warning(caplog):
     simulator's problem to fix -- it applies whatever it was last told
     and logs that the delay is known to be stale."""
     feed = DelayFeed(name="test-source")
-    feed.update(_poly(start_validity_sec=0.0, validity_period_sec=10.0, xypol_coeffs_ns=[750.0]))
+    feed.update(
+        _poly(start_validity_sec=0.0, validity_period_sec=10.0, xypol_coeffs_ns=[750.0])
+    )
     with caplog.at_level(logging.WARNING, logger="cbf_sim"):
         poly = feed.get(20.0)  # past valid_until=10.0
     assert poly.xypol_coeffs_ns == [750.0]
@@ -130,7 +134,12 @@ def test_streamer_rejects_tone_without_delay_feed():
     and could mask a real CBF delay-tracking bug rather than exercise
     it."""
     station = StationConfig(
-        station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
+        station_id=1,
+        substation_id=0,
+        subarray_id=1,
+        beam_id=1,
+        first_channel_id=0,
+        scan_id=1,
     )
     try:
         sim.DirectSynthesisStreamer(
@@ -150,13 +159,24 @@ def test_streamer_rejects_pulsed_without_delay_feed():
     pulsed sources -- both source kinds must be rejected identically,
     not just one of them guarded."""
     station = StationConfig(
-        station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
+        station_id=1,
+        substation_id=0,
+        subarray_id=1,
+        beam_id=1,
+        first_channel_id=0,
+        scan_id=1,
     )
     try:
         sim.DirectSynthesisStreamer(
             station=station,
             source_cfgs=[
-                {"kind": "pulsed", "period_s": 0.1, "width_s": 0.005, "amplitude": 1.0, "dm_pc_cm3": 2.0}
+                {
+                    "kind": "pulsed",
+                    "period_s": 0.1,
+                    "width_s": 0.005,
+                    "amplitude": 1.0,
+                    "dm_pc_cm3": 2.0,
+                }
             ],
             obs_time_ref=0.0,
             num_channels=32,
@@ -223,7 +243,12 @@ def test_two_sources_with_different_delay_feeds_diverge():
     different sky directions), must each receive their OWN, independently
     correct delay correction -- not the station's one shared delay."""
     station = StationConfig(
-        station_id=1, substation_id=0, subarray_id=1, beam_id=1, first_channel_id=0, scan_id=1
+        station_id=1,
+        substation_id=0,
+        subarray_id=1,
+        beam_id=1,
+        first_channel_id=0,
+        scan_id=1,
     )
     feed_a = DelayFeed(name="source-a")
     feed_a.update(_poly(start_validity_sec=0.0, xypol_coeffs_ns=[0.0]))
