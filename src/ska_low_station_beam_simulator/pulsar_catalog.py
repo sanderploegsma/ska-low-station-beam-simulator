@@ -41,6 +41,7 @@ after it, is exactly the kind of drift this check exists to catch.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -51,6 +52,34 @@ from ska_low_station_beam_simulator.common import (
     CHANNEL_WIDTH_HZ,
     MAX_NUM_CHANNELS,
 )
+
+
+@dataclass
+class CatalogEntrySpec:
+    """One entry in ``CATALOG_ENTRIES`` -- the parameters
+    ``generate_pulsar_catalog.py`` builds a catalog entry from (as
+    opposed to ``LoadedPulsarTemplate`` below, what a caller gets back
+    once that entry has been built and saved)."""
+
+    name: str
+    period_s: float
+    width_s: float
+    dm_pc_cm3: float
+    sky_seed: int
+
+
+@dataclass
+class LoadedPulsarTemplate:
+    """Returned by ``load_pulsar_from_catalog`` -- everything
+    ``DirectSynthesisStreamer`` needs to treat a loaded catalog entry
+    exactly like a template it built itself via ``build_pulsar_template``."""
+
+    template: np.ndarray
+    period_s: float
+    n_period_samples: int
+    width_s: float
+    dm_pc_cm3: float
+    sky_seed: int
 
 # Not bundled via wheel packaging (see CLAUDE.md's "Pulsar catalog"
 # section for why: generated data this large shouldn't go through git or
@@ -69,34 +98,34 @@ CATALOG_FILENAME = "catalog.json"
 # entries are never accidentally correlated even if a future addition
 # happened to produce the same n_wide as an existing one.
 CATALOG_ENTRIES = [
-    {
-        "name": "fast_test",
-        "period_s": 0.01,
-        "width_s": 0.0005,
-        "dm_pc_cm3": 2.0,
-        "sky_seed": 0x5AB1E5EED + 1,
-    },
-    {
-        "name": "vela_like",
+    CatalogEntrySpec(
+        name="fast_test",
+        period_s=0.01,
+        width_s=0.0005,
+        dm_pc_cm3=2.0,
+        sky_seed=0x5AB1E5EED + 1,
+    ),
+    CatalogEntrySpec(
+        name="vela_like",
         # Illustrative, not a precise reproduction: real Vela (PSR
         # B0833-45) is ~89.3ms period, DM ~67.97 pc/cm^3.
-        "period_s": 0.0893,
-        "width_s": 0.003,
-        "dm_pc_cm3": 68.0,
-        "sky_seed": 0x5AB1E5EED + 2,
-    },
-    {
-        "name": "slow_wide",
+        period_s=0.0893,
+        width_s=0.003,
+        dm_pc_cm3=68.0,
+        sky_seed=0x5AB1E5EED + 2,
+    ),
+    CatalogEntrySpec(
+        name="slow_wide",
         # A longer period than this project's per-tick generation would
         # ever build live within the one-time construction budget (see
         # CLAUDE.md) -- exactly the case pre-generation is FOR: this
         # construction cost is paid once, offline, by
         # generate_pulsar_catalog.py, not at every scan start.
-        "period_s": 0.3,
-        "width_s": 0.015,
-        "dm_pc_cm3": 30.0,
-        "sky_seed": 0x5AB1E5EED + 3,
-    },
+        period_s=0.3,
+        width_s=0.015,
+        dm_pc_cm3=30.0,
+        sky_seed=0x5AB1E5EED + 3,
+    ),
 ]
 
 
@@ -173,7 +202,7 @@ def load_pulsar_from_catalog(
     station_num_channels: int,
     station_base_freq_hz: float,
     catalog_dir: Path | None = None,
-) -> dict:
+) -> LoadedPulsarTemplate:
     """Loads ``name``'s pre-generated template and slices out the channel
     range [station_base_freq_hz, station_base_freq_hz +
     station_num_channels*channel_width_hz) that this station actually
@@ -190,9 +219,8 @@ def load_pulsar_from_catalog(
         entry's channel grid.
     :param catalog_dir: directory to read from; defaults to
         ``DEFAULT_CATALOG_DIR`` if not given.
-    :returns: a dict with ``template`` (complex128, upcast from the
-        on-disk complex64 -- see module docstring), ``period_s``,
-        ``n_period_samples``, ``width_s``, ``dm_pc_cm3``, ``sky_seed`` --
+    :returns: a ``LoadedPulsarTemplate`` (``template`` complex128, upcast
+        from the on-disk complex64 -- see module docstring) --
         everything ``DirectSynthesisStreamer`` needs to treat this
         exactly like a template it built itself.
     :raises ValueError: if ``name`` isn't in the catalog; if the catalog
@@ -266,11 +294,11 @@ def load_pulsar_from_catalog(
         )
     )
 
-    return {
-        "template": template,
-        "period_s": entry["period_s"],
-        "n_period_samples": entry["n_period_samples"],
-        "width_s": entry["width_s"],
-        "dm_pc_cm3": entry["dm_pc_cm3"],
-        "sky_seed": entry["sky_seed"],
-    }
+    return LoadedPulsarTemplate(
+        template=template,
+        period_s=entry["period_s"],
+        n_period_samples=entry["n_period_samples"],
+        width_s=entry["width_s"],
+        dm_pc_cm3=entry["dm_pc_cm3"],
+        sky_seed=entry["sky_seed"],
+    )

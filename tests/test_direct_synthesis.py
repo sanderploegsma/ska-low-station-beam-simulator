@@ -198,7 +198,7 @@ def test_tile_bank_determinism(station):
     streamer = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[],
-        noise_cfg={"std": 1.0, "seed": 7},
+        noise_cfg=sim.NoiseConfig(std=1.0, seed=7),
         obs_time_ref=OBS_TIME,
         num_channels=96,
         n_tiles=8,
@@ -215,7 +215,7 @@ def test_tile_bank_first_repeat_is_early_for_small_n_tiles(station):
     streamer = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[],
-        noise_cfg={"std": 1.0, "seed": 7},
+        noise_cfg=sim.NoiseConfig(std=1.0, seed=7),
         obs_time_ref=OBS_TIME,
         num_channels=96,
         n_tiles=8,
@@ -240,7 +240,7 @@ def test_tile_bank_cross_station_independence(station):
     streamer_a = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[],
-        noise_cfg={"std": 1.0, "seed": 7},
+        noise_cfg=sim.NoiseConfig(std=1.0, seed=7),
         obs_time_ref=OBS_TIME,
         num_channels=96,
         n_tiles=8,
@@ -254,7 +254,7 @@ def test_tile_bank_cross_station_independence(station):
             scan_id=1,
         ),
         source_cfgs=[],
-        noise_cfg={"std": 1.0, "seed": 99},
+        noise_cfg=sim.NoiseConfig(std=1.0, seed=99),
         obs_time_ref=OBS_TIME,
         num_channels=96,
         n_tiles=8,
@@ -324,14 +324,13 @@ def pulsar_streamer(station):
     return sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "period_s": PULSAR_PERIOD_S,
-                "width_s": PULSAR_WIDTH_S,
-                "amplitude": 1.0,
-                "dm_pc_cm3": PULSAR_DM,
-                "delay_feed": _delay_feed("pulsar-a"),
-            }
+            sim.PulsarByParamsConfig(
+                period_s=PULSAR_PERIOD_S,
+                width_s=PULSAR_WIDTH_S,
+                amplitude=1.0,
+                dm_pc_cm3=PULSAR_DM,
+                delay_feed=_delay_feed("pulsar-a"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
@@ -378,19 +377,18 @@ def test_pulsar_cross_station_coherence_after_delay_compensation(
     pulsar_streamer_b = sim.DirectSynthesisStreamer(
         station=station_b,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "period_s": PULSAR_PERIOD_S,
-                "width_s": PULSAR_WIDTH_S,
-                "amplitude": 1.0,
-                "dm_pc_cm3": PULSAR_DM,
-                "delay_feed": _delay_feed(
+            sim.PulsarByParamsConfig(
+                period_s=PULSAR_PERIOD_S,
+                width_s=PULSAR_WIDTH_S,
+                amplitude=1.0,
+                dm_pc_cm3=PULSAR_DM,
+                delay_feed=_delay_feed(
                     "pulsar-b",
                     station_id=2,
                     xypol_coeffs_ns=[300.0, 0.002, 0.0, 0.0, 0.0, 0.0],
                     ypol_offset_ns=1.0,
                 ),
-            }
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=PULSAR_NUM_CHANNELS,
@@ -464,6 +462,25 @@ def test_num_channels_at_max_accepted(station):
 
 
 # ============================================================
+# source_cfgs typing: only the three dataclasses are accepted
+# ============================================================
+
+
+def test_source_cfgs_rejects_untyped_entry(station):
+    """source_cfgs entries are now explicit dataclasses (ToneSourceConfig/
+    PulsarByNameConfig/PulsarByParamsConfig), not untyped dicts -- an
+    old-style dict (or any other object) must be rejected outright rather
+    than silently doing nothing (e.g. via a ``kind`` lookup that just
+    never matches)."""
+    with pytest.raises(TypeError, match="ToneSourceConfig"):
+        sim.DirectSynthesisStreamer(
+            station=station,
+            source_cfgs=[{"kind": "tone", "freq_hz": 60e6}],
+            obs_time_ref=OBS_TIME,
+        )
+
+
+# ============================================================
 # PULSAR: loading a pre-generated catalog entry by name
 # ============================================================
 
@@ -509,40 +526,6 @@ def small_catalog(tmp_path_factory):
     return catalog_dir, template, n_period_samples
 
 
-def test_pulsed_source_cfg_rejects_both_name_and_params(station):
-    """A pulsed source_cfg naming a catalog entry AND supplying direct
-    period_s/width_s/dm_pc_cm3 params is ambiguous about which should
-    win -- must be rejected rather than silently preferring one over the
-    other."""
-    with pytest.raises(ValueError, match="both"):
-        sim.DirectSynthesisStreamer(
-            station=station,
-            source_cfgs=[
-                {
-                    "kind": "pulsed",
-                    "pulsar_name": "x",
-                    "period_s": 0.01,
-                    "width_s": 0.001,
-                    "dm_pc_cm3": 2.0,
-                    "delay_feed": _delay_feed("both"),
-                }
-            ],
-            obs_time_ref=OBS_TIME,
-        )
-
-
-def test_pulsed_source_cfg_rejects_neither_name_nor_params(station):
-    """A pulsed source_cfg giving neither a catalog name nor direct params
-    has no way to know what pulsar to build -- must fail loudly at
-    construction rather than produce undefined content."""
-    with pytest.raises(ValueError, match="neither"):
-        sim.DirectSynthesisStreamer(
-            station=station,
-            source_cfgs=[{"kind": "pulsed", "delay_feed": _delay_feed("neither")}],
-            obs_time_ref=OBS_TIME,
-        )
-
-
 def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
     """Basic end-to-end check that loading a pulsar by catalog name
     produces a working streamer: deterministic per-tick content, and
@@ -553,12 +536,11 @@ def test_pulsar_name_loads_and_generates_ticks(small_catalog, station):
     streamer = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "pulsar_name": "test_catalog_pulsar",
-                "catalog_dir": catalog_dir,
-                "delay_feed": _delay_feed("catalog-pulsar"),
-            }
+            sim.PulsarByNameConfig(
+                pulsar_name="test_catalog_pulsar",
+                catalog_dir=catalog_dir,
+                delay_feed=_delay_feed("catalog-pulsar"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -583,12 +565,11 @@ def test_pulsar_name_matches_directly_built_content(small_catalog, station):
     streamer_by_name = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "pulsar_name": "test_catalog_pulsar",
-                "catalog_dir": catalog_dir,
-                "delay_feed": _delay_feed("by-name"),
-            }
+            sim.PulsarByNameConfig(
+                pulsar_name="test_catalog_pulsar",
+                catalog_dir=catalog_dir,
+                delay_feed=_delay_feed("by-name"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -597,13 +578,12 @@ def test_pulsar_name_matches_directly_built_content(small_catalog, station):
     streamer_direct = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "period_s": CATALOG_TEST_PERIOD_S,
-                "width_s": CATALOG_TEST_WIDTH_S,
-                "dm_pc_cm3": CATALOG_TEST_DM,
-                "delay_feed": _delay_feed("direct"),
-            }
+            sim.PulsarByParamsConfig(
+                period_s=CATALOG_TEST_PERIOD_S,
+                width_s=CATALOG_TEST_WIDTH_S,
+                dm_pc_cm3=CATALOG_TEST_DM,
+                delay_feed=_delay_feed("direct"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -625,12 +605,11 @@ def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
     streamer_default = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "pulsar_name": "test_catalog_pulsar",
-                "catalog_dir": catalog_dir,
-                "delay_feed": _delay_feed("amp-default"),
-            }
+            sim.PulsarByNameConfig(
+                pulsar_name="test_catalog_pulsar",
+                catalog_dir=catalog_dir,
+                delay_feed=_delay_feed("amp-default"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,
@@ -639,13 +618,12 @@ def test_pulsar_name_amplitude_override_scales_content(small_catalog, station):
     streamer_scaled = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "pulsed",
-                "pulsar_name": "test_catalog_pulsar",
-                "catalog_dir": catalog_dir,
-                "amplitude": 2.5,
-                "delay_feed": _delay_feed("amp-scaled"),
-            }
+            sim.PulsarByNameConfig(
+                pulsar_name="test_catalog_pulsar",
+                catalog_dir=catalog_dir,
+                amplitude=2.5,
+                delay_feed=_delay_feed("amp-scaled"),
+            )
         ],
         obs_time_ref=OBS_TIME,
         num_channels=CATALOG_TEST_NUM_CHANNELS,

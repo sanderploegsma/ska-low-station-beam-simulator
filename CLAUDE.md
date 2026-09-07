@@ -522,6 +522,45 @@ current value on subscribe (vs. only on the next actual change) both
 depend on how the real delay-poly emulator is configured — confirm
 against it once available, not just against this assumption.
 
+### `source_cfgs`/`noise_cfg` are typed dataclasses, not dicts (new this session)
+
+`DirectSynthesisStreamer.__init__` used to take `source_cfgs: list[dict]`
+and `noise_cfg: dict | None` — a `cfg["kind"]` string plus ad hoc keys
+validated by hand at construction time (kind in `("tone", "pulsed")`,
+`delay_feed` present and a `DelayFeed`, pulsar's `pulsar_name` XOR
+`period_s`/`width_s`/`dm_pc_cm3`). Replaced with explicit dataclasses in
+`direct_synthesis.py`: `ToneSourceConfig`, `PulsarByNameConfig`,
+`PulsarByParamsConfig` (`SourceConfig`/`PulsedSourceConfig` are the
+corresponding union aliases), and `NoiseConfig`.
+
+**The two pulsar variants are deliberately SEPARATE types, not one
+dataclass with optional fields** — this turns the old "`pulsar_name` XOR
+`period_s`/`width_s`/`dm_pc_cm3`" runtime dict-shape check into a
+structural property of which type a caller constructs, so
+`DirectSynthesisStreamer.__init__` no longer needs that validation at
+all. Same for `delay_feed`: it's a required field with no default on
+every config type, so a source with no real delay path fails at the
+dataclass's own construction (a plain `TypeError` from Python itself, not
+custom validation code) — still satisfies this simulator's "no
+default/fallback delay" rule (see "Per-source delay" above), just
+enforced one level earlier than before.
+
+**The mutual-exclusion/kind-dispatch validation didn't disappear — it
+moved to `simulator.build_source_cfg`**, a standalone (Tango-free)
+function that turns one raw JSON `source_cfgs` entry plus its
+already-resolved `DelayFeed` into the right dataclass. This is a
+deliberate "validate at the boundary" move: `StartScan`'s JSON argument
+is the actual untyped-data entry point into this system (per-source
+`kind`/`pulsar_name`/`period_s` etc. arrive as strings/numbers off the
+wire), whereas `DirectSynthesisStreamer`'s own callers (tests,
+`benchmark_direct_synthesis.py`) now pass already-typed config objects
+directly and get that checked by Python's own type system rather than by
+runtime dict-shape assertions. `build_source_cfg` is unit-tested in
+`tests/test_simulator_source_cfg.py` (kind dispatch, `delay_attr_uri`
+correctly not forwarded as a dataclass field, both/neither pulsar-config
+rejection) without standing up a Tango device — this codebase otherwise
+doesn't unit test that layer at all (see Setup).
+
 ### Pulsar catalog — pre-generated templates, loaded by name (new this session)
 
 `build_pulsar_template`'s one-time construction cost (see Benchmarking's
@@ -535,14 +574,30 @@ essentially free startup cost (an `np.load` plus a slice), no FFT.
 
 **Both configuration styles are supported side by side, not one instead
 of the other** — a `"pulsed"` `source_cfg` gives either `pulsar_name`
-(load a catalog entry) or `period_s`/`width_s`/`dm_pc_cm3` (build a
-custom template at construction), validated as mutually exclusive
-(`DirectSynthesisStreamer.__init__` raises if a cfg gives both or
-neither). This was a deliberate design choice, not the obvious
-default: it means clients can pick fast, fixed-parameter setup for
-routine tests while still keeping the ability to dial in an arbitrary
-period/DM for a test that specifically needs one, at the cost of the
-slower construction path.
+(load a catalog entry, `PulsarByNameConfig`) or
+`period_s`/`width_s`/`dm_pc_cm3` (build a custom template at
+construction, `PulsarByParamsConfig`) — see "`source_cfgs`/`noise_cfg`
+are typed dataclasses, not dicts" above for why these are two separate
+types rather than one mutual-exclusion check. This was a deliberate
+design choice, not the obvious default: it means clients can pick fast,
+fixed-parameter setup for routine tests while still keeping the ability
+to dial in an arbitrary period/DM for a test that specifically needs
+one, at the cost of the slower construction path.
+
+**`pulsar_catalog.py`'s own entries are typed too, not raw dicts**:
+`CATALOG_ENTRIES` is a list of `CatalogEntrySpec`
+(`name`/`period_s`/`width_s`/`dm_pc_cm3`/`sky_seed`) —
+`generate_pulsar_catalog.py` reads these as attributes, not `entry["..."]`
+lookups. `load_pulsar_from_catalog` returns a `LoadedPulsarTemplate`
+(`template`/`period_s`/`n_period_samples`/`width_s`/`dm_pc_cm3`/
+`sky_seed`) instead of a dict, which is what `DirectSynthesisStreamer`'s
+`PulsarByNameConfig` branch and `tests/test_pulsar_catalog.py` both
+consume. The on-disk `catalog.json` record itself (`save_pulsar_to_catalog`'s
+per-name dict, including `npy_filename`/`num_channels`/`base_freq_hz`/
+`channel_width_hz`/`channel_output_rate`) deliberately stays a plain
+dict — it's a JSON serialization boundary, the same reasoning that keeps
+`StartScan`'s raw JSON argument a dict before `simulator.build_source_cfg`
+turns it into a typed config.
 
 **Every catalog entry is generated at the FULL band width**
 (`common.MAX_NUM_CHANNELS` = 384 channels, starting at

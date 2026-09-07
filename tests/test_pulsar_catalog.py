@@ -64,11 +64,11 @@ def test_load_full_range_matches_saved_template(tmp_path):
     # complex64 round-trip loses precision -- values here are small
     # integers, well within complex64's exact-representation range, so
     # this can and should be an exact match.
-    assert np.array_equal(loaded["template"], template)
-    assert loaded["template"].dtype == np.complex128
-    assert loaded["period_s"] == 0.05
-    assert loaded["n_period_samples"] == N_PERIOD_SAMPLES
-    assert loaded["dm_pc_cm3"] == 10.0
+    assert np.array_equal(loaded.template, template)
+    assert loaded.template.dtype == np.complex128
+    assert loaded.period_s == 0.05
+    assert loaded.n_period_samples == N_PERIOD_SAMPLES
+    assert loaded.dm_pc_cm3 == 10.0
 
 
 def test_load_slices_correct_channel_range(tmp_path):
@@ -86,7 +86,7 @@ def test_load_slices_correct_channel_range(tmp_path):
         BASE_FREQ_HZ + slice_start * CHANNEL_WIDTH_HZ,
         catalog_dir=tmp_path,
     )
-    template = loaded["template"]
+    template = loaded.template
     assert template.shape == (n_channels, N_PERIOD_SAMPLES)
     # channel c's content is literally its GLOBAL channel index -- so a
     # slice starting at channel 50 should read 50, 51, 52, ...
@@ -188,4 +188,4 @@ def test_save_preserves_other_entries(tmp_path):
     _save(tmp_path, name="pulsar_b")
     for name in ("pulsar_a", "pulsar_b"):
         loaded = load_pulsar_from_catalog(name, 32, BASE_FREQ_HZ, catalog_dir=tmp_path)
-        assert loaded["period_s"] == 0.05
+        assert loaded.period_s == 0.05

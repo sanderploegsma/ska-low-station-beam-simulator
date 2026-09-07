@@ -45,7 +45,10 @@ from ska_low_station_beam_simulator.common import (
     SpsPacketizer,
     StationConfig,
 )
-from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStreamer
+from ska_low_station_beam_simulator.direct_synthesis import (
+    DirectSynthesisStreamer,
+    NoiseConfig,
+)
 
 # Synthetic network addressing -- arbitrary, content doesn't matter for
 # testing SPEAD encoding, just needs to be well-formed.
@@ -156,7 +159,7 @@ def generate_test_pcap(output_path: str, n_heaps: int = 5) -> None:
         station_id=1, substation_id=0, subarray_id=1, beam_id=1, scan_id=1
     )
     obs_time = time.time()
-    noise_cfg = {"std": 0.05, "seed": station.station_id}
+    noise_cfg = NoiseConfig(std=0.05, seed=station.station_id)
 
     streamer = DirectSynthesisStreamer(
         station=station,

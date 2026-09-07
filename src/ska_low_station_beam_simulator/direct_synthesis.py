@@ -225,6 +225,8 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import scipy.fft
@@ -269,6 +271,65 @@ DISPERSION_CONST_S_MHZ2_PER_DM = 4148.808
 # simulating this pulsar (see module docstring). NEVER derive this from
 # station.station_id.
 DEFAULT_SKY_SEED = 0x5AB1E5EED
+
+
+# ============================================================
+# SOURCE/NOISE CONFIG TYPES -- explicit dataclasses instead of untyped
+# dicts. The two pulsar variants (by catalog name vs. by raw params) are
+# deliberately SEPARATE types rather than one dataclass with optional
+# fields: this makes the "pulsar_name" XOR "period_s"/"width_s"/
+# "dm_pc_cm3" mutual exclusivity a structural property of which type a
+# caller constructs, instead of a runtime dict-shape check inside
+# DirectSynthesisStreamer.__init__ (that check has moved to simulator.py's
+# StartScan, the actual untyped-JSON system boundary -- see its
+# docstring). ``delay_feed`` has no default on any of these: a source with
+# no real delay path is refused by construction (missing a required
+# dataclass field raises TypeError immediately), matching this
+# simulator's "no default/fallback delay" rule -- see module docstring's
+# PULSED sources section and CLAUDE.md's "Per-source delay" section.
+# ============================================================
+
+
+@dataclass
+class ToneSourceConfig:
+    delay_feed: DelayFeed
+    freq_hz: float
+    amplitude: float = 1.0
+
+
+@dataclass
+class PulsarByNameConfig:
+    """Loads a pre-generated catalog entry (see ``pulsar_catalog.py``) --
+    fast, essentially free startup cost, fixed parameters."""
+
+    delay_feed: DelayFeed
+    pulsar_name: str
+    catalog_dir: Path | None = None
+    amplitude: float = 1.0
+
+
+@dataclass
+class PulsarByParamsConfig:
+    """Builds a custom template at construction -- arbitrary parameters,
+    pays the one-time FFT construction cost (see CLAUDE.md's Benchmarking
+    section for how tight that budget is)."""
+
+    delay_feed: DelayFeed
+    period_s: float
+    width_s: float
+    dm_pc_cm3: float
+    amplitude: float = 1.0
+    sky_seed: int = DEFAULT_SKY_SEED
+
+
+PulsedSourceConfig = PulsarByNameConfig | PulsarByParamsConfig
+SourceConfig = ToneSourceConfig | PulsedSourceConfig
+
+
+@dataclass
+class NoiseConfig:
+    std: float
+    seed: int
 
 
 # ============================================================
@@ -701,9 +762,9 @@ class DirectSynthesisStreamer:
     def __init__(
         self,
         station: StationConfig,
-        source_cfgs: list[dict],
+        source_cfgs: list[SourceConfig],
         obs_time_ref: float,
-        noise_cfg: dict | None = None,
+        noise_cfg: NoiseConfig | None = None,
         num_channels: int = MAX_NUM_CHANNELS,
         base_freq_hz: float = BASE_FREQ_HZ,
         channel_width_hz: float = CHANNEL_WIDTH_HZ,
@@ -724,55 +785,24 @@ class DirectSynthesisStreamer:
                 f"configuration, see CLAUDE.md)."
             )
 
-        for cfg in source_cfgs:
-            if cfg["kind"] not in ("tone", "pulsed"):
-                raise ValueError(
-                    f"DirectSynthesisStreamer only supports kind in "
-                    f"('tone', 'pulsed') in source_cfgs; got kind={cfg['kind']!r}."
+        self._tone_cfgs_raw = [c for c in source_cfgs if isinstance(c, ToneSourceConfig)]
+        self._pulsed_cfgs = [
+            c for c in source_cfgs if isinstance(c, (PulsarByNameConfig, PulsarByParamsConfig))
+        ]
+        if len(self._tone_cfgs_raw) + len(self._pulsed_cfgs) != len(source_cfgs):
+            unknown = [
+                c
+                for c in source_cfgs
+                if not isinstance(
+                    c, (ToneSourceConfig, PulsarByNameConfig, PulsarByParamsConfig)
                 )
-            if not isinstance(cfg.get("delay_feed"), DelayFeed):
-                raise TypeError(
-                    f"source_cfg kind={cfg['kind']!r} is missing a required "
-                    f"'delay_feed' (a common.DelayFeed instance). There is no "
-                    f"default/fallback delay for a source — a source with no "
-                    f"real delay path would silently produce content that's "
-                    f"trivially 'perfectly aligned', which could mask a real "
-                    f"CBF delay-tracking bug instead of exercising it. Attach "
-                    f"a DelayFeed to this source_cfg (e.g. via "
-                    f"simulator.py's Tango attribute subscription, or "
-                    f"directly in a test)."
-                )
-            if cfg["kind"] == "pulsed":
-                # Two mutually exclusive ways to configure a pulsar: load
-                # a pre-generated catalog entry by name (fast startup,
-                # fixed parameters -- see pulsar_catalog.py) or supply
-                # raw parameters to build a custom template at
-                # construction (arbitrary parameters, pays the one-time
-                # FFT construction cost -- see CLAUDE.md's Benchmarking
-                # section for how tight that budget now is).
-                param_keys = ("period_s", "width_s", "dm_pc_cm3")
-                has_name = "pulsar_name" in cfg
-                present_params = [k for k in param_keys if k in cfg]
-                if has_name and present_params:
-                    raise ValueError(
-                        f"pulsed source_cfg has both 'pulsar_name' and "
-                        f"{present_params} -- specify one or the other, "
-                        f"not both: 'pulsar_name' loads a pre-generated "
-                        f"catalog entry (see pulsar_catalog.py), "
-                        f"'period_s'/'width_s'/'dm_pc_cm3' builds a custom "
-                        f"template at construction."
-                    )
-                if not has_name and len(present_params) != len(param_keys):
-                    missing = [k for k in param_keys if k not in cfg]
-                    raise ValueError(
-                        f"pulsed source_cfg needs either 'pulsar_name' "
-                        f"(load a pre-generated catalog entry) or all of "
-                        f"'period_s'/'width_s'/'dm_pc_cm3' (build a custom "
-                        f"template at construction) -- got neither "
-                        f"'pulsar_name' nor {missing}."
-                    )
+            ]
+            raise TypeError(
+                f"source_cfgs entries must be ToneSourceConfig, "
+                f"PulsarByNameConfig, or PulsarByParamsConfig; got "
+                f"{[type(c) for c in unknown]}."
+            )
 
-        self._pulsed_cfgs = [c for c in source_cfgs if c["kind"] == "pulsed"]
         if self._pulsed_cfgs and base_freq_hz <= 0:
             raise ValueError(
                 f"pulsed source configured but base_freq_hz={base_freq_hz} -- "
@@ -807,14 +837,12 @@ class DirectSynthesisStreamer:
         # only rebuilt when that source's poly actually changes, not every
         # tick (see bug #13 in CLAUDE.md — per-tick allocation churn, not
         # compute, was the historical bottleneck here).
-        self._tone_cfgs = [
-            (c, c["delay_feed"], {}) for c in source_cfgs if c["kind"] == "tone"
-        ]
+        self._tone_cfgs = [(c, c.delay_feed, {}) for c in self._tone_cfgs_raw]
 
         self._noise_cfg = noise_cfg
-        self._noise_seed_v = noise_cfg["seed"] if noise_cfg else 0
-        self._noise_seed_h = (noise_cfg["seed"] + 1_000_003) if noise_cfg else 0
-        self._noise_std = noise_cfg["std"] if noise_cfg else 0.0
+        self._noise_seed_v = noise_cfg.seed if noise_cfg else 0
+        self._noise_seed_h = (noise_cfg.seed + 1_000_003) if noise_cfg else 0
+        self._noise_std = noise_cfg.std if noise_cfg else 0.0
 
         # --- noise tile bank (see module docstring for the tradeoff) ---
         self.n_tiles = n_tiles
@@ -833,41 +861,42 @@ class DirectSynthesisStreamer:
         # --- pulsar templates: one (template, period_s, n_period_samples)
         # tuple per pulsed source cfg. Either LOADED from the catalog by
         # name (fast -- see pulsar_catalog.py) or BUILT here from raw
-        # parameters, per source_cfg (validated mutually exclusive,
-        # above). sky_seed is shared across all stations for the same
-        # pulsar cfg by default (see module docstring) -- override only
-        # for a deliberately DIFFERENT (uncorrelated) pulsar, never to
-        # "vary" the same pulsar per station. ---
+        # parameters, per source_cfg -- which of the two is determined by
+        # the cfg's own type (PulsarByNameConfig vs. PulsarByParamsConfig),
+        # not a runtime dict-shape check. sky_seed is shared across all
+        # stations for the same pulsar cfg by default (see module
+        # docstring) -- override only for a deliberately DIFFERENT
+        # (uncorrelated) pulsar, never to "vary" the same pulsar per
+        # station. ---
         self._pulsars = []
         for cfg in self._pulsed_cfgs:
-            if "pulsar_name" in cfg:
+            if isinstance(cfg, PulsarByNameConfig):
                 loaded = load_pulsar_from_catalog(
-                    cfg["pulsar_name"],
+                    cfg.pulsar_name,
                     self.num_channels,
                     self.base_freq_hz,
-                    catalog_dir=cfg.get("catalog_dir"),
+                    catalog_dir=cfg.catalog_dir,
                 )
-                template = loaded["template"]
-                amplitude = cfg.get("amplitude", 1.0)
-                if amplitude != 1.0:
-                    template = template * amplitude
-                period_s = loaded["period_s"]
-                n_period_samples = loaded["n_period_samples"]
+                template = loaded.template
+                if cfg.amplitude != 1.0:
+                    template = template * cfg.amplitude
+                period_s = loaded.period_s
+                n_period_samples = loaded.n_period_samples
             else:
                 template, n_period_samples = build_pulsar_template(
                     self.num_channels,
                     self.channel_width_hz,
                     self.base_freq_hz,
                     self.channel_output_rate,
-                    cfg["period_s"],
-                    cfg["width_s"],
-                    cfg.get("amplitude", 1.0),
-                    cfg["dm_pc_cm3"],
-                    cfg.get("sky_seed", DEFAULT_SKY_SEED),
+                    cfg.period_s,
+                    cfg.width_s,
+                    cfg.amplitude,
+                    cfg.dm_pc_cm3,
+                    cfg.sky_seed,
                 )
-                period_s = cfg["period_s"]
+                period_s = cfg.period_s
             self._pulsars.append(
-                (template, period_s, n_period_samples, cfg["delay_feed"], {})
+                (template, period_s, n_period_samples, cfg.delay_feed, {})
             )
 
         # Reused across ticks (per pol) so generate_next_tick doesn't
@@ -1001,8 +1030,8 @@ class DirectSynthesisStreamer:
                 poly_t_rel_start = t - poly.start_validity_sec
 
                 ch_idx, samples = synth_tone_channel(
-                    cfg["freq_hz"],
-                    cfg.get("amplitude", 1.0),
+                    cfg.freq_hz,
+                    cfg.amplitude,
                     self.base_freq_hz,
                     self.channel_width_hz,
                     delay_coeffs,
@@ -1017,7 +1046,7 @@ class DirectSynthesisStreamer:
                     log.warning(
                         "tone freq_hz=%s maps to channel_idx=%d, outside the "
                         "configured [0, %d) channel range — skipping",
-                        cfg["freq_hz"],
+                        cfg.freq_hz,
                         ch_idx,
                         self.num_channels,
                     )

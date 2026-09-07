@@ -64,7 +64,70 @@ from ska_low_station_beam_simulator.common import (
     parse_delay_polynomial_from_attr_value,
     sender_loop,
 )
-from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStreamer
+from ska_low_station_beam_simulator.direct_synthesis import (
+    DirectSynthesisStreamer,
+    NoiseConfig,
+    PulsarByNameConfig,
+    PulsarByParamsConfig,
+    SourceConfig,
+    ToneSourceConfig,
+)
+
+
+def build_source_cfg(spec: dict, delay_feed: DelayFeed) -> SourceConfig:
+    """Turns one ``source_cfgs`` JSON entry (plus its already-resolved
+    ``DelayFeed``) into the typed config ``DirectSynthesisStreamer``
+    expects -- the JSON-boundary equivalent of the type choice
+    DirectSynthesisStreamer's direct Python callers make themselves (see
+    direct_synthesis.py's SOURCE/NOISE CONFIG TYPES section). Kept as a
+    standalone function, not inlined into ``StartScan``, so this JSON
+    dispatch/validation logic is unit-testable without a live Tango
+    device -- this codebase otherwise doesn't unit test the Tango device
+    server layer at all (see CLAUDE.md's Setup section).
+
+    :param spec: one raw ``source_cfgs`` entry (``'delay_attr_uri'``
+        already consumed by the caller to build ``delay_feed`` -- an
+        extra key here is harmless, ignored via ``dict`` unpacking).
+    :param delay_feed: this source's already-subscribed ``DelayFeed``.
+    :returns: a ``ToneSourceConfig``, ``PulsarByNameConfig``, or
+        ``PulsarByParamsConfig``.
+    :raises ValueError: for an unsupported ``kind``, or an ambiguous/
+        incomplete pulsed source (both/neither of ``pulsar_name`` and
+        ``period_s``/``width_s``/``dm_pc_cm3``).
+    """
+    cfg = dict(spec)
+    cfg.pop("delay_attr_uri", None)
+    kind = cfg.pop("kind", None)
+    if kind == "tone":
+        return ToneSourceConfig(delay_feed=delay_feed, **cfg)
+    if kind == "pulsed":
+        param_keys = ("period_s", "width_s", "dm_pc_cm3")
+        has_name = "pulsar_name" in cfg
+        present_params = [k for k in param_keys if k in cfg]
+        if has_name and present_params:
+            raise ValueError(
+                f"pulsed source_cfgs entry has both 'pulsar_name' and "
+                f"{present_params} -- specify one or the other, not both: "
+                f"'pulsar_name' loads a pre-generated catalog entry, "
+                f"'period_s'/'width_s'/'dm_pc_cm3' builds a custom "
+                f"template at construction."
+            )
+        if has_name:
+            return PulsarByNameConfig(delay_feed=delay_feed, **cfg)
+        if len(present_params) == len(param_keys):
+            return PulsarByParamsConfig(delay_feed=delay_feed, **cfg)
+        missing = [k for k in param_keys if k not in cfg]
+        raise ValueError(
+            f"pulsed source_cfgs entry needs either 'pulsar_name' (load a "
+            f"pre-generated catalog entry) or all of "
+            f"'period_s'/'width_s'/'dm_pc_cm3' (build a custom template "
+            f"at construction) -- got neither 'pulsar_name' nor {missing}."
+        )
+    raise ValueError(
+        f"source_cfgs entry kind={kind!r} is not supported -- must be "
+        f"'tone' or 'pulsed'."
+    )
+
 
 # ============================================================
 # TANGO DEVICE SERVER
@@ -183,22 +246,21 @@ class StationSimulatorDevice(Device):
         self._station_cfg.scan_id = int(scan_id)
 
         source_specs = args.get("source_cfgs", [])
-        noise_cfg = {"std": 0.05, "seed": self.station_id}
+        noise_cfg = NoiseConfig(std=0.05, seed=self.station_id)
 
         self._teardown_delay_subscriptions()
-        source_cfgs = []
+        source_cfgs: list[SourceConfig] = []
         for spec in source_specs:
-            cfg = dict(spec)
-            attr_uri = cfg.pop("delay_attr_uri", None)
+            attr_uri = spec.get("delay_attr_uri")
             if not attr_uri:
                 raise ValueError(
-                    f"source_cfgs entry kind={cfg.get('kind')!r} is "
+                    f"source_cfgs entry kind={spec.get('kind')!r} is "
                     f"missing required 'delay_attr_uri' — every source must "
                     f"name a delay-poly attribute to subscribe to, there is "
                     f"no default delay (see module docstring)."
                 )
-            cfg["delay_feed"] = self._make_delay_feed(attr_uri)
-            source_cfgs.append(cfg)
+            delay_feed = self._make_delay_feed(attr_uri)
+            source_cfgs.append(build_source_cfg(spec, delay_feed))
 
         streamer = DirectSynthesisStreamer(
             station=self._station_cfg,

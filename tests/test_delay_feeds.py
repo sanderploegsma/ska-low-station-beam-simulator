@@ -131,22 +131,12 @@ def test_streamer_rejects_tone_without_delay_feed():
     """Enforces the non-negotiable rule from direct_synthesis.py: a tone
     source_cfg with no delay_feed must fail construction outright, since
     a silently-zero-delay source would look trivially 'perfectly aligned'
-    and could mask a real CBF delay-tracking bug rather than exercise
-    it."""
-    station = StationConfig(
-        station_id=1,
-        substation_id=0,
-        subarray_id=1,
-        beam_id=1,
-        scan_id=1,
-    )
+    and could mask a real CBF delay-tracking bug rather than exercise it.
+    ``delay_feed`` has no default on ``ToneSourceConfig``, so omitting it
+    raises ``TypeError`` from the dataclass itself, before
+    ``DirectSynthesisStreamer`` even runs."""
     try:
-        sim.DirectSynthesisStreamer(
-            station=station,
-            source_cfgs=[{"kind": "tone", "freq_hz": 60e6, "amplitude": 1.0}],
-            obs_time_ref=0.0,
-            num_channels=32,
-        )
+        sim.ToneSourceConfig(freq_hz=60e6, amplitude=1.0)
     except TypeError as exc:
         assert "delay_feed" in str(exc)
     else:
@@ -157,28 +147,12 @@ def test_streamer_rejects_pulsed_without_delay_feed():
     """Same required-delay_feed rule as the tone case above, applied to
     pulsed sources -- both source kinds must be rejected identically,
     not just one of them guarded."""
-    station = StationConfig(
-        station_id=1,
-        substation_id=0,
-        subarray_id=1,
-        beam_id=1,
-        scan_id=1,
-    )
     try:
-        sim.DirectSynthesisStreamer(
-            station=station,
-            source_cfgs=[
-                {
-                    "kind": "pulsed",
-                    "period_s": 0.1,
-                    "width_s": 0.005,
-                    "amplitude": 1.0,
-                    "dm_pc_cm3": 2.0,
-                }
-            ],
-            obs_time_ref=0.0,
-            num_channels=32,
-            base_freq_hz=sim.BASE_FREQ_HZ,
+        sim.PulsarByParamsConfig(
+            period_s=0.1,
+            width_s=0.005,
+            amplitude=1.0,
+            dm_pc_cm3=2.0,
         )
     except TypeError as exc:
         assert "delay_feed" in str(exc)
@@ -259,8 +233,8 @@ def test_two_sources_with_different_delay_feeds_diverge():
     streamer = sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {"kind": "tone", "freq_hz": freq_a, "amplitude": 1.0, "delay_feed": feed_a},
-            {"kind": "tone", "freq_hz": freq_b, "amplitude": 1.0, "delay_feed": feed_b},
+            sim.ToneSourceConfig(freq_hz=freq_a, amplitude=1.0, delay_feed=feed_a),
+            sim.ToneSourceConfig(freq_hz=freq_b, amplitude=1.0, delay_feed=feed_b),
         ],
         obs_time_ref=0.0,
         num_channels=32,

@@ -49,33 +49,33 @@ from ska_low_station_beam_simulator.pulsar_catalog import (
 
 def generate_catalog(output_dir: Path) -> None:
     for entry in CATALOG_ENTRIES:
-        print(f"building {entry['name']!r} (period={entry['period_s']*1000:.1f}ms, "
-              f"DM={entry['dm_pc_cm3']})...")
+        print(f"building {entry.name!r} (period={entry.period_s*1000:.1f}ms, "
+              f"DM={entry.dm_pc_cm3})...")
         t0 = time.perf_counter()
         template, n_period_samples = build_pulsar_template(
             MAX_NUM_CHANNELS,
             CHANNEL_WIDTH_HZ,
             BASE_FREQ_HZ,
             CHANNEL_OUTPUT_RATE_HZ,
-            entry["period_s"],
-            entry["width_s"],
+            entry.period_s,
+            entry.width_s,
             1.0,  # canonical unit amplitude -- callers scale at load time, see direct_synthesis.py
-            entry["dm_pc_cm3"],
-            entry["sky_seed"],
+            entry.dm_pc_cm3,
+            entry.sky_seed,
         )
         build_s = time.perf_counter() - t0
         save_pulsar_to_catalog(
             output_dir,
-            entry["name"],
+            entry.name,
             template,
             n_period_samples,
-            entry["period_s"],
-            entry["width_s"],
-            entry["dm_pc_cm3"],
-            entry["sky_seed"],
+            entry.period_s,
+            entry.width_s,
+            entry.dm_pc_cm3,
+            entry.sky_seed,
         )
-        npy_size_mb = (output_dir / f"{entry['name']}.npy").stat().st_size / 1e6
-        print(f"  wrote {entry['name']}.npy ({npy_size_mb:.1f}MB) in {build_s:.2f}s")
+        npy_size_mb = (output_dir / f"{entry.name}.npy").stat().st_size / 1e6
+        print(f"  wrote {entry.name}.npy ({npy_size_mb:.1f}MB) in {build_s:.2f}s")
 
     print(f"\ncatalog written to {output_dir} ({len(CATALOG_ENTRIES)} entries)")
 

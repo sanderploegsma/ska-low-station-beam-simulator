@@ -86,22 +86,20 @@ def build_streamer(num_channels: int) -> sim.DirectSynthesisStreamer:
     return sim.DirectSynthesisStreamer(
         station=station,
         source_cfgs=[
-            {
-                "kind": "tone",
-                "freq_hz": tone_freq,
-                "amplitude": 1.0,
-                "delay_feed": _fixed_delay_feed("bench-tone"),
-            },
-            {
-                "kind": "pulsed",
-                "period_s": PULSAR_PERIOD_S,
-                "width_s": PULSAR_WIDTH_S,
-                "amplitude": 1.0,
-                "dm_pc_cm3": PULSAR_DM,
-                "delay_feed": _fixed_delay_feed("bench-pulsar"),
-            },
+            sim.ToneSourceConfig(
+                freq_hz=tone_freq,
+                amplitude=1.0,
+                delay_feed=_fixed_delay_feed("bench-tone"),
+            ),
+            sim.PulsarByParamsConfig(
+                period_s=PULSAR_PERIOD_S,
+                width_s=PULSAR_WIDTH_S,
+                amplitude=1.0,
+                dm_pc_cm3=PULSAR_DM,
+                delay_feed=_fixed_delay_feed("bench-pulsar"),
+            ),
         ],
-        noise_cfg={"std": 0.05, "seed": 7},
+        noise_cfg=sim.NoiseConfig(std=0.05, seed=7),
         obs_time_ref=1_800_000_000.0,
         num_channels=num_channels,
         n_tiles=N_TILES,
