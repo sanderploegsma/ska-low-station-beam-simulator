@@ -1,0 +1,108 @@
+# Default values for go-simulator.
+#
+# IMPORTANT — one release per station: this chart deploys ONE simulator
+# pod, identified by simulator.stationId/substationId, matching this
+# project's "one station = one pod" model (see the source repo's
+# CLAUDE.md). replicaCount > 1 would give every pod the SAME
+# station_id/substation_id/dest_ip/dest_port (a Deployment's pods share
+# one PodSpec) and is NOT a way to simulate multiple stations — install
+# a separate Helm release per station instead (e.g. one values file, or
+# -f overrides, per station).
+
+replicaCount: 1
+
+image:
+  repository: ghcr.io/sanderploegsma/ska-low-station-beam-simulator/go-simulator
+  pullPolicy: IfNotPresent
+  # Defaults to "latest", published by .github/workflows/go-simulator-docker.yml
+  # on every push to main. Pin to a go-simulator-vX.Y.Z tag for anything
+  # beyond local/dev use.
+  tag: sha-96c0c0f
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# This station pod's identity and CBF destination — the Go equivalent of
+# simulator.py's station_id/substation_id/dest_ip/dest_port device
+# properties (see go-simulator/cmd/simulator's flags, which these values
+# are passed through as).
+simulator:
+  stationId: 1
+  substationId: 0
+  destIp: "192.168.200.2"
+  destPort: 1234
+  # gRPC control-plane port -- the container's -listen flag and the
+  # Service's targetPort both derive from this.
+  grpcPort: 50051
+
+serviceAccount:
+  # Whether a ServiceAccount should be created.
+  create: true
+  annotations: {}
+  # Name of the ServiceAccount to use. If not set and create is true, a
+  # name is generated using the fullname template.
+  name: ""
+
+podAnnotations:
+  k8s.v1.cni.cncf.io/networks: kube-system/cbf-sdp-1
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+
+# Exposes the gRPC control plane (StartScan/StopScan/GetStatus/
+# PushDelayUpdate) to whatever process sits on the other side of it (see
+# go-simulator/api/simulator.proto's doc comment) -- LoadBalancer by
+# default so that counterpart, wherever it runs, can reach this pod
+# without needing in-cluster DNS. There is no Service for the CBF
+# SPEAD/UDP destination: that's an OUTBOUND connection this pod
+# initiates itself (dest_ip/dest_port above), not something a Service
+# exposes.
+service:
+  type: LoadBalancer
+  port: 50051
+  annotations: {}
+  # loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+
+# grpc_health_probe / a registered grpc.health.v1.Health service isn't
+# implemented by cmd/simulator yet, so probes default to a plain TCP
+# check against the gRPC port (confirms the process is up and listening,
+# not that it's actually healthy at the gRPC layer). Switch to
+# `grpc: {port: ...}` probes once that health service exists.
+livenessProbe:
+  tcpSocket:
+    port: grpc
+  initialDelaySeconds: 5
+  periodSeconds: 10
+readinessProbe:
+  tcpSocket:
+    port: grpc
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+resources: {}
+  # Uncomment and size for your cluster -- see the source repo's
+  # CLAUDE.md Benchmarking section for the Python backend's per-core
+  # numbers; this Go prototype hasn't been benchmarked on target
+  # hardware yet (see go-simulator/README.md).
+  # limits:
+  #   cpu: 1
+  #   memory: 256Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

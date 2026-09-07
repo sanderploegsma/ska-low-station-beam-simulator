@@ -1,0 +1,18 @@
+apiVersion: v2
+name: go-simulator
+description: >-
+  SKA Low station-beam simulator (Go prototype): numeric core (tone +
+  noise), SPEAD-64-48 packetizer, and gRPC control plane. See
+  go-simulator/README.md in the source repo for scope and architecture.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/skao/ska-low-station-beam-simulator
+sources:
+  - https://github.com/skao/ska-low-station-beam-simulator
+keywords:
+  - ska
+  - station-beam-simulator
+  - grpc
+maintainers:
+  - name: SKAO
