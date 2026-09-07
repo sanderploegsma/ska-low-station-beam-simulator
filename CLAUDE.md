@@ -496,17 +496,25 @@ array keyed by poly *identity*, not recomputed every tick — same
 per-tick-allocation discipline as bug #13 below, just applied per source
 instead of once station-wide.
 
-**`simulator.py` wiring**: `StationSimulatorDevice.source_cfgs_json` (a
-device_property) describes the sources this station simulates; EVERY
-entry MUST include a `delay_attr_uri` naming a Tango attribute to
-subscribe — `StartScan` raises if one is missing, rather than silently
-omitting delay for that source. `StartScan` opens an `AttributeProxy` per
-named attribute, subscribes to its `CHANGE_EVENT`s, and feeds updates
-into a `DelayFeed` attached to that source's cfg before constructing the
-streamer; subscriptions are torn down in `StopScan`/`delete_device` (and
-before any new scan's subscriptions are created) so they never leak
-across scans. **UNVERIFIED, same category of risk as the ICD bit-packing
-below**: the exact attribute payload shape
+**`simulator.py` wiring**: `subarray_id`, `beam_id`, and `source_cfgs`
+are no longer device properties — they're passed dynamically as fields
+of a single JSON object given to the `StartScan` command (alongside
+`obs_time_epoch_s`/`scan_duration_s`/`scan_id`), since a station can be
+reassigned between subarrays/beams across scans without a pod restart.
+Only `station_id`/`substation_id` (identify the pod itself) and
+`dest_ip`/`dest_port` (the CBF endpoint) remain static device
+properties. EVERY `source_cfgs` entry MUST include a `delay_attr_uri`
+naming a Tango attribute to subscribe — `StartScan` raises if one is
+missing, rather than silently omitting delay for that source. `StartScan`
+opens an `AttributeProxy` per named attribute, subscribes to its
+`CHANGE_EVENT`s, and feeds updates into a `DelayFeed` attached to that
+source's cfg before constructing the streamer; subscriptions are torn
+down in `StopScan`/`delete_device` (and before any new scan's
+subscriptions are created) so they never leak across scans. `subarray_id`
+and `beam_id` are set on the same `StationConfig` instance
+`SpsPacketizer` holds a live reference to, so a new scan's values take
+effect without recreating the packetizer. **UNVERIFIED, same category of
+risk as the ICD bit-packing below**: the exact attribute payload shape
 (`common.parse_delay_polynomial_from_attr_value` assumes a JSON
 string/mapping matching `DelayPolynomial`'s fields) and whether
 `AttributeProxy` delivers an immediate `CHANGE_EVENT` with the attribute's
@@ -1358,18 +1366,19 @@ bug; backed-up queue/dropped heaps → simulator artifact.
    pulsed-source test cases whether this level of astrophysical
    approximation (achromatic profile, Gaussian shape, no pulse-to-pulse
    jitter) is sufficient, (d) ~~`StartScan` still hardcodes `source_cfgs`/
-   `noise_cfg` rather than accepting them as scan parameters~~ **partially
-   done this session**: `source_cfgs` (including a required per-source
-   `delay_attr_uri`, see "Per-source delay" above) now comes from the
-   `source_cfgs_json` device_property, not a hardcoded literal — there is
-   no convenience default tone anymore either (an empty `source_cfgs_json`
-   means no tone/pulsar sources at all, since a fabricated default would
-   need a fabricated delay too, which is exactly what "delay is required"
-   is meant to rule out). `noise_cfg` is still hardcoded in `StartScan`,
-   and `source_cfgs_json` is a static per-instance property (set at
-   deployment), not a dynamic `StartScan` command argument — revisit if a
-   test needs to vary sources between scans on the same running device
-   without a restart.
+   `noise_cfg` rather than accepting them as scan parameters~~ **done**:
+   `StartScan` now takes a single JSON string argument
+   (`{obs_time_epoch_s, scan_duration_s, scan_id, subarray_id, beam_id,
+   source_cfgs}`) — `subarray_id`, `beam_id`, and `source_cfgs` (including
+   a required per-source `delay_attr_uri`, see "Per-source delay" above)
+   are no longer device properties, so a station can be reassigned
+   between subarrays/beams/sources across scans without a pod restart.
+   There is still no convenience default tone (an empty `source_cfgs`
+   list means no tone/pulsar sources at all, since a fabricated default
+   would need a fabricated delay too, which is exactly what "delay is
+   required" is meant to rule out). `noise_cfg` is still hardcoded in
+   `StartScan` — revisit if a test needs to vary noise parameters
+   per-scan too.
 7. Confirm the exact CSP LMC command for pushing a delay model without
    going through TMC.
 8. ~~Long-period pulsars violate the one-time construction budget~~

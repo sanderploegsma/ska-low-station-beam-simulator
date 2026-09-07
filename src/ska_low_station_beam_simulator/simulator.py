@@ -9,8 +9,16 @@ Shared plumbing (delay polynomial, heap accumulation, SPEAD
 packetization, the producer/sender loop) lives in ``common.py``, which
 ``direct_synthesis.py`` does not depend on beyond that shared plumbing.
 
-PER-SOURCE DELAY: ``source_cfgs_json`` (a device_property) describes the
-tones/pulsars this station simulates. EVERY entry MUST name a
+PER-SCAN CONFIG: ``subarray_id``, ``beam_id``, and ``source_cfgs`` are no
+longer device properties — they vary per scan (a station can be
+reassigned between subarrays/beams across scans), so they're passed
+dynamically as fields of the JSON object given to ``StartScan``. Only
+``station_id``/``substation_id`` (identify the pod itself) and
+``dest_ip``/``dest_port`` (the CBF endpoint) remain static device
+properties.
+
+PER-SOURCE DELAY: ``source_cfgs`` (in the ``StartScan`` JSON argument)
+describes the tones/pulsars this station simulates. EVERY entry MUST name a
 ``delay_attr_uri`` — a Tango attribute on CBF's delay-poly emulator that
 publishes CHANGE_EVENTs for that one source's direction (RA/Dec, Az/El,
 or static; the emulator can expose several such directions, each on its
@@ -66,23 +74,8 @@ from ska_low_station_beam_simulator.direct_synthesis import DirectSynthesisStrea
 class StationSimulatorDevice(Device):
     station_id = device_property(dtype=int, default_value=1)
     substation_id = device_property(dtype=int, default_value=0)
-    subarray_id = device_property(dtype=int, default_value=1)
-    beam_id = device_property(dtype=int, default_value=1)
     dest_ip = device_property(dtype=str, default_value="127.0.0.1")
     dest_port = device_property(dtype=int, default_value=8000)
-
-    # JSON list of source_cfgs (see direct_synthesis.DirectSynthesisStreamer)
-    # -- EVERY entry MUST include "delay_attr_uri" naming a Tango attribute
-    # on CBF's delay-poly emulator to subscribe for that source's own
-    # delay polynomial (there is no default delay -- see module
-    # docstring). Empty ("[]", the default) means no tone/pulsar sources
-    # at all for this scan (noise, if noise_cfg is set, still plays). A
-    # "pulsed" entry may give either "pulsar_name" (loads a pre-generated
-    # catalog entry -- fast startup, fixed parameters, see
-    # pulsar_catalog.py) or "period_s"/"width_s"/"dm_pc_cm3" (builds a
-    # custom template at construction -- arbitrary parameters, slower
-    # startup), never both.
-    source_cfgs_json = device_property(dtype=str, default_value="[]")
 
     def init_device(self):
         super().init_device()
@@ -91,11 +84,15 @@ class StationSimulatorDevice(Device):
         self._scan_runner: ScanRunner | None = None
         self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
 
+        # subarray_id/beam_id are unknown until the first StartScan --
+        # placeholder 0s here, overwritten (on the same StationConfig
+        # instance, which SpsPacketizer holds a live reference to) each
+        # StartScan call.
         self._station_cfg = StationConfig(
             station_id=self.station_id,
             substation_id=self.substation_id,
-            subarray_id=self.subarray_id,
-            beam_id=self.beam_id,
+            subarray_id=0,
+            beam_id=0,
         )
         self._packetizer = SpsPacketizer(
             self._station_cfg, self.dest_ip, self.dest_port
@@ -154,17 +151,38 @@ class StationSimulatorDevice(Device):
                 log.exception("failed to unsubscribe from a delay-poly attribute")
         self._delay_subscriptions = []
 
-    @command(dtype_in=[float], doc_in="[obs_time_epoch_s, scan_duration_s, scan_id]")
-    def StartScan(self, args):
-        obs_time, scan_duration_s, scan_id = args
+    @command(
+        dtype_in=str,
+        doc_in=(
+            "JSON object: {obs_time_epoch_s, scan_duration_s, scan_id, "
+            "subarray_id, beam_id, source_cfgs}. source_cfgs is a JSON "
+            "list (see direct_synthesis.DirectSynthesisStreamer) -- EVERY "
+            "entry MUST include 'delay_attr_uri' naming a Tango attribute "
+            "on CBF's delay-poly emulator to subscribe for that source's "
+            "own delay polynomial (there is no default delay -- see "
+            "module docstring). An empty list means no tone/pulsar "
+            "sources at all for this scan (noise, if noise_cfg is set, "
+            "still plays). A 'pulsed' entry may give either "
+            "'pulsar_name' (loads a pre-generated catalog entry -- fast "
+            "startup, fixed parameters, see pulsar_catalog.py) or "
+            "'period_s'/'width_s'/'dm_pc_cm3' (builds a custom template "
+            "at construction -- arbitrary parameters, slower startup), "
+            "never both."
+        ),
+    )
+    def StartScan(self, args_json):
+        args = json.loads(args_json)
+        obs_time = args["obs_time_epoch_s"]
+        scan_duration_s = args["scan_duration_s"]
+        scan_id = args["scan_id"]
         if self._scan_runner is not None and self._scan_runner.thread.is_alive():
             raise RuntimeError("scan already running — call StopScan first")
 
+        self._station_cfg.subarray_id = int(args["subarray_id"])
+        self._station_cfg.beam_id = int(args["beam_id"])
         self._station_cfg.scan_id = int(scan_id)
 
-        source_specs = (
-            json.loads(self.source_cfgs_json) if self.source_cfgs_json else []
-        )
+        source_specs = args.get("source_cfgs", [])
         noise_cfg = {"std": 0.05, "seed": self.station_id}
 
         self._teardown_delay_subscriptions()
@@ -174,7 +192,7 @@ class StationSimulatorDevice(Device):
             attr_uri = cfg.pop("delay_attr_uri", None)
             if not attr_uri:
                 raise ValueError(
-                    f"source_cfgs_json entry kind={cfg.get('kind')!r} is "
+                    f"source_cfgs entry kind={cfg.get('kind')!r} is "
                     f"missing required 'delay_attr_uri' — every source must "
                     f"name a delay-poly attribute to subscribe to, there is "
                     f"no default delay (see module docstring)."
