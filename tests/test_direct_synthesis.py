@@ -44,7 +44,6 @@ def station():
         substation_id=0,
         subarray_id=1,
         beam_id=1,
-        first_channel_id=0,
         scan_id=1,
     )
 
@@ -252,7 +251,6 @@ def test_tile_bank_cross_station_independence(station):
             substation_id=0,
             subarray_id=1,
             beam_id=1,
-            first_channel_id=0,
             scan_id=1,
         ),
         source_cfgs=[],
@@ -374,7 +372,6 @@ def test_pulsar_cross_station_coherence_after_delay_compensation(
         substation_id=0,
         subarray_id=1,
         beam_id=1,
-        first_channel_id=0,
         scan_id=1,
     )
 

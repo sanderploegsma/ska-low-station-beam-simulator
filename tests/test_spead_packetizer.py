@@ -29,6 +29,7 @@ import numpy as np
 from ska_low_station_beam_simulator import generate_test_pcap as gen_pcap
 from ska_low_station_beam_simulator.common import (
     BLOCK_DURATION_S,
+    CHANNEL_START,
     HEAP_LEN,
     PAYLOAD_LENGTH_BYTES,
     SPEAD_HEAP_ADDRESS_BITS,
@@ -113,7 +114,7 @@ def test_encode_channel_heap_item_pointers_match_icd_spec():
     assert pointers[0x0004] == PAYLOAD_LENGTH_BYTES
     assert pointers[0x3010] == station.scan_id
     assert pointers[0x3000] == pack_channel_info(
-        station.beam_id, station.first_channel_id + heap.channel_id
+        station.beam_id, CHANNEL_START + heap.channel_id
     )
     assert pointers[0x3001] == pack_antenna_info(
         station.substation_id, station.subarray_id, station.station_id

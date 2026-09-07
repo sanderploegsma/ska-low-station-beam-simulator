@@ -138,7 +138,6 @@ def test_streamer_rejects_tone_without_delay_feed():
         substation_id=0,
         subarray_id=1,
         beam_id=1,
-        first_channel_id=0,
         scan_id=1,
     )
     try:
@@ -163,7 +162,6 @@ def test_streamer_rejects_pulsed_without_delay_feed():
         substation_id=0,
         subarray_id=1,
         beam_id=1,
-        first_channel_id=0,
         scan_id=1,
     )
     try:
@@ -247,7 +245,6 @@ def test_two_sources_with_different_delay_feeds_diverge():
         substation_id=0,
         subarray_id=1,
         beam_id=1,
-        first_channel_id=0,
         scan_id=1,
     )
     feed_a = DelayFeed(name="source-a")

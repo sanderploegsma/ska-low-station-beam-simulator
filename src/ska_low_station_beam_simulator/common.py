@@ -67,7 +67,7 @@ log = logging.getLogger("cbf_sim")
 # ============================================================
 
 CHANNEL_WIDTH_HZ = 781_250.0  # per SPS-CBF ICD coarse channel spacing — CONFIRMED (channel centre spacing)
-NUM_CHANNELS = 96  # 96 * 781.25kHz ≈ 75 MHz, per your requirement
+CHANNEL_START = 64  # CONFIRMED against the real ICD text: the lowest frequency channel is channel 64, centre frequency 50MHz
 
 # CONFIRMED against the real ICD text (not a screenshot, not an
 # assumption): the band is channelized as 384 equispaced coarse channels
@@ -338,12 +338,6 @@ class StationConfig:
     substation_id: int
     subarray_id: int
     beam_id: int
-    # 64 = the confirmed GLOBAL coarse channel ID of BASE_FREQ_HZ
-    # (50.0 MHz, the lowest valid SKA-Low channel centre) — the right
-    # default for a station simulating the band's bottom edge, whose
-    # local channel 0 corresponds to that global channel. Override for a
-    # station covering a different sub-band.
-    first_channel_id: int = 64
     scan_id: int = 0
 
 
@@ -660,7 +654,7 @@ class SpsPacketizer:
                 0x3000,
                 pack_channel_info(
                     self.station.beam_id,
-                    self.station.first_channel_id + heap.channel_id,
+                    CHANNEL_START + heap.channel_id,
                 ),
             ),
             (

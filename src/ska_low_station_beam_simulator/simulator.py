@@ -68,9 +68,6 @@ class StationSimulatorDevice(Device):
     substation_id = device_property(dtype=int, default_value=0)
     subarray_id = device_property(dtype=int, default_value=1)
     beam_id = device_property(dtype=int, default_value=1)
-    # 64 = confirmed GLOBAL coarse channel ID of BASE_FREQ_HZ (50.0 MHz,
-    # the lowest valid SKA-Low channel centre) -- see common.StationConfig.
-    first_channel_id = device_property(dtype=int, default_value=64)
     dest_ip = device_property(dtype=str, default_value="127.0.0.1")
     dest_port = device_property(dtype=int, default_value=8000)
 
@@ -99,7 +96,6 @@ class StationSimulatorDevice(Device):
             substation_id=self.substation_id,
             subarray_id=self.subarray_id,
             beam_id=self.beam_id,
-            first_channel_id=self.first_channel_id,
         )
         self._packetizer = SpsPacketizer(
             self._station_cfg, self.dest_ip, self.dest_port
