@@ -1,0 +1,99 @@
+# Tests, then builds and publishes the Go simulator prototype
+# (go-simulator/) as a container image to the GitHub Container Registry.
+# Scoped to go-simulator/ via the paths filter below -- changes to the
+# Python simulator don't trigger this workflow.
+name: go-simulator image
+
+on:
+  push:
+    branches: [main]
+    tags: ["go-simulator-v*"]
+    paths:
+      - "go-simulator/**"
+      - ".github/workflows/go-simulator-docker.yml"
+  pull_request:
+    paths:
+      - "go-simulator/**"
+      - ".github/workflows/go-simulator-docker.yml"
+  workflow_dispatch: {}
+
+# A ref (branch/tag) that pushes a new commit while an older run for the
+# same ref is still building should cancel the stale run rather than race
+# it for the same image tag.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  # ghcr.io requires a lowercase path; github.repository can contain
+  # uppercase (e.g. an org name), so this is normalized in the "image
+  # metadata" step below rather than assumed lowercase here.
+  IMAGE_BASE: ${{ github.repository }}/go-simulator
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: go-simulator
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-simulator/go.mod
+          cache-dependency-path: go-simulator/go.sum
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalize image name to lowercase
+        id: image
+        run: echo "name=$(echo '${{ env.IMAGE_BASE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags/labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}},prefix=go-simulator-v
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Pull requests build (to catch a broken Dockerfile/build early)
+      # but never push -- publishing only happens from main/tags.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: go-simulator
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

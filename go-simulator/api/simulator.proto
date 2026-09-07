@@ -1,0 +1,97 @@
+// Sample control-plane API between a Tango device server (owns the
+// Tango-facing bits: device properties, attribute subscriptions to CBF's
+// delay-poly emulator) and this Go simulator process (owns signal
+// generation + SPEAD/UDP sending). Mirrors simulator.py's StartScan/
+// StopScan/queue_depth surface, plus PushDelayUpdate to forward delay
+// polynomial updates the Tango side receives via CHANGE_EVENT
+// subscriptions (this process has no Tango access of its own).
+//
+// Prototype scope: tone + noise sources only, no pulsar (see the Go
+// prototype's README for why).
+syntax = "proto3";
+
+package simulator.v1;
+
+option go_package = "github.com/skao/station-beam-simulator-go/api/simulatorpb";
+
+service StationSimulator {
+  // Starts a scan. Fails if a scan is already running (call StopScan
+  // first) — matches simulator.py's StartScan.
+  rpc StartScan(StartScanRequest) returns (StartScanResponse);
+
+  // Stops the current scan, if any. Idempotent.
+  rpc StopScan(StopScanRequest) returns (StopScanResponse);
+
+  // Pushes a fresh delay polynomial for one named source. The caller
+  // (the Tango-facing side) is responsible for subscribing to CBF's
+  // delay-poly emulator attribute and forwarding every CHANGE_EVENT here
+  // — this process holds no Tango attribute subscriptions itself.
+  // source_id must match a tone source's source_id from the StartScan
+  // request that started the currently-running scan.
+  rpc PushDelayUpdate(PushDelayUpdateRequest) returns (PushDelayUpdateResponse);
+
+  // Point-in-time status — mirrors simulator.py's queue_depth attribute.
+  rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+}
+
+// Per ska-low-csp-delaymodel/1.0 (ADR-88 in ska-telmodel) — see
+// common.DelayPolynomial in the Python codebase.
+message DelayPolynomial {
+  int32 station_id = 1;
+  double start_validity_sec = 2;
+  double validity_period_sec = 3;
+  repeated double xypol_coeffs_ns = 4;
+  double ypol_offset_ns = 5;
+}
+
+// A tone source. source_id is this process's own handle for routing
+// PushDelayUpdate calls to the right DelayFeed — it never goes on the
+// wire to CBF.
+message ToneSourceConfig {
+  string source_id = 1;
+  double freq_hz = 2;
+  double amplitude = 3; // defaults to 1.0 if unset (0 is treated as unset)
+}
+
+message NoiseConfig {
+  double std = 1;
+  int64 seed = 2;
+}
+
+message StartScanRequest {
+  double obs_time_epoch_s = 1;
+  double scan_duration_s = 2;
+  int64 scan_id = 3;
+  int32 subarray_id = 4;
+  int32 beam_id = 5;
+  int32 num_channels = 6; // 0 means "use MaxNumChannels (384)"
+  repeated ToneSourceConfig tone_sources = 7;
+  NoiseConfig noise = 8; // omit entirely for no noise
+}
+
+message StartScanResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message StopScanRequest {}
+
+message StopScanResponse {
+  bool ok = 1;
+}
+
+message PushDelayUpdateRequest {
+  string source_id = 1;
+  DelayPolynomial polynomial = 2;
+}
+
+message PushDelayUpdateResponse {
+  bool ok = 1;
+}
+
+message GetStatusRequest {}
+
+message StatusResponse {
+  bool scan_running = 1;
+  int32 queue_depth = 2;
+}

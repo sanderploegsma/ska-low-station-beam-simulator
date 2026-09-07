@@ -1,0 +1,105 @@
+package common
+
+import "testing"
+
+func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex128) []complex128 {
+	chunk := make([]complex128, rows*numChannels)
+	for r := 0; r < rows; r++ {
+		for c := 0; c < numChannels; c++ {
+			chunk[r*numChannels+c] = valueFor(r, c)
+		}
+	}
+	return chunk
+}
+
+func TestHeapAccumulator_NoHeapUntilFull(t *testing.T) {
+	numChannels := 3
+	acc := NewHeapAccumulator(numChannels, 0, 1.0, nil)
+	chunk := makeChunk(numChannels, HeapLen-1, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
+	acc.Add("V", chunk)
+	acc.Add("H", chunk)
+	if heaps := acc.PopReadyHeaps(); len(heaps) != 0 {
+		t.Fatalf("expected no heaps before HeapLen rows are buffered, got %d", len(heaps))
+	}
+}
+
+func TestHeapAccumulator_EmitsOneHeapPerChannel(t *testing.T) {
+	numChannels := 4
+	acc := NewHeapAccumulator(numChannels, 100.0, 2.0, nil)
+
+	vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
+	hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(c), float64(r)) })
+	acc.Add("V", vChunk)
+	acc.Add("H", hChunk)
+
+	heaps := acc.PopReadyHeaps()
+	if len(heaps) != numChannels {
+		t.Fatalf("expected %d heaps (one per channel), got %d", numChannels, len(heaps))
+	}
+
+	seenChannels := map[int]bool{}
+	for _, h := range heaps {
+		seenChannels[h.ChannelID] = true
+		if len(h.VSamples) != HeapLen || len(h.HSamples) != HeapLen {
+			t.Fatalf("channel %d: sample slice length wrong: v=%d h=%d", h.ChannelID, len(h.VSamples), len(h.HSamples))
+		}
+		// obs_time + samples_consumed(0)/sample_rate(2.0) = 100.0
+		if h.HeapStartTime != 100.0 {
+			t.Fatalf("channel %d: HeapStartTime = %v, want 100.0", h.ChannelID, h.HeapStartTime)
+		}
+		// Spot-check a couple of samples landed in the right column.
+		if real(h.VSamples[5]) != 5 || imag(h.VSamples[5]) != float64(h.ChannelID) {
+			t.Fatalf("channel %d: VSamples[5] = %v, want (5+%di)", h.ChannelID, h.VSamples[5], h.ChannelID)
+		}
+	}
+	for ch := 0; ch < numChannels; ch++ {
+		if !seenChannels[ch] {
+			t.Fatalf("channel %d missing from emitted heaps", ch)
+		}
+	}
+}
+
+func TestHeapAccumulator_SecondHeapAdvancesStartTime(t *testing.T) {
+	numChannels := 1
+	sampleRate := 4.0
+	acc := NewHeapAccumulator(numChannels, 0.0, sampleRate, nil)
+
+	full := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return 0 })
+	acc.Add("V", full)
+	acc.Add("H", full)
+	acc.Add("V", full)
+	acc.Add("H", full)
+
+	heaps := acc.PopReadyHeaps()
+	if len(heaps) != 2 {
+		t.Fatalf("expected 2 heaps from 2*HeapLen buffered rows, got %d", len(heaps))
+	}
+	if heaps[0].HeapStartTime != 0.0 {
+		t.Fatalf("first heap HeapStartTime = %v, want 0.0", heaps[0].HeapStartTime)
+	}
+	wantSecond := float64(HeapLen) / sampleRate
+	if heaps[1].HeapStartTime != wantSecond {
+		t.Fatalf("second heap HeapStartTime = %v, want %v", heaps[1].HeapStartTime, wantSecond)
+	}
+}
+
+func TestHeapAccumulator_CustomChannelIDMap(t *testing.T) {
+	numChannels := 2
+	channelIDMap := []int{64, 72} // e.g. a station's first_channel_id offset
+	acc := NewHeapAccumulator(numChannels, 0, 1.0, channelIDMap)
+
+	full := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return 0 })
+	acc.Add("V", full)
+	acc.Add("H", full)
+
+	heaps := acc.PopReadyHeaps()
+	gotIDs := map[int]bool{}
+	for _, h := range heaps {
+		gotIDs[h.ChannelID] = true
+	}
+	for _, want := range channelIDMap {
+		if !gotIDs[want] {
+			t.Fatalf("expected a heap with ChannelID=%d (from channelIDMap), got IDs %v", want, gotIDs)
+		}
+	}
+}

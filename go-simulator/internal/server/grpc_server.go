@@ -1,0 +1,218 @@
+// Package server implements the gRPC control plane for the Go
+// simulator — the equivalent of simulator.py's StationSimulatorDevice,
+// minus the Tango-facing bits (device properties, attribute
+// subscriptions to CBF's delay-poly emulator), which are expected to
+// live on whatever process sits on the other side of this gRPC service
+// (see api/simulator.proto's doc comment for the intended split: a
+// Tango device server owns Tango, forwards delay updates here via
+// PushDelayUpdate, and this process owns signal generation + SPEAD/UDP
+// sending).
+package server
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/skao/station-beam-simulator-go/api/simulatorpb"
+	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/skao/station-beam-simulator-go/internal/spead"
+	"github.com/skao/station-beam-simulator-go/internal/synth"
+)
+
+// heapQueue is a bounded, non-blocking common.HeapSender backed by a
+// channel — the Go equivalent of Python's queue.Queue(maxsize=...) send
+// queue between the producer (ScanRunner) and the sender goroutine.
+type heapQueue struct {
+	ch chan *common.ChannelHeap
+}
+
+func newHeapQueue(size int) *heapQueue {
+	return &heapQueue{ch: make(chan *common.ChannelHeap, size)}
+}
+
+// Send implements common.HeapSender — non-blocking, returns false
+// (dropped) if the queue is full rather than blocking the producer.
+func (q *heapQueue) Send(heap *common.ChannelHeap) bool {
+	select {
+	case q.ch <- heap:
+		return true
+	default:
+		return false
+	}
+}
+
+// Server implements pb.StationSimulatorServer.
+type Server struct {
+	pb.UnimplementedStationSimulatorServer
+
+	destIP   string
+	destPort int
+
+	mu         sync.Mutex
+	stationCfg *common.StationConfig
+	scanRunner *common.ScanRunner
+	delayFeeds map[string]*common.DelayFeed
+
+	sendQueue *heapQueue
+	shutdown  chan struct{}
+}
+
+// NewServer constructs a Server for one station. stationID/substationID
+// identify this pod; destIP/destPort are the CBF SPEAD/UDP endpoint —
+// both static for the pod's lifetime, matching simulator.py's device
+// properties (subarray_id/beam_id/source_cfgs vary per scan instead, see
+// StartScan).
+func NewServer(stationID, substationID int32, destIP string, destPort int) *Server {
+	return &Server{
+		destIP:   destIP,
+		destPort: destPort,
+		stationCfg: &common.StationConfig{
+			StationID:    stationID,
+			SubstationID: substationID,
+		},
+		sendQueue: newHeapQueue(common.QueueMaxSize),
+		shutdown:  make(chan struct{}),
+	}
+}
+
+// Start dials the CBF SPEAD/UDP destination and starts the sender
+// goroutine (the equivalent of Python's sender_loop). Call once before
+// serving gRPC traffic.
+func (s *Server) Start() error {
+	conn, err := net.Dial("udp", net.JoinHostPort(s.destIP, fmt.Sprintf("%d", s.destPort)))
+	if err != nil {
+		return fmt.Errorf("dialing SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
+	}
+	packetizer := spead.NewSpsPacketizer(s.stationCfg, conn)
+	go s.senderLoop(packetizer)
+	return nil
+}
+
+// Stop stops any running scan and the sender goroutine.
+func (s *Server) Stop() {
+	s.mu.Lock()
+	if s.scanRunner != nil {
+		s.scanRunner.Stop(5 * time.Second)
+	}
+	s.mu.Unlock()
+	close(s.shutdown)
+}
+
+func (s *Server) senderLoop(packetizer *spead.SpsPacketizer) {
+	for {
+		select {
+		case <-s.shutdown:
+			return
+		case heap := <-s.sendQueue.ch:
+			if err := packetizer.SendChannelHeap(heap); err != nil {
+				log.Printf("failed to send heap ch=%d t=%.4f: %v", heap.ChannelID, heap.HeapStartTime, err)
+			}
+		}
+	}
+}
+
+// StartScan implements pb.StationSimulatorServer. Fails if a scan is
+// already running — call StopScan first, matching simulator.py.
+func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.StartScanResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.scanRunner != nil && s.scanRunner.IsRunning() {
+		return nil, status.Error(codes.FailedPrecondition, "scan already running -- call StopScan first")
+	}
+
+	s.stationCfg.SubarrayID = req.SubarrayId
+	s.stationCfg.BeamID = req.BeamId
+	s.stationCfg.ScanID = req.ScanId
+
+	// Fresh delay feeds per scan -- a source_id from a previous scan
+	// must not silently keep receiving updates meant for a different
+	// scan's source of the same name.
+	delayFeeds := make(map[string]*common.DelayFeed, len(req.ToneSources))
+	toneCfgs := make([]synth.ToneSourceConfig, 0, len(req.ToneSources))
+	for _, ts := range req.ToneSources {
+		if ts.SourceId == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "tone source with freq_hz=%v is missing required source_id", ts.FreqHz)
+		}
+		if _, dup := delayFeeds[ts.SourceId]; dup {
+			return nil, status.Errorf(codes.InvalidArgument, "duplicate tone source_id %q", ts.SourceId)
+		}
+		feed := common.NewDelayFeed(ts.SourceId)
+		delayFeeds[ts.SourceId] = feed
+		toneCfgs = append(toneCfgs, synth.ToneSourceConfig{
+			DelayFeed: feed,
+			FreqHz:    ts.FreqHz,
+			Amplitude: ts.Amplitude,
+		})
+	}
+
+	var noiseCfg *synth.NoiseConfig
+	if req.Noise != nil {
+		noiseCfg = &synth.NoiseConfig{Std: req.Noise.Std, Seed: req.Noise.Seed}
+	}
+
+	streamer, err := synth.NewDirectSynthesisStreamer(synth.StreamerConfig{
+		Station:     s.stationCfg,
+		ToneSources: toneCfgs,
+		ObsTimeRef:  req.ObsTimeEpochS,
+		Noise:       noiseCfg,
+		NumChannels: int(req.NumChannels),
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+
+	s.delayFeeds = delayFeeds
+	s.scanRunner = common.NewScanRunner(streamer, s.sendQueue, req.ObsTimeEpochS, req.ScanDurationS)
+	s.scanRunner.Start()
+
+	return &pb.StartScanResponse{Ok: true, Message: "scan started"}, nil
+}
+
+// StopScan implements pb.StationSimulatorServer. Idempotent.
+func (s *Server) StopScan(ctx context.Context, req *pb.StopScanRequest) (*pb.StopScanResponse, error) {
+	s.mu.Lock()
+	runner := s.scanRunner
+	s.mu.Unlock()
+	if runner != nil {
+		runner.Stop(5 * time.Second)
+	}
+	return &pb.StopScanResponse{Ok: true}, nil
+}
+
+// PushDelayUpdate implements pb.StationSimulatorServer, forwarding a
+// freshly-received delay polynomial to the named source's DelayFeed.
+func (s *Server) PushDelayUpdate(ctx context.Context, req *pb.PushDelayUpdateRequest) (*pb.PushDelayUpdateResponse, error) {
+	s.mu.Lock()
+	feed, ok := s.delayFeeds[req.SourceId]
+	s.mu.Unlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "no source with source_id=%q in the current scan", req.SourceId)
+	}
+	if req.Polynomial == nil {
+		return nil, status.Error(codes.InvalidArgument, "polynomial is required")
+	}
+	feed.Update(&common.DelayPolynomial{
+		StationID:         req.Polynomial.StationId,
+		StartValiditySec:  req.Polynomial.StartValiditySec,
+		ValidityPeriodSec: req.Polynomial.ValidityPeriodSec,
+		XYPolCoeffsNs:     req.Polynomial.XypolCoeffsNs,
+		YPolOffsetNs:      req.Polynomial.YpolOffsetNs,
+	})
+	return &pb.PushDelayUpdateResponse{Ok: true}, nil
+}
+
+// GetStatus implements pb.StationSimulatorServer.
+func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.StatusResponse, error) {
+	s.mu.Lock()
+	running := s.scanRunner != nil && s.scanRunner.IsRunning()
+	s.mu.Unlock()
+	return &pb.StatusResponse{ScanRunning: running, QueueDepth: int32(len(s.sendQueue.ch))}, nil
+}
