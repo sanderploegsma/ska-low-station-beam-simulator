@@ -45,7 +45,7 @@ func main() {
 	noiseStd := flag.Float64("noise-std", 0.05, "noise standard deviation (both real and imaginary parts)")
 	noiseSeed := flag.Int64("noise-seed", 0, "noise seed (default: same as -station-id, unless explicitly set)")
 
-	numSenders := flag.Int("sender-goroutines", spead.DefaultNumSenders, "number of parallel UDP sender sockets/goroutines for outbound SPEAD/UDP")
+	numSenders := flag.Int("sender-goroutines", 0, "number of parallel UDP sender sockets/goroutines for outbound SPEAD/UDP (0: auto -- scales with -num-channels, spead.DefaultNumSendersForChannels)")
 	sendBatchSize := flag.Int("send-batch-size", spead.DefaultSendBatchSize, "max heaps per batched UDP send (uses sendmmsg on Linux)")
 	udpSendBufferBytes := flag.Int("udp-send-buffer-bytes", spead.DefaultUDPSendBufferBytes, "SO_SNDBUF size for each outbound SPEAD/UDP socket, in bytes (0: leave at OS default)")
 
@@ -70,6 +70,10 @@ func main() {
 	seed := *noiseSeed
 	if !isFlagSet("noise-seed") {
 		seed = int64(*stationID)
+	}
+
+	if !isFlagSet("sender-goroutines") {
+		*numSenders = spead.DefaultNumSendersForChannels(*numChannels)
 	}
 
 	stationCfg := &common.StationConfig{

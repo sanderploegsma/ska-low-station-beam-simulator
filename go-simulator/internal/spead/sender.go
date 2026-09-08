@@ -29,7 +29,38 @@ const (
 	// project's per-tick heap bursts; 8MiB gives real headroom without
 	// being a meaningful memory cost per pod.
 	DefaultUDPSendBufferBytes = 8 << 20
+
+	// fullBandNumSenders: sender goroutines confirmed on real 100G
+	// SR-IOV target hardware to keep up at common.MaxNumChannels (384,
+	// the full band) -- see DefaultNumSendersForChannels. This replaced
+	// a flat DefaultNumSenders=4 default that the same real-hardware
+	// testing outgrew twice in one session (4, then 8) once the
+	// producer-side fixes elsewhere in this package's history (see
+	// HeapAccumulator's doc comment) stopped being the bottleneck: once
+	// generation got fast enough, the send side needed to absorb a much
+	// higher sustained throughput than a fixed small sender count could
+	// drain.
+	fullBandNumSenders = 16
 )
+
+// DefaultNumSendersForChannels scales the sender-goroutine count with
+// numChannels, using fullBandNumSenders at common.MaxNumChannels (384)
+// as the confirmed real-hardware baseline and proportionally fewer for
+// a narrower configuration -- a station running fewer channels sends
+// proportionally less data, so needs proportionally fewer sockets
+// draining it. Not used by every caller: cmd/simulator's gRPC server
+// creates its SenderPool once at process Start(), before any scan (and
+// therefore its num_channels) is known, so it still uses the flat
+// DefaultNumSenders unless a caller overrides it explicitly via
+// WithNumSenders -- only cmd/noise-stream, which takes -num-channels
+// upfront on the command line, can compute this at pool-creation time.
+func DefaultNumSendersForChannels(numChannels int) int {
+	n := (fullBandNumSenders*numChannels + common.MaxNumChannels - 1) / common.MaxNumChannels
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
 
 // BatchSender is anything that can send multiple already-encoded heap
 // payloads in one call — a batched UDP socket write in production, or a
