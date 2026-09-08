@@ -247,7 +247,24 @@ func (s *Server) PushDelayUpdate(ctx context.Context, req *pb.PushDelayUpdateReq
 // GetStatus implements pb.StationSimulatorServer.
 func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.StatusResponse, error) {
 	s.mu.Lock()
-	running := s.scanRunner != nil && s.scanRunner.IsRunning()
+	runner := s.scanRunner
+	running := runner != nil && runner.IsRunning()
 	s.mu.Unlock()
-	return &pb.StatusResponse{ScanRunning: running, QueueDepth: int32(s.sendQueue.Len())}, nil
+
+	// A finished/never-started runner reports 0 for both -- there is no
+	// "last tick" to report once nothing is running, matching
+	// DriftSeconds/TickNumber's own pre-first-tick zero value.
+	var drift float64
+	var tickNumber int64
+	if running {
+		drift = runner.DriftSeconds()
+		tickNumber = runner.TickNumber()
+	}
+
+	return &pb.StatusResponse{
+		ScanRunning:  running,
+		QueueDepth:   int32(s.sendQueue.Len()),
+		DriftSeconds: drift,
+		TickNumber:   tickNumber,
+	}, nil
 }

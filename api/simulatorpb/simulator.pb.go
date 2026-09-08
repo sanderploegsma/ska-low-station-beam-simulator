@@ -590,9 +590,19 @@ func (*GetStatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type StatusResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ScanRunning   bool                   `protobuf:"varint,1,opt,name=scan_running,json=scanRunning,proto3" json:"scan_running,omitempty"`
-	QueueDepth    int32                  `protobuf:"varint,2,opt,name=queue_depth,json=queueDepth,proto3" json:"queue_depth,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	ScanRunning bool                   `protobuf:"varint,1,opt,name=scan_running,json=scanRunning,proto3" json:"scan_running,omitempty"`
+	QueueDepth  int32                  `protobuf:"varint,2,opt,name=queue_depth,json=queueDepth,proto3" json:"queue_depth,omitempty"`
+	// Pacing drift at the most recent tick: wall-clock time minus that
+	// tick's target time, in seconds. Positive means the producer is
+	// running behind its real-time schedule (see ScanRunner's
+	// OverrunTolerance-gated log line, which this mirrors as a queryable
+	// value); zero or negative means on-pace or ahead. 0 if no scan has
+	// produced a tick yet.
+	DriftSeconds float64 `protobuf:"fixed64,3,opt,name=drift_seconds,json=driftSeconds,proto3" json:"drift_seconds,omitempty"`
+	// The most recently produced tick's index (0-based) within the
+	// current scan. 0 if no scan has produced a tick yet.
+	TickNumber    int64 `protobuf:"varint,4,opt,name=tick_number,json=tickNumber,proto3" json:"tick_number,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -641,6 +651,20 @@ func (x *StatusResponse) GetQueueDepth() int32 {
 	return 0
 }
 
+func (x *StatusResponse) GetDriftSeconds() float64 {
+	if x != nil {
+		return x.DriftSeconds
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetTickNumber() int64 {
+	if x != nil {
+		return x.TickNumber
+	}
+	return 0
+}
+
 var File_simulator_proto protoreflect.FileDescriptor
 
 const file_simulator_proto_rawDesc = "" +
@@ -683,11 +707,14 @@ const file_simulator_proto_rawDesc = "" +
 	"polynomial\")\n" +
 	"\x17PushDelayUpdateResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x12\n" +
-	"\x10GetStatusRequest\"T\n" +
+	"\x10GetStatusRequest\"\x9a\x01\n" +
 	"\x0eStatusResponse\x12!\n" +
 	"\fscan_running\x18\x01 \x01(\bR\vscanRunning\x12\x1f\n" +
 	"\vqueue_depth\x18\x02 \x01(\x05R\n" +
-	"queueDepth2\xd6\x02\n" +
+	"queueDepth\x12#\n" +
+	"\rdrift_seconds\x18\x03 \x01(\x01R\fdriftSeconds\x12\x1f\n" +
+	"\vtick_number\x18\x04 \x01(\x03R\n" +
+	"tickNumber2\xd6\x02\n" +
 	"\x10StationSimulator\x12L\n" +
 	"\tStartScan\x12\x1e.simulator.v1.StartScanRequest\x1a\x1f.simulator.v1.StartScanResponse\x12I\n" +
 	"\bStopScan\x12\x1d.simulator.v1.StopScanRequest\x1a\x1e.simulator.v1.StopScanResponse\x12^\n" +

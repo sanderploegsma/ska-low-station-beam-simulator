@@ -1,132 +1,119 @@
 """
 Tango device server entry point for the SPS station-beam simulator.
 
-The actual signal-generation logic lives entirely in ``direct_synthesis.py``
-(``DirectSynthesisStreamer``) — tone, per-pol station noise (a
-pre-generated tile bank), and pulsed/pulsar sources are all handled by
-direct, per-channel synthesis; there is no wideband+FFT fallback path.
-Shared plumbing (delay polynomial, heap accumulation, SPEAD
-packetization, the producer/sender loop) lives in ``common.py``, which
-``direct_synthesis.py`` does not depend on beyond that shared plumbing.
+This device no longer generates SPEAD/UDP content itself. Signal
+generation, heap accumulation, and SPEAD/UDP sending have moved to a
+separate Go process (see the repo root's ``cmd/simulator``,
+``api/simulator.proto``) that this device drives over gRPC — this
+module now owns only the Tango-facing bits: device properties,
+StartScan/StopScan command handling, and subscribing to CBF's
+delay-poly emulator's CHANGE_EVENTs and forwarding them on via
+PushDelayUpdate. This is exactly the split ``api/simulator.proto``'s own
+doc comment describes (a Tango device server owns Tango, this Go
+process owns signal generation + SPEAD/UDP sending, with no Tango access
+of its own).
 
-PER-SCAN CONFIG: ``subarray_id``, ``beam_id``, and ``source_cfgs`` are no
-longer device properties — they vary per scan (a station can be
-reassigned between subarrays/beams across scans), so they're passed
-dynamically as fields of the JSON object given to ``StartScan``. Only
-``station_id``/``substation_id`` (identify the pod itself) and
-``dest_ip``/``dest_port`` (the CBF endpoint) remain static device
-properties.
+PROTOTYPE SCOPE, inherited from the Go side (see ``api/simulator.proto``):
+only ``'tone'`` ``source_cfgs`` entries (plus noise) are supported
+through this gRPC path — a ``'pulsed'`` (pulsar) entry raises
+immediately from ``build_tone_source_request``, rather than silently
+doing nothing or falling back to a local Python generation path (there
+is no local generation path left in this device at all).
+``direct_synthesis.py``'s pulsar support is untouched and still directly
+usable (``benchmark_direct_synthesis.py``, ``generate_test_pcap.py``,
+``tests/test_direct_synthesis.py``) — only this Tango-facing device no
+longer drives it.
 
-PER-SOURCE DELAY: ``source_cfgs`` (in the ``StartScan`` JSON argument)
-describes the tones/pulsars this station simulates. EVERY entry MUST name a
-``delay_attr_uri`` — a Tango attribute on CBF's delay-poly emulator that
-publishes CHANGE_EVENTs for that one source's direction (RA/Dec, Az/El,
-or static; the emulator can expose several such directions, each on its
-own attribute). There is deliberately no default delay for a source
-missing one: ``DirectSynthesisStreamer`` refuses to construct a source
-with no real delay path, since silently applying zero delay would
-produce content that's trivially "perfectly aligned" and could mask a
-real CBF delay-tracking bug rather than exercise it. ``StartScan``
-subscribes to each named attribute and feeds its updates into a
-``common.DelayFeed``, which ``DirectSynthesisStreamer`` then queries per
-source, per tick, instead of every source sharing one station-level
-delay.
+PER-SCAN CONFIG: unchanged from before — ``subarray_id``, ``beam_id``,
+and ``source_cfgs`` arrive per ``StartScan`` call (a station can be
+reassigned between subarrays/beams across scans), not as device
+properties. ``station_id``/``substation_id`` remain static device
+properties, used to tag delay-poly pushes with this station's ID (see
+``parse_delay_polynomial_from_attr_value``) — they are NOT forwarded to
+the Go process over gRPC, which gets its own station_id/substation_id
+independently at deploy time (its own CLI flags, see
+``cmd/simulator/main.go``) and must already agree with this device's
+values. ``dest_ip``/``dest_port`` are gone from this device entirely:
+the Go process owns the CBF SPEAD/UDP destination now (also its own CLI
+flags), not this device.
 
-UNVERIFIED, same caveat as the rest of this file's Tango-facing bits: the
-exact attribute payload shape (see
-``common.parse_delay_polynomial_from_attr_value``) and whether
+PER-SOURCE DELAY: unchanged in spirit — every ``'tone'`` ``source_cfgs``
+entry MUST name a ``delay_attr_uri``, a Tango attribute on CBF's
+delay-poly emulator publishing CHANGE_EVENTs for that source's
+direction. This device still owns the ``AttributeProxy`` subscription
+(Go has no Tango access of its own), but instead of feeding a local
+``common.DelayFeed`` consumed by a local streamer, a pushed update is
+now translated into a ``DelayPolynomial`` protobuf message and forwarded
+via ``PushDelayUpdate``, keyed by ``source_id``. This device reuses each
+source's own ``delay_attr_uri`` AS its ``source_id`` (already required,
+already unique per source by construction — attempting to reuse one
+``delay_attr_uri`` across two sources in the same scan is rejected by
+the gRPC server as a duplicate ``source_id``), so no new JSON field is
+needed for it.
+
+UNVERIFIED, same caveat as before: the exact attribute payload shape
+(see ``common.parse_delay_polynomial_from_attr_value``) and whether
 ``AttributeProxy`` delivers an immediate CHANGE_EVENT with the
-attribute's current value on subscribe (rather than only on the next
-actual change) both depend on how the real delay-poly emulator's
-attributes are configured — confirm against it once available. Until a
-first event arrives for a source, its ``DelayFeed`` applies zero delay
-and logs a warning (see ``common.DelayFeed``) rather than blocking scan
-start.
+attribute's current value on subscribe both depend on how the real
+delay-poly emulator is configured — confirm against it once available.
 """
 
 from __future__ import annotations
 
 import json
-import queue
-import threading
 
+import grpc
 from tango import AttributeProxy, DevState, EventType
 from tango.server import Device, attribute, command, device_property, run
 
 from ska_low_station_beam_simulator.common import (
-    QUEUE_MAXSIZE,
-    ChannelHeap,
-    DelayFeed,
-    ScanRunner,
-    StationConfig,
     log,
     parse_delay_polynomial_from_attr_value,
-    sender_loop,
 )
-from ska_low_station_beam_simulator.direct_synthesis import (
-    DirectSynthesisStreamer,
-    NoiseConfig,
-    PulsarByNameConfig,
-    PulsarByParamsConfig,
-    SourceConfig,
-    ToneSourceConfig,
+from ska_low_station_beam_simulator.simulatorpb import (
+    simulator_pb2,
+    simulator_pb2_grpc,
 )
-from ska_low_station_beam_simulator.spead import SpsPacketizer
 
 
-def build_source_cfg(spec: dict, delay_feed: DelayFeed) -> SourceConfig:
-    """Turns one ``source_cfgs`` JSON entry (plus its already-resolved
-    ``DelayFeed``) into the typed config ``DirectSynthesisStreamer``
-    expects -- the JSON-boundary equivalent of the type choice
-    DirectSynthesisStreamer's direct Python callers make themselves (see
-    direct_synthesis.py's SOURCE/NOISE CONFIG TYPES section). Kept as a
-    standalone function, not inlined into ``StartScan``, so this JSON
-    dispatch/validation logic is unit-testable without a live Tango
-    device -- this codebase otherwise doesn't unit test the Tango device
-    server layer at all (see CLAUDE.md's Setup section).
+def build_tone_source_request(spec: dict) -> simulator_pb2.ToneSourceConfig:
+    """Turns one ``'tone'`` ``source_cfgs`` JSON entry into the
+    ``ToneSourceConfig`` protobuf message ``StartScan`` sends to the Go
+    gRPC simulator — the JSON-boundary validation this codebase keeps
+    doing at the point untyped data enters the system (see CLAUDE.md's
+    "source_cfgs/noise_cfg are typed dataclasses, not dicts" section for
+    the same pattern applied to the since-replaced local-generation
+    path). Kept standalone, not inlined into ``StartScan``, so it's
+    unit-testable without a live Tango device or a live gRPC server.
 
-    :param spec: one raw ``source_cfgs`` entry (``'delay_attr_uri'``
-        already consumed by the caller to build ``delay_feed`` -- an
-        extra key here is harmless, ignored via ``dict`` unpacking).
-    :param delay_feed: this source's already-subscribed ``DelayFeed``.
-    :returns: a ``ToneSourceConfig``, ``PulsarByNameConfig``, or
-        ``PulsarByParamsConfig``.
-    :raises ValueError: for an unsupported ``kind``, or an ambiguous/
-        incomplete pulsed source (both/neither of ``pulsar_name`` and
-        ``period_s``/``width_s``/``dm_pc_cm3``).
+    :param spec: one raw ``source_cfgs`` entry.
+    :returns: a ``ToneSourceConfig`` with ``source_id`` set to
+        ``spec['delay_attr_uri']`` (consumed here, not forwarded as a
+        stray field — the caller subscribes to that same URI, see
+        ``StartScan``/``_make_delay_feed``).
+    :raises ValueError: if ``spec['kind']`` isn't ``'tone'`` (the gRPC
+        backend doesn't support pulsed/pulsar sources yet — see module
+        docstring) or ``'delay_attr_uri'`` is missing (there is no
+        default delay).
     """
-    cfg = dict(spec)
-    cfg.pop("delay_attr_uri", None)
-    kind = cfg.pop("kind", None)
-    if kind == "tone":
-        return ToneSourceConfig(delay_feed=delay_feed, **cfg)
-    if kind == "pulsed":
-        param_keys = ("period_s", "width_s", "dm_pc_cm3")
-        has_name = "pulsar_name" in cfg
-        present_params = [k for k in param_keys if k in cfg]
-        if has_name and present_params:
-            raise ValueError(
-                f"pulsed source_cfgs entry has both 'pulsar_name' and "
-                f"{present_params} -- specify one or the other, not both: "
-                f"'pulsar_name' loads a pre-generated catalog entry, "
-                f"'period_s'/'width_s'/'dm_pc_cm3' builds a custom "
-                f"template at construction."
-            )
-        if has_name:
-            return PulsarByNameConfig(delay_feed=delay_feed, **cfg)
-        if len(present_params) == len(param_keys):
-            return PulsarByParamsConfig(delay_feed=delay_feed, **cfg)
-        missing = [k for k in param_keys if k not in cfg]
+    kind = spec.get("kind")
+    if kind != "tone":
         raise ValueError(
-            f"pulsed source_cfgs entry needs either 'pulsar_name' (load a "
-            f"pre-generated catalog entry) or all of "
-            f"'period_s'/'width_s'/'dm_pc_cm3' (build a custom template "
-            f"at construction) -- got neither 'pulsar_name' nor {missing}."
+            f"source_cfgs entry kind={kind!r} is not supported by the "
+            f"gRPC simulator backend -- only 'tone' sources (plus noise) "
+            f"are implemented there so far (see api/simulator.proto's "
+            f"doc comment)."
         )
-    raise ValueError(
-        f"source_cfgs entry kind={kind!r} is not supported -- must be "
-        f"'tone' or 'pulsed'."
-    )
+    cfg = dict(spec)
+    cfg.pop("kind")
+    attr_uri = cfg.pop("delay_attr_uri", None)
+    if not attr_uri:
+        raise ValueError(
+            "source_cfgs entry is missing required 'delay_attr_uri' -- "
+            "every source must name a delay-poly attribute to subscribe "
+            "to, there is no default delay (see module docstring)."
+        )
+    return simulator_pb2.ToneSourceConfig(source_id=attr_uri, **cfg)
 
 
 # ============================================================
@@ -137,52 +124,36 @@ def build_source_cfg(spec: dict, delay_feed: DelayFeed) -> SourceConfig:
 class StationSimulatorDevice(Device):
     station_id = device_property(dtype=int, default_value=1)
     substation_id = device_property(dtype=int, default_value=0)
-    dest_ip = device_property(dtype=str, default_value="127.0.0.1")
-    dest_port = device_property(dtype=int, default_value=8000)
+    # host:port of the Go gRPC simulator this device drives -- see
+    # cmd/simulator's -listen flag (default matches here). Must already
+    # be running with the SAME station_id/substation_id and the real CBF
+    # dest_ip/dest_port (its own CLI flags now, not device properties on
+    # this side -- see module docstring).
+    grpc_target = device_property(dtype=str, default_value="localhost:50051")
 
     def init_device(self):
         super().init_device()
-        self._send_queue: queue.Queue[ChannelHeap] = queue.Queue(maxsize=QUEUE_MAXSIZE)
-        self._shutdown_event = threading.Event()
-        self._scan_runner: ScanRunner | None = None
         self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
-
-        # subarray_id/beam_id are unknown until the first StartScan --
-        # placeholder 0s here, overwritten (on the same StationConfig
-        # instance, which SpsPacketizer holds a live reference to) each
-        # StartScan call.
-        self._station_cfg = StationConfig(
-            station_id=self.station_id,
-            substation_id=self.substation_id,
-            subarray_id=0,
-            beam_id=0,
-        )
-        self._packetizer = SpsPacketizer(
-            self._station_cfg, self.dest_ip, self.dest_port
-        )
-
-        self._sender_thread = threading.Thread(
-            target=sender_loop,
-            args=(self._send_queue, self._packetizer, self._shutdown_event),
-            daemon=True,
-        )
-        self._sender_thread.start()
+        # insecure_channel doesn't dial until the first RPC -- a
+        # misconfigured/unreachable grpc_target only surfaces once
+        # StartScan (or an attribute read) actually calls out, not here.
+        self._channel = grpc.insecure_channel(self.grpc_target)
+        self._stub = simulator_pb2_grpc.StationSimulatorStub(self._channel)
         self.set_state(DevState.ON)
 
-    def _make_delay_feed(self, attr_uri: str) -> DelayFeed:
-        """Subscribes to ``attr_uri``'s CHANGE_EVENTs and returns a
-        ``DelayFeed`` that always reflects the most recently pushed
-        value. The subscription itself is torn down in
-        ``_teardown_delay_subscriptions`` (called from ``StartScan``
-        before setting up the next scan's subscriptions, and from
-        ``StopScan``/``delete_device``) — never left dangling across
-        scans.
+    def _make_delay_feed(self, attr_uri: str) -> None:
+        """Subscribes to ``attr_uri``'s CHANGE_EVENTs and forwards every
+        pushed value to the gRPC simulator via ``PushDelayUpdate``, keyed
+        by ``source_id=attr_uri`` (see module docstring for why the
+        attribute URI doubles as the source_id). The subscription itself
+        is torn down in ``_teardown_delay_subscriptions`` (called from
+        ``StartScan`` before setting up the next scan's subscriptions,
+        and from ``StopScan``/``delete_device``) — never left dangling
+        across scans.
 
-        :param attr_uri: the Tango attribute to subscribe to.
-        :returns: a ``DelayFeed`` that ``DirectSynthesisStreamer`` can
-            query for this source's current delay polynomial.
+        :param attr_uri: the Tango attribute to subscribe to; also this
+            source's gRPC ``source_id``.
         """
-        feed = DelayFeed(name=attr_uri)
         proxy = AttributeProxy(attr_uri)
 
         def _on_event(event):
@@ -200,11 +171,27 @@ class StationSimulatorDevice(Device):
             except Exception:  # noqa: BLE001
                 log.exception("failed to parse delay polynomial pushed by %s", attr_uri)
                 return
-            feed.update(poly)
+            try:
+                self._stub.PushDelayUpdate(
+                    simulator_pb2.PushDelayUpdateRequest(
+                        source_id=attr_uri,
+                        polynomial=simulator_pb2.DelayPolynomial(
+                            station_id=poly.station_id,
+                            start_validity_sec=poly.start_validity_sec,
+                            validity_period_sec=poly.validity_period_sec,
+                            xypol_coeffs_ns=poly.xypol_coeffs_ns,
+                            ypol_offset_ns=poly.ypol_offset_ns,
+                        ),
+                    )
+                )
+            except grpc.RpcError:
+                log.exception(
+                    "failed to forward delay-poly update for %s to the gRPC simulator",
+                    attr_uri,
+                )
 
         event_id = proxy.subscribe_event(EventType.CHANGE_EVENT, _on_event)
         self._delay_subscriptions.append((proxy, event_id))
-        return feed
 
     def _teardown_delay_subscriptions(self):
         for proxy, event_id in self._delay_subscriptions:
@@ -214,86 +201,95 @@ class StationSimulatorDevice(Device):
                 log.exception("failed to unsubscribe from a delay-poly attribute")
         self._delay_subscriptions = []
 
+    def _get_status(self) -> simulator_pb2.StatusResponse:
+        return self._stub.GetStatus(simulator_pb2.GetStatusRequest())
+
     @command(
         dtype_in=str,
         doc_in=(
             "JSON object: {obs_time_epoch_s, scan_duration_s, scan_id, "
             "subarray_id, beam_id, source_cfgs}. source_cfgs is a JSON "
-            "list (see direct_synthesis.DirectSynthesisStreamer) -- EVERY "
-            "entry MUST include 'delay_attr_uri' naming a Tango attribute "
-            "on CBF's delay-poly emulator to subscribe for that source's "
-            "own delay polynomial (there is no default delay -- see "
-            "module docstring). An empty list means no tone/pulsar "
-            "sources at all for this scan (noise, if noise_cfg is set, "
-            "still plays). A 'pulsed' entry may give either "
-            "'pulsar_name' (loads a pre-generated catalog entry -- fast "
-            "startup, fixed parameters, see pulsar_catalog.py) or "
-            "'period_s'/'width_s'/'dm_pc_cm3' (builds a custom template "
-            "at construction -- arbitrary parameters, slower startup), "
-            "never both."
+            "list -- EVERY entry MUST include 'delay_attr_uri' naming a "
+            "Tango attribute on CBF's delay-poly emulator to subscribe "
+            "for that source's own delay polynomial (there is no "
+            "default delay -- see module docstring), and MUST have "
+            "kind='tone' (the gRPC simulator backend doesn't support "
+            "'pulsed' sources yet). An empty list means no tone sources "
+            "at all for this scan (noise still plays)."
         ),
     )
     def StartScan(self, args_json):
         args = json.loads(args_json)
-        obs_time = args["obs_time_epoch_s"]
-        scan_duration_s = args["scan_duration_s"]
-        scan_id = args["scan_id"]
-        if self._scan_runner is not None and self._scan_runner.thread.is_alive():
+
+        # Checked up front, before touching any subscription, so a
+        # rejected StartScan (scan already running) never tears down the
+        # ACTUAL running scan's delay subscriptions -- see StartScan's
+        # gRPC-error handling below for the remaining (pre-existing,
+        # equally non-atomic) check-then-act race with a concurrent
+        # StartScan call, which the Go server's own FailedPrecondition
+        # check is the real backstop for.
+        try:
+            already_running = self._get_status().scan_running
+        except grpc.RpcError as e:
+            raise RuntimeError(f"gRPC GetStatus failed: {e.details()}") from e
+        if already_running:
             raise RuntimeError("scan already running — call StopScan first")
 
-        self._station_cfg.subarray_id = int(args["subarray_id"])
-        self._station_cfg.beam_id = int(args["beam_id"])
-        self._station_cfg.scan_id = int(scan_id)
-
         source_specs = args.get("source_cfgs", [])
-        noise_cfg = NoiseConfig(std=0.05, seed=self.station_id)
-
         self._teardown_delay_subscriptions()
-        source_cfgs: list[SourceConfig] = []
+        tone_sources = []
         for spec in source_specs:
-            attr_uri = spec.get("delay_attr_uri")
-            if not attr_uri:
-                raise ValueError(
-                    f"source_cfgs entry kind={spec.get('kind')!r} is "
-                    f"missing required 'delay_attr_uri' — every source must "
-                    f"name a delay-poly attribute to subscribe to, there is "
-                    f"no default delay (see module docstring)."
-                )
-            delay_feed = self._make_delay_feed(attr_uri)
-            source_cfgs.append(build_source_cfg(spec, delay_feed))
+            request = build_tone_source_request(spec)
+            self._make_delay_feed(request.source_id)
+            tone_sources.append(request)
 
-        streamer = DirectSynthesisStreamer(
-            station=self._station_cfg,
-            source_cfgs=source_cfgs,
-            noise_cfg=noise_cfg,
-            obs_time_ref=obs_time,
+        scan_request = simulator_pb2.StartScanRequest(
+            obs_time_epoch_s=args["obs_time_epoch_s"],
+            scan_duration_s=args["scan_duration_s"],
+            scan_id=int(args["scan_id"]),
+            subarray_id=int(args["subarray_id"]),
+            beam_id=int(args["beam_id"]),
+            tone_sources=tone_sources,
+            noise=simulator_pb2.NoiseConfig(std=0.05, seed=self.station_id),
         )
-        self._scan_runner = ScanRunner(
-            streamer=streamer,
-            send_queue=self._send_queue,
-            obs_time=obs_time,
-            scan_duration_s=scan_duration_s,
-        )
-        self._scan_runner.start()
+        try:
+            response = self._stub.StartScan(scan_request)
+        except grpc.RpcError as e:
+            self._teardown_delay_subscriptions()
+            raise RuntimeError(f"gRPC StartScan failed: {e.details()}") from e
+        if not response.ok:
+            self._teardown_delay_subscriptions()
+            raise RuntimeError(f"gRPC StartScan rejected: {response.message}")
         self.set_state(DevState.RUNNING)
 
     @command
     def StopScan(self):
-        if self._scan_runner is not None:
-            self._scan_runner.stop()
+        try:
+            self._stub.StopScan(simulator_pb2.StopScanRequest())
+        except grpc.RpcError:
+            log.exception("gRPC StopScan failed")
         self._teardown_delay_subscriptions()
         self.set_state(DevState.ON)
 
     @attribute(dtype=int)
     def queue_depth(self):
-        return self._send_queue.qsize()
+        return self._get_status().queue_depth
+
+    @attribute(dtype=float)
+    def drift_seconds(self):
+        return self._get_status().drift_seconds
+
+    @attribute(dtype=int)
+    def tick_number(self):
+        return self._get_status().tick_number
 
     def delete_device(self):
-        if self._scan_runner is not None:
-            self._scan_runner.stop()
+        try:
+            self._stub.StopScan(simulator_pb2.StopScanRequest())
+        except grpc.RpcError:
+            log.exception("gRPC StopScan failed during delete_device")
         self._teardown_delay_subscriptions()
-        self._shutdown_event.set()
-        self._sender_thread.join(timeout=5.0)
+        self._channel.close()
         super().delete_device()
 
 

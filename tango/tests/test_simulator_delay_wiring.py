@@ -5,10 +5,15 @@ Doesn't stand up a real Tango device server (this codebase doesn't unit
 test that layer anywhere else either — see CLAUDE.md's Setup section:
 pytango degrades ``simulator.py`` to stub classes if unavailable, but
 ``StationSimulatorDevice`` itself still isn't deployable without a live
-Tango context). Instead, ``AttributeProxy``/``EventType`` are
-monkeypatched with fakes so the subscribe/unsubscribe pairing,
-event-error handling, and parse-failure handling can be exercised
-directly against a lightweight stand-in object.
+Tango context) or a real gRPC server. Instead, ``AttributeProxy``/
+``EventType`` are monkeypatched with fakes so the subscribe/unsubscribe
+pairing and event-handling can be exercised directly against a
+lightweight stand-in object, and ``dev._stub`` is a fake stub recording
+every ``PushDelayUpdate`` call it receives -- the observable effect
+``_make_delay_feed`` is now responsible for (it used to update a local
+``DelayFeed`` directly; that state now lives entirely in the Go gRPC
+process, so a pushed update is verified by what got forwarded to the
+stub instead of by reading a local feed).
 """
 
 import types
@@ -46,6 +51,18 @@ class _FakeAttributeProxy:
         self.subscriptions.pop(event_id, None)
 
 
+class _FakeStub:
+    """Records every ``PushDelayUpdate`` request it receives -- stands
+    in for ``simulator_pb2_grpc.StationSimulatorStub`` without a live
+    gRPC server."""
+
+    def __init__(self):
+        self.pushed = []
+
+    def PushDelayUpdate(self, request):
+        self.pushed.append(request)
+
+
 @pytest.fixture(autouse=True)
 def _fake_attribute_proxy(monkeypatch):
     _FakeAttributeProxy.instances = []
@@ -56,12 +73,13 @@ def _fake_attribute_proxy(monkeypatch):
 
 
 def _fake_device():
-    """A bare stand-in with just the attributes/state
-    _make_delay_feed/_teardown_delay_subscriptions actually touch —
-    avoids needing a live Tango device server context."""
+    """A bare stand-in with just the attributes ``_make_delay_feed``/
+    ``_teardown_delay_subscriptions`` actually touch -- avoids needing a
+    live Tango device server context or a live gRPC channel."""
     dev = types.SimpleNamespace()
     dev.station_id = 1
     dev._delay_subscriptions = []
+    dev._stub = _FakeStub()
     return dev
 
 
@@ -71,65 +89,58 @@ VALID_PAYLOAD = (
 )
 
 
-def test_make_delay_feed_subscribes_and_applies_pushed_value():
+def test_make_delay_feed_subscribes_and_forwards_pushed_value():
     """Confirms the core subscription wiring works end to end:
     _make_delay_feed must actually subscribe to the named Tango
-    attribute and, when a CHANGE_EVENT delivers a value, apply it to the
-    returned DelayFeed -- the mechanism StartScan relies on to get real
-    delay polynomials into a running streamer."""
+    attribute and, when a CHANGE_EVENT delivers a value, forward it to
+    the gRPC stub as a PushDelayUpdate request keyed by source_id=
+    attr_uri -- the mechanism StartScan relies on to get real delay
+    polynomials into the Go simulator process."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(
-        dev, "sys/delaypoly/1/direction0"
-    )
+    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
 
     assert len(dev._delay_subscriptions) == 1
     proxy, event_id = dev._delay_subscriptions[0]
     assert proxy.attr_uri == "sys/delaypoly/1/direction0"
 
     proxy.subscriptions[event_id](_FakeEvent(value=VALID_PAYLOAD))
-    poly = feed.get(100.0)
-    assert poly.xypol_coeffs_ns == [750.0]
-    assert poly.ypol_offset_ns == 2.0
-    assert poly.station_id == dev.station_id
+
+    assert len(dev._stub.pushed) == 1
+    request = dev._stub.pushed[0]
+    assert request.source_id == "sys/delaypoly/1/direction0"
+    assert list(request.polynomial.xypol_coeffs_ns) == [750.0]
+    assert request.polynomial.ypol_offset_ns == 2.0
+    assert request.polynomial.station_id == dev.station_id
 
 
 def test_make_delay_feed_ignores_error_events(caplog):
     """A Tango event marked as an error (e.g. a connection blip) must not
-    be treated as a valid polynomial push -- the feed should stay on its
-    zero-delay default rather than applying whatever garbage an error
-    event's payload happens to carry."""
+    be forwarded as a delay-poly update at all."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(
-        dev, "sys/delaypoly/1/direction0"
-    )
+    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(err=True, errors=["boom"]))
 
-    # no update was ever applied -- still on the zero-delay default
-    poly = feed.get(0.0)
-    assert sum(poly.xypol_coeffs_ns) == 0.0
+    assert dev._stub.pushed == []
 
 
 def test_make_delay_feed_survives_unparseable_payload():
     """An attribute push that isn't valid, parseable delay-polynomial
     JSON must be dropped without crashing the subscription callback
     (which would silently kill all future updates too), and a later,
-    well-formed push must still be applied normally afterward."""
+    well-formed push must still be forwarded normally afterward."""
     dev = _fake_device()
-    feed = sim.StationSimulatorDevice._make_delay_feed(
-        dev, "sys/delaypoly/1/direction0"
-    )
+    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(value="not valid json"))
-
-    poly = feed.get(0.0)
-    assert sum(poly.xypol_coeffs_ns) == 0.0  # malformed push is dropped, not crashed on
+    assert dev._stub.pushed == []  # malformed push is dropped, not crashed on
 
     # a later, valid push still works normally
     proxy.subscriptions[event_id](_FakeEvent(value=VALID_PAYLOAD))
-    assert feed.get(100.0).xypol_coeffs_ns == [750.0]
+    assert len(dev._stub.pushed) == 1
+    assert list(dev._stub.pushed[0].polynomial.xypol_coeffs_ns) == [750.0]
 
 
 def test_teardown_unsubscribes_all_and_clears_list():

@@ -6,7 +6,9 @@ readme = "tango/README.md"
 requires-python = ">=3.10"
 dependencies = [
     "astropy>=6.1.7",
+    "grpcio>=1.83.1",
     "numba>=0.67.0",
+    "protobuf>=7.36.1",
     "scipy>=1.15.3",
     "ska-tango-base>=1.7.0",
 ]
@@ -29,9 +31,21 @@ packages = ["tango/src/ska_low_station_beam_simulator"]
 [tool.pytest.ini_options]
 testpaths = ["tango/tests"]
 
+# Without this, ruff's isort falls back to its default src roots (repo
+# root + <root>/src) to decide what's first-party -- and since the repo
+# root now literally has a directory named tango/ (see CLAUDE.md's "Code
+# layout"), ruff mistakes `import tango` (pytango, third-party) for a
+# first-party import of that directory, scattering `tango`/`tango.server`
+# imports apart from the rest of a file's third-party block. Pointing
+# src at the real package root fixes the misdetection at its source
+# instead of hand-ordering imports around it in every affected file.
+[tool.ruff]
+src = ["tango/src"]
+
 [dependency-groups]
 dev = [
     "coverage>=7.16.0",
+    "grpcio-tools>=1.83.1",
     "jupyter>=1.1.1",
     "matplotlib>=3.10.9",
     "pytest>=9.1.1",

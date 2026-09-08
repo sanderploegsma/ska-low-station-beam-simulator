@@ -2,6 +2,7 @@ package common
 
 import (
 	"log"
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -108,6 +109,31 @@ type ScanRunner struct {
 	started atomic.Bool
 	stop    chan struct{}
 	done    chan struct{}
+
+	// driftBits/tick are updated once per tick from the run() goroutine
+	// and read from GetStatus's goroutine (the gRPC handler) -- atomics,
+	// not the mu-guarded fields elsewhere in this package, since these
+	// are polled at a much higher rate than start/stop and don't need to
+	// be consistent with any other field. float64 has no atomic type in
+	// this Go version, hence the math.Float64bits/frombits round-trip
+	// through an atomic.Uint64 rather than atomic.Value (which would box
+	// every store).
+	driftBits atomic.Uint64
+	tick      atomic.Int64
+}
+
+// DriftSeconds returns the most recently observed pacing drift: wall-
+// clock time minus that tick's target time, in seconds, at the last
+// tick produced. Positive means the producer is running behind
+// schedule. 0 before the first tick.
+func (r *ScanRunner) DriftSeconds() float64 {
+	return math.Float64frombits(r.driftBits.Load())
+}
+
+// TickNumber returns the most recently produced tick's 0-based index.
+// 0 before the first tick.
+func (r *ScanRunner) TickNumber() int64 {
+	return r.tick.Load()
 }
 
 // NewScanRunner constructs a ScanRunner. The per-channel output sample
@@ -209,11 +235,14 @@ func (r *ScanRunner) run() {
 				return
 			case <-timer.C:
 			}
-		} else {
-			overrun := now.Sub(targetWall).Seconds()
-			if overrun > BlockDurationS*OverrunTolerance {
-				log.Printf("producer falling behind pacing by %.3fs at tick %d", overrun, tick)
-			}
+			now = time.Now()
+		}
+
+		drift := now.Sub(targetWall).Seconds()
+		r.driftBits.Store(math.Float64bits(drift))
+		r.tick.Store(int64(tick))
+		if drift > BlockDurationS*OverrunTolerance {
+			log.Printf("producer falling behind pacing by %.3fs at tick %d", drift, tick)
 		}
 
 		dst := map[string][][]complex64{

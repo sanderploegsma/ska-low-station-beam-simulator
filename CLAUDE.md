@@ -67,8 +67,14 @@ tango/src/ska_low_station_beam_simulator/
                                 see the ICD section below and bug #17 -- split out of common.py so
                                 the SPEAD wire-format concern doesn't live alongside common.py's
                                 config/delay/producer-sender plumbing
-  direct_synthesis.py          the SOLE backend: DirectSynthesisStreamer (tone + tiled noise + pulsar)
-  simulator.py                 Tango device server (StationSimulatorDevice)
+  direct_synthesis.py          the SOLE backend: DirectSynthesisStreamer (tone + tiled noise + pulsar) --
+                                still used directly by the scripts/tests below; no longer driven by
+                                simulator.py itself (see "Tango device now drives the Go gRPC simulator")
+  simulator.py                 Tango device server (StationSimulatorDevice) -- now a gRPC CLIENT of the
+                                Go simulator (repo root's cmd/simulator), not a local generator; see
+                                "Tango device now drives the Go gRPC simulator" below
+  simulatorpb/                 generated gRPC/protobuf stubs (simulator_pb2.py/simulator_pb2_grpc.py)
+                                from the repo root's api/simulator.proto -- regenerate per "Setup" below
   benchmark_direct_synthesis.py  benchmarks DirectSynthesisStreamer, incl. tone+noise+pulsar combined
   generate_test_pcap.py        writes a real pcap of a few SPEAD-encoded heaps, for testing the
                                 encoding path against an external unpacker (see spead.py's
@@ -106,8 +112,10 @@ now-deleted `wideband_streamer.py`.
 `ScanRunner` drives structurally — it never imports
 `DirectSynthesisStreamer` (the sole implementation), so `common.py` stays
 testable independent of the generation strategy behind it.
-`simulator.py` always constructs a `DirectSynthesisStreamer`; there is no
-backend-selection branching left.
+**`simulator.py` no longer constructs a `DirectSynthesisStreamer` at
+all — see "Tango device now drives the Go gRPC simulator" below.** This
+paragraph still describes `direct_synthesis.py`/`common.py` accurately
+(unchanged); only the Tango-facing device server's own wiring moved.
 
 ## Signal generation
 
@@ -506,31 +514,131 @@ array keyed by poly *identity*, not recomputed every tick — same
 per-tick-allocation discipline as bug #13 below, just applied per source
 instead of once station-wide.
 
-**`simulator.py` wiring**: `subarray_id`, `beam_id`, and `source_cfgs`
-are no longer device properties — they're passed dynamically as fields
-of a single JSON object given to the `StartScan` command (alongside
-`obs_time_epoch_s`/`scan_duration_s`/`scan_id`), since a station can be
-reassigned between subarrays/beams across scans without a pod restart.
-Only `station_id`/`substation_id` (identify the pod itself) and
-`dest_ip`/`dest_port` (the CBF endpoint) remain static device
-properties. EVERY `source_cfgs` entry MUST include a `delay_attr_uri`
-naming a Tango attribute to subscribe — `StartScan` raises if one is
-missing, rather than silently omitting delay for that source. `StartScan`
-opens an `AttributeProxy` per named attribute, subscribes to its
-`CHANGE_EVENT`s, and feeds updates into a `DelayFeed` attached to that
-source's cfg before constructing the streamer; subscriptions are torn
-down in `StopScan`/`delete_device` (and before any new scan's
-subscriptions are created) so they never leak across scans. `subarray_id`
-and `beam_id` are set on the same `StationConfig` instance
-`SpsPacketizer` holds a live reference to, so a new scan's values take
-effect without recreating the packetizer. **UNVERIFIED, same category of
-risk as the ICD bit-packing below**: the exact attribute payload shape
+**`simulator.py` wiring — REPLACED this session, see "Tango device now
+drives the Go gRPC simulator" below for the full picture.** In brief:
+`subarray_id`/`beam_id`/`source_cfgs` still arrive dynamically as fields
+of the `StartScan` JSON argument (alongside
+`obs_time_epoch_s`/`scan_duration_s`/`scan_id`) — unchanged in spirit, a
+station can still be reassigned between subarrays/beams across scans
+without a pod restart. What changed is everything downstream: EVERY
+`source_cfgs` entry still MUST include a `delay_attr_uri` (there is no
+default delay), and `StartScan` still opens an `AttributeProxy` per
+named attribute and subscribes to its `CHANGE_EVENT`s — but a pushed
+update is now forwarded over gRPC (`PushDelayUpdate`) to a separate Go
+process instead of feeding a local `DelayFeed` consumed by a locally
+constructed streamer, since there is no local streamer anymore.
+`dest_ip`/`dest_port` are gone from this device entirely — the Go
+process owns the CBF SPEAD/UDP destination now, via its own CLI flags —
+and `station_id`/`substation_id` remain, plus a new `grpc_target` device
+property naming the Go process's `host:port`. The UNVERIFIED wire-format
+caveat is unchanged and still applies: the exact attribute payload shape
 (`common.parse_delay_polynomial_from_attr_value` assumes a JSON
 string/mapping matching `DelayPolynomial`'s fields) and whether
 `AttributeProxy` delivers an immediate `CHANGE_EVENT` with the attribute's
 current value on subscribe (vs. only on the next actual change) both
 depend on how the real delay-poly emulator is configured — confirm
 against it once available, not just against this assumption.
+
+### Tango device now drives the Go gRPC simulator, not a local streamer (new this session)
+
+`simulator.py` used to construct a `DirectSynthesisStreamer` and
+`ScanRunner` directly and run the whole producer/sender pipeline in this
+process (SPEAD/UDP included). It now does none of that: `StartScan`/
+`StopScan`/attribute reads instead call a separate Go process
+(`cmd/simulator` at the repo root, `internal/server.Server` — see
+`api/simulator.proto`) over gRPC, using generated stubs at
+`tango/src/ska_low_station_beam_simulator/simulatorpb/`
+(`simulator_pb2.py`/`simulator_pb2_grpc.py`, regenerated from
+`api/simulator.proto` — see "Setup" below for the exact command). This
+is exactly the split `api/simulator.proto`'s own doc comment already
+described before this session actually wired it up: a Tango device
+server owns Tango (device properties, `AttributeProxy` subscriptions to
+CBF's delay-poly emulator), the Go process owns signal generation and
+SPEAD/UDP sending, and has no Tango access of its own.
+
+**Prototype scope, inherited from the Go side, not yet extended**: the
+Go backend (see `api/simulator.proto`'s own doc comment) implements
+tone + noise only — no pulsar. `simulator.build_tone_source_request`
+(replacing the old local-generation `build_source_cfg`) raises
+`ValueError` immediately for any `source_cfgs` entry with
+`kind != "tone"`, rather than silently dropping it or attempting some
+local fallback — there is no local generation path left in this device
+at all, so "fall back to Python" isn't an option even if it were
+desirable. Same "fail loud instead of silently degrading" principle
+this codebase applies to missing delay feeds elsewhere.
+`direct_synthesis.py`'s own pulsar support is completely untouched and
+still directly exercised by `benchmark_direct_synthesis.py`,
+`generate_test_pcap.py`, and `tests/test_direct_synthesis.py` — only
+this Tango-facing device no longer drives it for a real scan.
+
+**`source_id` reuses `delay_attr_uri` verbatim, not a new JSON field.**
+The gRPC `PushDelayUpdate` RPC routes an update to the right source by
+`source_id`, a concept the old local-generation flow never needed (each
+`source_cfgs` entry just built its own `DelayFeed` object directly).
+Since every source already requires a unique `delay_attr_uri` (there's
+no default delay — see "Per-source delay" above), `simulator.py` reuses
+that URI string as the source's `source_id` on both ends of the wire —
+`build_tone_source_request` sets `ToneSourceConfig.source_id =
+spec["delay_attr_uri"]`, and `_make_delay_feed`'s `CHANGE_EVENT`
+callback keys its `PushDelayUpdateRequest` the same way — instead of
+inventing a new required key in the `source_cfgs` JSON schema. The Go
+server independently rejects a duplicate `source_id` within one scan
+(`StartScan`'s own validation), which doubles as a duplicate-
+`delay_attr_uri` check on this side.
+
+**`StartScan`'s check-then-act race, same shape as before, not fully
+closed**: before touching any subscription, `StartScan` calls
+`GetStatus` and raises if a scan is already reported running — this runs
+BEFORE tearing down the previous scan's delay subscriptions,
+specifically so a rejected `StartScan` never destroys the actually-
+running scan's ability to receive delay updates. A concurrent second
+`StartScan` call between that check and the real gRPC `StartScan` call
+could still slip through (the check and the act aren't atomic); the real
+backstop is the Go server's own `FailedPrecondition` rejection in
+`StartScan` (`internal/server/grpc_server.go`) — the same non-atomicity
+the old local-generation flow already tolerated (a
+`self._scan_runner.thread.is_alive()` check with no lock around it
+either).
+
+**New Tango attributes, next to `queue_depth`**: `StatusResponse` (the
+`GetStatus` RPC's response message) gained `drift_seconds` and
+`tick_number` this session, both sourced from `ScanRunner`
+(`internal/common/scan_runner.go`) on the Go side — `DriftSeconds()`/
+`TickNumber()` read two atomics (`driftBits`, via
+`math.Float64bits`/`Float64frombits` since this Go version has no atomic
+float64 type; `tick`, an `atomic.Int64`) updated once per tick from the
+scan loop, both 0 before the first tick or once no scan is running.
+`drift_seconds` is wall-clock time minus that tick's target time at the
+most recently produced tick — positive means the producer is running
+behind its real-time pacing schedule; this is the same value the scan
+loop already logged past `OverrunTolerance` (see "Observability" below),
+now queryable directly rather than only visible in a log line, and now
+computed uniformly on every tick (previously only computed in the
+"already behind" branch) rather than only when the loop didn't need to
+wait. `simulator.py` exposes both as read-only Tango attributes
+(`drift_seconds`: float, `tick_number`: int) alongside `queue_depth`,
+each issuing its own `GetStatus` RPC on read — three independent
+round-trips per polling cycle rather than one cached call, deliberately
+kept simple for a first version; revisit if that's ever shown to matter
+(each call is a small, sub-millisecond local RPC).
+
+**Regenerating the Python stubs** (after editing `api/simulator.proto`):
+see "Setup" below. The generated `simulator_pb2_grpc.py` needs one
+hand-patch after every regeneration — `grpc_tools.protoc`'s Python
+plugin always emits `import simulator_pb2 as simulator__pb2` (a bare,
+top-level import), which doesn't resolve from inside the
+`ska_low_station_beam_simulator.simulatorpb` package; a `sed` rewrite to
+`from . import simulator_pb2 as simulator__pb2` is required every time
+(the Go side has no equivalent issue — `protoc-gen-go` emits
+package-qualified imports directly).
+
+**Verified against a live Go process, not just unit-level mocks**: this
+session drove a locally-built `cmd/simulator` binary directly with the
+generated Python stub (`StartScan`, `PushDelayUpdate`, `GetStatus`
+mid-scan, `StopScan`) — confirmed `drift_seconds`/`tick_number` populate
+with real, sane values mid-scan (e.g. `drift_seconds≈0.00018`,
+`tick_number` advancing) and both go back to their zero defaults once
+`StopScan` completes.
 
 ### `source_cfgs`/`noise_cfg` are typed dataclasses, not dicts (new this session)
 
@@ -1535,10 +1643,43 @@ instead of one long script, so a failure identifies exactly which
 property broke. `tango/tests/test_direct_synthesis.py` covers tone/noise/pulsar
 (the old `__main__` checks); `tango/tests/test_delay_feeds.py` covers
 `DelayFeed`/the required-delay_feed validation/the per-source-delay-divergence
-integration check; `tango/tests/test_simulator_delay_wiring.py` covers the
-Tango attribute subscription plumbing in `simulator.py` (against a fake
-`AttributeProxy`, not a live Tango context — this codebase still doesn't
-unit test the actual Tango device server layer).
+integration check (`direct_synthesis.py`'s own local-generation path,
+still exercised directly, independent of `simulator.py`);
+`tango/tests/test_simulator_delay_wiring.py` covers the
+Tango attribute subscription **and gRPC-forwarding** plumbing in
+`simulator.py` (against fake `AttributeProxy`/gRPC-stub objects, not a
+live Tango context or a live Go process — this codebase still doesn't
+unit test the actual Tango device server layer; see "Tango device now
+drives the Go gRPC simulator" above for a live-process smoke test that
+DID exercise a real `cmd/simulator` binary, not committed as an
+automated test); `tango/tests/test_simulator_tone_source_request.py`
+covers `build_tone_source_request`'s JSON-boundary validation (rejects
+non-'tone' kinds, missing `delay_attr_uri`).
+
+**Regenerating the Python gRPC stubs** (after editing the repo root's
+`api/simulator.proto` — see the Go side's own regeneration command in
+`README.md`):
+
+```
+mkdir -p tango/src/ska_low_station_beam_simulator/simulatorpb   # first time only
+uv run python -m grpc_tools.protoc \
+    --proto_path=api \
+    --python_out=tango/src/ska_low_station_beam_simulator/simulatorpb \
+    --grpc_python_out=tango/src/ska_low_station_beam_simulator/simulatorpb \
+    --pyi_out=tango/src/ska_low_station_beam_simulator/simulatorpb \
+    api/simulator.proto
+
+# REQUIRED every time -- grpc_tools.protoc's Python plugin always emits
+# a bare `import simulator_pb2 as simulator__pb2`, which doesn't resolve
+# from inside the simulatorpb package (see "Tango device now drives the
+# Go gRPC simulator" above):
+sed -i '' 's/^import simulator_pb2 as simulator__pb2$/from . import simulator_pb2 as simulator__pb2/' \
+    tango/src/ska_low_station_beam_simulator/simulatorpb/simulator_pb2_grpc.py
+```
+
+`grpcio-tools` (the `dev` dependency group) provides `grpc_tools.protoc`
+— no separate `protoc`/plugin binaries to install beyond what `uv sync`
+already pulls in, unlike the Go side's regeneration command.
 
 `pytango` isn't required to run the above — `simulator.py` degrades to
 stub Tango classes if `pytango` isn't installed (importable, not

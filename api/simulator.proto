@@ -94,4 +94,14 @@ message GetStatusRequest {}
 message StatusResponse {
   bool scan_running = 1;
   int32 queue_depth = 2;
+  // Pacing drift at the most recent tick: wall-clock time minus that
+  // tick's target time, in seconds. Positive means the producer is
+  // running behind its real-time schedule (see ScanRunner's
+  // OverrunTolerance-gated log line, which this mirrors as a queryable
+  // value); zero or negative means on-pace or ahead. 0 if no scan has
+  // produced a tick yet.
+  double drift_seconds = 3;
+  // The most recently produced tick's index (0-based) within the
+  // current scan. 0 if no scan has produced a tick yet.
+  int64 tick_number = 4;
 }
