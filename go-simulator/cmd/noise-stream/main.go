@@ -15,7 +15,6 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -43,6 +42,10 @@ func main() {
 
 	noiseStd := flag.Float64("noise-std", 0.05, "noise standard deviation (both real and imaginary parts)")
 	noiseSeed := flag.Int64("noise-seed", 0, "noise seed (default: same as -station-id, unless explicitly set)")
+
+	numSenders := flag.Int("sender-goroutines", spead.DefaultNumSenders, "number of parallel UDP sender sockets/goroutines for outbound SPEAD/UDP")
+	sendBatchSize := flag.Int("send-batch-size", spead.DefaultSendBatchSize, "max heaps per batched UDP send (uses sendmmsg on Linux)")
+	udpSendBufferBytes := flag.Int("udp-send-buffer-bytes", spead.DefaultUDPSendBufferBytes, "SO_SNDBUF size for each outbound SPEAD/UDP socket, in bytes (0: leave at OS default)")
 
 	flag.Parse()
 
@@ -87,20 +90,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolving destination %s:%d: %v", *destIP, *destPort, err)
 	}
-	conn, err := net.DialUDP("udp", localAddr, destAddr)
-	if err != nil {
-		log.Fatalf("dialing destination %s:%d: %v", *destIP, *destPort, err)
-	}
-	packetizer := spead.NewSpsPacketizer(stationCfg, conn)
 
 	queue := common.NewHeapQueue(common.QueueMaxSize)
 	shutdown := make(chan struct{})
-	var senderDone sync.WaitGroup
-	senderDone.Add(1)
-	go func() {
-		defer senderDone.Done()
-		spead.SendLoop(queue.Recv(), packetizer, shutdown)
-	}()
+	pool, err := spead.NewSenderPool(stationCfg, queue.Recv(), localAddr, destAddr, *numSenders, *udpSendBufferBytes, *sendBatchSize, shutdown)
+	if err != nil {
+		log.Fatalf("starting SPEAD/UDP sender pool: %v", err)
+	}
 
 	runner := common.NewScanRunner(streamer, queue, obsTime, *scanDuration)
 	runner.Start()
@@ -109,8 +105,9 @@ func main() {
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 
 	log.Printf(
-		"streaming noise-only: station_id=%d substation_id=%d subarray_id=%d beam_id=%d scan_id=%d num_channels=%d dest=%s:%d duration=%.1fs noise_std=%v noise_seed=%d",
+		"streaming noise-only: station_id=%d substation_id=%d subarray_id=%d beam_id=%d scan_id=%d num_channels=%d dest=%s:%d duration=%.1fs noise_std=%v noise_seed=%d sender_goroutines=%d send_batch_size=%d udp_send_buffer_bytes=%d",
 		*stationID, *substationID, *subarrayID, *beamID, *scanID, *numChannels, *destIP, *destPort, *scanDuration, *noiseStd, seed,
+		*numSenders, *sendBatchSize, *udpSendBufferBytes,
 	)
 
 	select {
@@ -120,13 +117,13 @@ func main() {
 		log.Printf("received %s, stopping", sig)
 		runner.Stop(5 * time.Second)
 	}
-	// Stop the sender goroutine and wait for it to actually return
-	// BEFORE closing conn -- otherwise a heap already pulled off the
-	// queue can lose its race against conn.Close() and fail with "use of
-	// closed network connection" on the way out.
+	// Stop the sender goroutines and wait for them to actually return
+	// BEFORE closing their sockets -- otherwise a heap already pulled off
+	// the queue can lose its race against Close() and fail with "use of
+	// closed network connection" on the way out. SenderPool.Close()
+	// handles that ordering internally.
 	close(shutdown)
-	senderDone.Wait()
-	conn.Close()
+	pool.Close()
 }
 
 // isFlagSet reports whether the named flag was explicitly passed on the

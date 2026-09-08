@@ -24,9 +24,16 @@ func main() {
 	destIP := flag.String("dest-ip", "127.0.0.1", "CBF SPEAD/UDP destination IP")
 	destPort := flag.Int("dest-port", 8000, "CBF SPEAD/UDP destination port")
 	sourceInterface := flag.String("spead-interface", "", "network interface to bind the outbound SPEAD/UDP socket to (e.g. net1 for a Multus-attached secondary NIC); empty leaves this to the OS's default route selection")
+	numSenders := flag.Int("sender-goroutines", server.DefaultNumSenders, "number of parallel UDP sender sockets/goroutines for outbound SPEAD/UDP")
+	sendBatchSize := flag.Int("send-batch-size", server.DefaultSendBatchSize, "max heaps per batched UDP send (uses sendmmsg on Linux)")
+	udpSendBufferBytes := flag.Int("udp-send-buffer-bytes", server.DefaultUDPSendBufferBytes, "SO_SNDBUF size for each outbound SPEAD/UDP socket, in bytes (0: leave at OS default)")
 	flag.Parse()
 
-	srv := server.NewServer(int32(*stationID), int32(*substationID), *destIP, *destPort, *sourceInterface)
+	srv := server.NewServer(int32(*stationID), int32(*substationID), *destIP, *destPort, *sourceInterface,
+		server.WithNumSenders(*numSenders),
+		server.WithSendBatchSize(*sendBatchSize),
+		server.WithUDPSendBufferBytes(*udpSendBufferBytes),
+	)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("starting server: %v", err)
 	}

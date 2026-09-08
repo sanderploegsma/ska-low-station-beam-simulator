@@ -35,14 +35,40 @@ type Server struct {
 	destPort        int
 	sourceInterface string // "" -- let the OS pick the outbound interface/address
 
+	numSenders         int
+	sendBatchSize      int
+	udpSendBufferBytes int
+
 	mu         sync.Mutex
 	stationCfg *common.StationConfig
 	scanRunner *common.ScanRunner
 	delayFeeds map[string]*common.DelayFeed
 
-	sendQueue *common.HeapQueue
-	shutdown  chan struct{}
+	sendQueue  *common.HeapQueue
+	senderPool *spead.SenderPool
+	shutdown   chan struct{}
 }
+
+// Sender-pool defaults, matching internal/spead's own so a Server built
+// with no Options behaves the same as one explicitly given these.
+const (
+	DefaultNumSenders         = spead.DefaultNumSenders
+	DefaultSendBatchSize      = spead.DefaultSendBatchSize
+	DefaultUDPSendBufferBytes = spead.DefaultUDPSendBufferBytes
+)
+
+// Option configures optional Server behavior beyond NewServer's required
+// per-pod identity/destination arguments.
+type Option func(*Server)
+
+// WithNumSenders sets the number of parallel UDP sender sockets/goroutines.
+func WithNumSenders(n int) Option { return func(s *Server) { s.numSenders = n } }
+
+// WithSendBatchSize sets the max heaps per batched UDP send.
+func WithSendBatchSize(n int) Option { return func(s *Server) { s.sendBatchSize = n } }
+
+// WithUDPSendBufferBytes sets each sender socket's SO_SNDBUF size.
+func WithUDPSendBufferBytes(n int) Option { return func(s *Server) { s.udpSendBufferBytes = n } }
 
 // NewServer constructs a Server for one station. stationID/substationID
 // identify this pod; destIP/destPort are the CBF SPEAD/UDP endpoint —
@@ -58,8 +84,8 @@ type Server struct {
 // time (it isn't known ahead of time: a Multus secondary interface's
 // address comes from an IPAM pool assigned at pod start). Pass "" to
 // leave this to the OS, as before.
-func NewServer(stationID, substationID int32, destIP string, destPort int, sourceInterface string) *Server {
-	return &Server{
+func NewServer(stationID, substationID int32, destIP string, destPort int, sourceInterface string, opts ...Option) *Server {
+	s := &Server{
 		destIP:          destIP,
 		destPort:        destPort,
 		sourceInterface: sourceInterface,
@@ -67,9 +93,16 @@ func NewServer(stationID, substationID int32, destIP string, destPort int, sourc
 			StationID:    stationID,
 			SubstationID: substationID,
 		},
-		sendQueue: common.NewHeapQueue(common.QueueMaxSize),
-		shutdown:  make(chan struct{}),
+		numSenders:         DefaultNumSenders,
+		sendBatchSize:      DefaultSendBatchSize,
+		udpSendBufferBytes: DefaultUDPSendBufferBytes,
+		sendQueue:          common.NewHeapQueue(common.QueueMaxSize),
+		shutdown:           make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // Start dials the CBF SPEAD/UDP destination and starts the sender
@@ -90,16 +123,15 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("resolving SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
 	}
-	conn, err := net.DialUDP("udp", localAddr, destAddr)
+	pool, err := spead.NewSenderPool(s.stationCfg, s.sendQueue.Recv(), localAddr, destAddr, s.numSenders, s.udpSendBufferBytes, s.sendBatchSize, s.shutdown)
 	if err != nil {
-		return fmt.Errorf("dialing SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
+		return fmt.Errorf("starting SPEAD/UDP sender pool: %w", err)
 	}
-	packetizer := spead.NewSpsPacketizer(s.stationCfg, conn)
-	go spead.SendLoop(s.sendQueue.Recv(), packetizer, s.shutdown)
+	s.senderPool = pool
 	return nil
 }
 
-// Stop stops any running scan and the sender goroutine.
+// Stop stops any running scan and the sender goroutines.
 func (s *Server) Stop() {
 	s.mu.Lock()
 	if s.scanRunner != nil {
@@ -107,6 +139,9 @@ func (s *Server) Stop() {
 	}
 	s.mu.Unlock()
 	close(s.shutdown)
+	if s.senderPool != nil {
+		s.senderPool.Close()
+	}
 }
 
 // StartScan implements pb.StationSimulatorServer. Fails if a scan is

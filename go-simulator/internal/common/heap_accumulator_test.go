@@ -1,6 +1,35 @@
 package common
 
-import "testing"
+import (
+	"strconv"
+	"testing"
+)
+
+// BenchmarkHeapAccumulator_OneTickPerPop mirrors ScanRunner's real
+// per-tick usage: exactly one HeapLen-row Add per pol, then one
+// PopReadyHeaps call, repeated -- the case that runs on every tick of a
+// real scan (see synth.DirectSynthesisStreamer.TickNSamples's doc
+// comment: "HeapLen by construction", so this is the only shape
+// PopReadyHeaps ever actually sees in production, not just one shape
+// among many).
+func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
+	for _, numChannels := range []int{96, 384} {
+		b.Run("channels="+strconv.Itoa(numChannels), func(b *testing.B) {
+			acc := NewHeapAccumulator(numChannels, 0, 1.0, nil)
+			vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
+			hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(c), float64(r)) })
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				acc.Add("V", vChunk)
+				acc.Add("H", hChunk)
+				heaps := acc.PopReadyHeaps()
+				if len(heaps) != numChannels {
+					b.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
+				}
+			}
+		})
+	}
+}
 
 func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex128) []complex128 {
 	chunk := make([]complex128, rows*numChannels)
