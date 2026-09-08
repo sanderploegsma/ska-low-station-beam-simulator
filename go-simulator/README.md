@@ -754,3 +754,77 @@ Not yet confirmed on target hardware -- next profile should show
 sharply, since noise-only channels (the vast majority in any config
 without many tone sources) no longer touch the complex64 bank/dst path
 that memmove was measuring at all.
+
+### Target-hardware validation: memmove fixed, but a new cost took its place (`cpu-384ch.pprof`, 2026-09-08 14:13 CEST, 90s scan, 384ch, one tone)
+
+`runtime.memmove` DID drop sharply, exactly as predicted: 6.0% of total
+CPU in this capture (core-rate 0.41), down from 33-37% across the two
+prior captures. The pre-quantized-bank change is doing exactly what it
+was built to do.
+
+**But `spead.copyQuantizedIntoPayload` -- the plain byte-copy that
+replaced the old quantize/round/clamp work -- was itself 36.03% of ALL
+CPU (core-rate 2.48), the #2 cost overall.** Not the near-free operation
+it should have been. Root cause, found by reading the function rather
+than assuming a byte copy is always cheap: it ran independently per pol,
+each call writing only 2 of dst's 4 bytes per sample (a strided partial
+write) -- meaning every 4-byte block in the shared payload buffer needed
+its own read-for-ownership TWICE (once per pol) instead of once. Fixed
+with `copyQuantizedVHIntoPayload`, a combined pass writing all 4 bytes
+of each sample together in one go (the actual common case: a noise-only
+channel always sets both `VQuantized` and `HQuantized`) -- confirmed
+faster via a same-machine before/after (not assumed): -17% just from
+combining passes on this dev machine (Apple M5); the real-hardware
+effect should be larger, since the strided-vs-combined difference is a
+cache/memory-bandwidth-pattern effect that a warm-cache microbenchmark
+loop understates relative to real, cold, high-throughput traffic.
+Proven behavior-identical to the independent two-pass version via
+`TestCopyQuantizedVHIntoPayload_MatchesTwoIndependentPasses`.
+
+**A second, separate inefficiency found investigating the same
+capture**: this run configured ONE tone source among 384 channels --
+meaning `NewDirectSynthesisStreamer` built the full-precision complex64
+bank at the FULL 384-channel width (~3.2GB, `DefaultNTiles`=256), even
+though only that ONE channel's column was ever going to be read. Fixed:
+the complex64 bank is now sized to `len(ComplexPathChannelIDMap())`
+(the tone-affected subset, here: 1), not `numChannels` -- for this exact
+scenario, ~3.2GB down to ~8.4MB, and the Box-Muller work needed to fill
+it drops by the same ~384x factor. This wasn't visible in the
+noise-only-no-tone captures earlier in this file (the complex64 bank
+was already skipped ENTIRELY when zero channels have a tone -- this
+regression only shows up in a MIXED config, exactly what this 90s test
+happened to use).
+
+**On "still saw the producer drifting, especially at the start"**: both
+fixes above are plausible, genuine contributors, but for different
+reasons, and a single aggregate 90-second profile can't distinguish
+"worse at the start vs. steady throughout" on its own (it has no
+per-time-bucket resolution) -- so this is reasoned diagnosis, not
+confirmed:
+- `copyQuantizedIntoPayload`'s inefficiency is a STEADY-STATE per-tick
+  cost -- it would contribute to drift throughout the whole scan, not
+  specifically at the start. Now fixed regardless.
+- The oversized complex64 bank is a ONE-TIME CONSTRUCTION cost, paid
+  entirely before `ScanRunner.Start()` begins ticking -- so it wouldn't
+  directly cause tick-to-tick drift by itself. But it's exactly the kind
+  of thing that COULD explain "worse specifically at the start": ~3.2GB
+  of freshly `make()`'d memory has to be either zeroed or first-touched
+  by the OS as the parallel fill workers write to it, and Linux commits
+  those pages lazily -- if any of that settling (page faults, TLB
+  pressure, allocator/GC catching up on a multi-GB allocation burst)
+  bleeds into the first several ticks after `Start()`, it would show up
+  as exactly "elevated drift early, self-corrects once the pages/caches
+  are warm" -- without directly measuring it, this is a plausible
+  mechanism, not a confirmed one. Also plausible and NOT mutually
+  exclusive: this same target machine is independently documented (see
+  the parent Python `CLAUDE.md`) as idling at 1.5GHz and needing
+  sustained load before `schedutil` ramps clocks to boost -- the exact
+  same "worse at the start, self-corrects" signature, for a completely
+  unrelated reason.
+- **What would actually distinguish these** (not done yet): the
+  producer's own "falling behind pacing by Xs at tick N" log line
+  already includes the tick number -- checking whether drift events
+  cluster at LOW tick numbers specifically (vs. spread evenly across
+  the whole 90s) would directly confirm or rule out a
+  construction/warm-up-related cause vs. a steady-state one. Worth
+  doing before assuming either explanation over the other.
