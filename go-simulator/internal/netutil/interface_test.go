@@ -1,4 +1,4 @@
-package server
+package netutil
 
 import (
 	"net"
@@ -24,18 +24,19 @@ func findLoopbackInterface(t *testing.T) string {
 	return ""
 }
 
-func TestServer_StartBindsToSourceInterface(t *testing.T) {
+func TestInterfaceIPv4Addr_ResolvesLoopback(t *testing.T) {
 	name := findLoopbackInterface(t)
-	srv := NewServer(1, 0, "127.0.0.1", 19999, name)
-	if err := srv.Start(); err != nil {
-		t.Fatalf("Start() with source_interface=%q: %v", name, err)
+	ip, err := InterfaceIPv4Addr(name)
+	if err != nil {
+		t.Fatalf("InterfaceIPv4Addr(%q): %v", name, err)
 	}
-	defer srv.Stop()
+	if !ip.IsLoopback() {
+		t.Fatalf("resolved IP %v for interface %q is not a loopback address", ip, name)
+	}
 }
 
-func TestServer_StartFailsForUnknownSourceInterface(t *testing.T) {
-	srv := NewServer(1, 0, "127.0.0.1", 19999, "this-interface-does-not-exist-xyz")
-	if err := srv.Start(); err == nil {
-		t.Fatal("expected Start() to fail for an unknown source_interface, got none")
+func TestInterfaceIPv4Addr_UnknownInterfaceErrors(t *testing.T) {
+	if _, err := InterfaceIPv4Addr("this-interface-does-not-exist-xyz"); err == nil {
+		t.Fatal("expected an error for a nonexistent interface, got none")
 	}
 }

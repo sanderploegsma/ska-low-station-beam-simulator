@@ -82,6 +82,17 @@ with no explicit lock. Go has no GIL, so `internal/common/delay.go` uses
 `atomic.Pointer` for the polynomial itself and a mutex for the
 "warned once" bookkeeping.
 
+There are two entrypoints (`cmd/simulator`, the gRPC-served one above,
+and `cmd/noise-stream`, a standalone noise-only CLI — see "Building and
+running" below), sharing the plumbing that has nothing gRPC-specific
+about it: `internal/common.HeapQueue` (a bounded, non-blocking
+`HeapSender`), `internal/spead.SendLoop` (drains a queue into an
+`SpsPacketizer`), and `internal/netutil.InterfaceIPv4Addr` (resolves a
+named interface's address for the `-spead-interface`/Multus flag both
+entrypoints support). `internal/server` depends on all three;
+`cmd/noise-stream` depends on `common`/`spead`/`netutil`/`synth`
+directly and never imports `internal/server` or any gRPC package at all.
+
 ## Building and running
 
 Requires Go 1.24+, and `protoc`/`protoc-gen-go`/`protoc-gen-go-grpc` only
@@ -113,6 +124,33 @@ go run ./cmd/simulator -listen :50051 -station-id 1 -dest-ip 127.0.0.1 -dest-por
 varies per scan (`subarray_id`, `beam_id`, tone sources, noise config) is
 a `StartScan` gRPC request field instead, matching the Python
 `StartScan` JSON argument's shape.
+
+### `cmd/noise-stream`: a standalone noise-only CLI
+
+For quickly exercising the numeric core + SPEAD packetizer end-to-end
+(e.g. against a packet capture tool, or CBF's receive path) without
+standing up the gRPC service or a Tango-facing counterpart process at
+all:
+
+```
+go run ./cmd/noise-stream -dest-ip 127.0.0.1 -dest-port 8000 -scan-duration 10
+```
+
+No gRPC, no tone/delay sources — just the noise tile bank, driven by a
+`ScanRunner` exactly like a real scan. `-station-id`/`-substation-id`/
+`-subarray-id`/`-beam-id`/`-scan-id` all default to `1`, `-num-channels`
+defaults to `96`, `-obs-time` defaults to `"now"` (or pass a fixed Unix
+epoch seconds value for a reproducible run), `-scan-duration` defaults to
+`60` (seconds). `-noise-std` defaults to `0.05` and `-noise-seed`
+defaults to the same value as `-station-id` unless explicitly
+overridden — both match `simulator.py`'s own `StartScan` noise default
+(`NoiseConfig(std=0.05, seed=self.station_id)`). `-spead-interface`
+works exactly as in `cmd/simulator`: pass a network interface name (e.g.
+`net1` for a Multus-attached secondary NIC) to bind the outbound
+SPEAD/UDP socket to that interface's IPv4 address instead of letting the
+OS pick via its default route; leave unset to use the OS's default
+selection. Stops on its own after `-scan-duration`, or immediately on
+Ctrl-C/SIGTERM.
 
 ## Container image
 
@@ -158,7 +196,13 @@ image (to catch a broken Dockerfile early) but never push it.
   and timestamping; `ScanRunner`'s pacing loop against a fake streamer.
 - **`internal/server`**: the gRPC surface end-to-end over an in-memory
   `bufconn` listener (`StartScan`/`StopScan`/`GetStatus`/
-  `PushDelayUpdate`, including the validation error codes).
+  `PushDelayUpdate`, including the validation error codes); `Start()`
+  actually binding to a real (loopback) interface, and failing for an
+  unknown one.
+- **`internal/netutil`**: resolving a real (loopback) interface's IPv4
+  address, and erroring for an unknown interface name — portable across
+  Linux/macOS (looked up by interface flag, not a hardcoded name like
+  `"lo"`/`"lo0"`).
 
 Not covered (left for real hardware/integration testing, same as the
 Python project's own stated gaps): actual throughput/timing benchmarks

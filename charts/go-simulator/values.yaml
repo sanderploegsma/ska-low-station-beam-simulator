@@ -17,7 +17,7 @@ image:
   # Defaults to "latest", published by .github/workflows/go-simulator-docker.yml
   # on every push to main. Pin to a go-simulator-vX.Y.Z tag for anything
   # beyond local/dev use.
-  tag: sha-96c0c0f
+  tag: sha-7a7e981
 
 imagePullSecrets: []
 nameOverride: ""

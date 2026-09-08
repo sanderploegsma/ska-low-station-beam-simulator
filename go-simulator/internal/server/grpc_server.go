@@ -22,31 +22,10 @@ import (
 
 	pb "github.com/skao/station-beam-simulator-go/api/simulatorpb"
 	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/skao/station-beam-simulator-go/internal/netutil"
 	"github.com/skao/station-beam-simulator-go/internal/spead"
 	"github.com/skao/station-beam-simulator-go/internal/synth"
 )
-
-// heapQueue is a bounded, non-blocking common.HeapSender backed by a
-// channel — the Go equivalent of Python's queue.Queue(maxsize=...) send
-// queue between the producer (ScanRunner) and the sender goroutine.
-type heapQueue struct {
-	ch chan *common.ChannelHeap
-}
-
-func newHeapQueue(size int) *heapQueue {
-	return &heapQueue{ch: make(chan *common.ChannelHeap, size)}
-}
-
-// Send implements common.HeapSender — non-blocking, returns false
-// (dropped) if the queue is full rather than blocking the producer.
-func (q *heapQueue) Send(heap *common.ChannelHeap) bool {
-	select {
-	case q.ch <- heap:
-		return true
-	default:
-		return false
-	}
-}
 
 // Server implements pb.StationSimulatorServer.
 type Server struct {
@@ -61,7 +40,7 @@ type Server struct {
 	scanRunner *common.ScanRunner
 	delayFeeds map[string]*common.DelayFeed
 
-	sendQueue *heapQueue
+	sendQueue *common.HeapQueue
 	shutdown  chan struct{}
 }
 
@@ -88,7 +67,7 @@ func NewServer(stationID, substationID int32, destIP string, destPort int, sourc
 			StationID:    stationID,
 			SubstationID: substationID,
 		},
-		sendQueue: newHeapQueue(common.QueueMaxSize),
+		sendQueue: common.NewHeapQueue(common.QueueMaxSize),
 		shutdown:  make(chan struct{}),
 	}
 }
@@ -99,7 +78,7 @@ func NewServer(stationID, substationID int32, destIP string, destPort int, sourc
 func (s *Server) Start() error {
 	var localAddr *net.UDPAddr
 	if s.sourceInterface != "" {
-		ip, err := interfaceIPv4Addr(s.sourceInterface)
+		ip, err := netutil.InterfaceIPv4Addr(s.sourceInterface)
 		if err != nil {
 			return fmt.Errorf("resolving source_interface %q for outbound SPEAD/UDP: %w", s.sourceInterface, err)
 		}
@@ -116,7 +95,7 @@ func (s *Server) Start() error {
 		return fmt.Errorf("dialing SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
 	}
 	packetizer := spead.NewSpsPacketizer(s.stationCfg, conn)
-	go s.senderLoop(packetizer)
+	go spead.SendLoop(s.sendQueue.Recv(), packetizer, s.shutdown)
 	return nil
 }
 
@@ -128,19 +107,6 @@ func (s *Server) Stop() {
 	}
 	s.mu.Unlock()
 	close(s.shutdown)
-}
-
-func (s *Server) senderLoop(packetizer *spead.SpsPacketizer) {
-	for {
-		select {
-		case <-s.shutdown:
-			return
-		case heap := <-s.sendQueue.ch:
-			if err := packetizer.SendChannelHeap(heap); err != nil {
-				log.Printf("failed to send heap ch=%d t=%.4f: %v", heap.ChannelID, heap.HeapStartTime, err)
-			}
-		}
-	}
 }
 
 // StartScan implements pb.StationSimulatorServer. Fails if a scan is
@@ -239,5 +205,5 @@ func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.S
 	s.mu.Lock()
 	running := s.scanRunner != nil && s.scanRunner.IsRunning()
 	s.mu.Unlock()
-	return &pb.StatusResponse{ScanRunning: running, QueueDepth: int32(len(s.sendQueue.ch))}, nil
+	return &pb.StatusResponse{ScanRunning: running, QueueDepth: int32(s.sendQueue.Len())}, nil
 }

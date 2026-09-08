@@ -1,16 +1,19 @@
-package server
+// Package netutil holds small, dependency-free networking helpers shared
+// across this module's entrypoints (the gRPC-served simulator and the
+// standalone noise-only CLI).
+package netutil
 
 import (
 	"fmt"
 	"net"
 )
 
-// interfaceIPv4Addr returns the first IPv4 address assigned to the named
+// InterfaceIPv4Addr returns the first IPv4 address assigned to the named
 // network interface — e.g. "net1", a Multus-attached secondary NIC whose
-// address comes from an IPAM pool at pod start, so unlike dest_ip it
-// can't be a fixed config value known ahead of time; it must be resolved
-// at runtime from the interface itself.
-func interfaceIPv4Addr(name string) (net.IP, error) {
+// address comes from an IPAM pool at pod start, so unlike a static
+// dest_ip it can't be a fixed config value known ahead of time; it must
+// be resolved at runtime from the interface itself.
+func InterfaceIPv4Addr(name string) (net.IP, error) {
 	iface, err := net.InterfaceByName(name)
 	if err != nil {
 		return nil, fmt.Errorf("looking up network interface %q: %w", name, err)
