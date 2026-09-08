@@ -85,8 +85,9 @@ func TestFillNoiseBank_Statistics(t *testing.T) {
 	var sumSqReal, sumSqImag float64
 	n := float64(len(bank))
 	for _, c := range bank {
-		sumSqReal += real(c) * real(c)
-		sumSqImag += imag(c) * imag(c)
+		re, im := float64(real(c)), float64(imag(c))
+		sumSqReal += re * re
+		sumSqImag += im * im
 	}
 	gotStdReal := math.Sqrt(sumSqReal / n)
 	gotStdImag := math.Sqrt(sumSqImag / n)

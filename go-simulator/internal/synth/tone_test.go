@@ -32,7 +32,7 @@ func TestSynthToneChannel_LandsInCorrectChannel(t *testing.T) {
 		t.Fatalf("len(samples) = %d, want 2048", len(samples))
 	}
 	// Sample 0 at zero delay must have phase 0 (amplitude on the real axis).
-	if diff := cmplx.Abs(samples[0] - complex(1.0, 0.0)); diff > 1e-9 {
+	if diff := cmplx.Abs(complex128(samples[0] - complex64(complex(1.0, 0.0)))); diff > 1e-9 {
 		t.Fatalf("samples[0] = %v, want ~1+0i (diff %v)", samples[0], diff)
 	}
 }
@@ -60,7 +60,7 @@ func TestSynthToneChannel_DelayMatchesAnalyticPhaseShift(t *testing.T) {
 	expectedShift := -2.0 * math.Pi * freqHz * (tauNs * 1e-9)
 	for i := range zeroDelay {
 		ratio := withDelay[i] / zeroDelay[i]
-		gotPhase := cmplx.Phase(ratio)
+		gotPhase := cmplx.Phase(complex128(ratio))
 		// wrap expectedShift into (-pi, pi] the same way cmplx.Phase does
 		wanted := math.Atan2(math.Sin(expectedShift), math.Cos(expectedShift))
 		if diff := math.Abs(gotPhase - wanted); diff > 1e-6 {
@@ -81,10 +81,10 @@ func TestSynthToneChannel_HPolOffsetAppliesOnlyToHPol(t *testing.T) {
 	_, hSamplesWithOffset := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 50.0, true, 0.0, 925_925.925925926, 4)
 
 	for i := range vSamples {
-		if cmplx.Abs(vSamples[i]-hSamplesNoOffset[i]) > 1e-12 {
+		if cmplx.Abs(complex128(vSamples[i]-hSamplesNoOffset[i])) > 1e-12 {
 			t.Fatalf("sample %d: V (ypol offset present but isHPol=false) and H (zero offset) should match, got %v vs %v", i, vSamples[i], hSamplesNoOffset[i])
 		}
-		if cmplx.Abs(hSamplesWithOffset[i]-hSamplesNoOffset[i]) < 1e-9 {
+		if cmplx.Abs(complex128(hSamplesWithOffset[i]-hSamplesNoOffset[i])) < 1e-9 {
 			t.Fatalf("sample %d: H-pol with a nonzero ypol_offset_ns should differ from zero-offset H-pol, got equal values %v", i, hSamplesWithOffset[i])
 		}
 	}

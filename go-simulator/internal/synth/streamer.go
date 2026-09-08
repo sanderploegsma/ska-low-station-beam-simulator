@@ -75,7 +75,7 @@ type DirectSynthesisStreamer struct {
 
 	nTiles       int
 	tileNSamples int
-	banks        map[string][]complex128 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels)
+	banks        map[string][]complex64 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels)
 
 	numWorkers int
 }
@@ -127,7 +127,7 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		obsTimeRef:        cfg.ObsTimeRef,
 		toneCfgs:          cfg.ToneSources,
 		noiseCfg:          cfg.Noise,
-		banks:             make(map[string][]complex128),
+		banks:             make(map[string][]complex64),
 	}
 
 	if cfg.Noise != nil {
@@ -215,6 +215,52 @@ func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
 	return bankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.banks))
 }
 
+// quantizeSigmaMargin: how many standard deviations of noise-amplitude
+// headroom QuantizeScale reserves above the largest configured tone
+// amplitude, chosen so the probability of a real sample EVER clipping
+// is negligible across any realistic deployment lifetime, not just "low
+// for one heap." A complex sample's magnitude (sqrt(re²+im²), re/im each
+// i.i.d. N(0, std²)) follows a Rayleigh(std) distribution, whose tail is
+// P(magnitude > k·std) = exp(-k²/2). At k=8: ~1.3e-14 per SAMPLE. Even
+// at 384 channels × 2 pols × ~10^8 ticks (a deliberately absurd
+// multi-year-continuous-scanning upper bound -- real usage is nowhere
+// near this), the expected number of samples that would EVER exceed
+// this bound across that whole lifetime is under 0.001 -- see the
+// go-simulator README's quantization-scale section for the full
+// derivation. This margin does NOT change how noise is GENERATED (still
+// the same full-precision float64 Box-Muller draws, same statistics as
+// before) -- it only changes how conservatively the already-generated
+// value is digitized to fit int8 on the wire, i.e. it's a wire-format
+// precision choice, not a physics/statistics one.
+const quantizeSigmaMargin = 8.0
+
+// QuantizeScale returns the fixed per-sample quantization scale this
+// streamer's configuration implies (see
+// spead.SpsPacketizer.SetQuantizeScale, which this feeds): the largest
+// configured tone amplitude -- summed across every configured tone
+// source, as if they all happened to land in the same channel and add
+// exactly in phase, the true worst case, not just the typical one --
+// plus quantizeSigmaMargin standard deviations of noise headroom. Using
+// this instead of the original per-heap adaptive scale
+// (quantize8bitScale re-scanning every heap's actual samples for their
+// own max magnitude, every tick) removes that scan from the per-tick hot
+// path entirely -- a real, if smaller, measured cost on real hardware
+// (see the go-simulator README's profiling history). Returns 0 if this
+// streamer has neither noise nor tone configured (an all-silent config,
+// where the scale value is moot: every sample is exactly zero either
+// way) -- SpsPacketizer.SetQuantizeScale treats 0 as "use the adaptive
+// scale," which is harmless here since 0*anything=0 regardless of scale.
+func (s *DirectSynthesisStreamer) QuantizeScale() float64 {
+	bound := quantizeSigmaMargin * s.noiseStd
+	for _, ts := range s.toneCfgs {
+		bound += ts.Amplitude
+	}
+	if bound == 0 {
+		return 0
+	}
+	return 127.0 / (bound + 1e-12)
+}
+
 // GenerateNextTick implements common.Streamer. t is the absolute epoch
 // time of this tick's first sample; nSamples is the per-channel sample
 // count for this tick (at channelOutputRate). Writes directly into
@@ -233,7 +279,7 @@ func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
 // established elsewhere in this file as O(1) per tone, negligible next
 // to the noise fill, and splitting it would only complicate the
 // out-of-range-tone warning below for no real benefit.
-func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst map[string][][]complex128) {
+func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst map[string][][]complex64) {
 	tLocalRelStart := t - s.obsTimeRef
 
 	pols := [...]struct {
@@ -298,7 +344,7 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst 
 // call wg.Wait() itself: GenerateNextTick calls this once per pol
 // against one shared WaitGroup, so both pols' fills run fully in
 // parallel with each other too, not just within a pol.
-func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol string, noiseSeed uint64, dst [][]complex128, nSamples int, tLocalRelStart float64) {
+func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64) {
 	if s.numWorkers <= 1 {
 		s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, 0, s.numChannels)
 		return
@@ -324,7 +370,7 @@ func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol stri
 // copy across the whole range -- same total bytes moved, no cross-worker
 // synchronization needed beyond the caller's WaitGroup either way, since
 // disjoint dst[ch] slices can never alias.
-func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex128, nSamples int, tLocalRelStart float64, chStart, chEnd int) {
+func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64, chStart, chEnd int) {
 	if s.noiseCfg == nil {
 		for ch := chStart; ch < chEnd; ch++ {
 			out := dst[ch]

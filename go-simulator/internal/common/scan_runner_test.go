@@ -25,14 +25,14 @@ func (f *fakeStreamer) ChannelIDMap() []int {
 }
 func (f *fakeStreamer) NumChannels() int  { return f.numChannels }
 func (f *fakeStreamer) TickNSamples() int { return f.tickN }
-func (f *fakeStreamer) GenerateNextTick(t float64, n int, dst map[string][][]complex128) {
+func (f *fakeStreamer) GenerateNextTick(t float64, n int, dst map[string][][]complex64) {
 	f.mu.Lock()
 	f.callCount++
 	f.mu.Unlock()
 	for _, pol := range []string{"V", "H"} {
-		val := complex(t, 0)
+		val := complex64(complex(t, 0))
 		if pol == "H" {
-			val = complex(t, 1)
+			val = complex64(complex(t, 1))
 		}
 		for _, chBuf := range dst[pol] {
 			for i := range chBuf {

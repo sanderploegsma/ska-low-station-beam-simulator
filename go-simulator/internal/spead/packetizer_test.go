@@ -64,11 +64,11 @@ func findItem(items []decodedItem, id uint16) (uint64, bool) {
 }
 
 func testHeap(channelID int, heapStartTime float64) *common.ChannelHeap {
-	v := make([]complex128, common.HeapLen)
-	h := make([]complex128, common.HeapLen)
+	v := make([]complex64, common.HeapLen)
+	h := make([]complex64, common.HeapLen)
 	for i := range v {
-		v[i] = complex(float64(i%128)-64, float64((i+10)%128)-64)
-		h[i] = complex(float64((i+30)%128)-64, float64((i+60)%128)-64)
+		v[i] = complex64(complex(float64(i%128)-64, float64((i+10)%128)-64))
+		h[i] = complex64(complex(float64((i+30)%128)-64, float64((i+60)%128)-64))
 	}
 	return &common.ChannelHeap{ChannelID: channelID, VSamples: v, HSamples: h, HeapStartTime: heapStartTime}
 }
@@ -138,8 +138,8 @@ func TestEncodeChannelHeap_PayloadInterleavesVHRealImag(t *testing.T) {
 	// sample is 3+4i (magnitude 5) and every H sample is 0+5i (magnitude
 	// 5) -- quantize8bit scales V and H INDEPENDENTLY, each by
 	// 127/max(|samples|), so both scale by 127/5=25.4 here.
-	v := make([]complex128, common.HeapLen)
-	h := make([]complex128, common.HeapLen)
+	v := make([]complex64, common.HeapLen)
+	h := make([]complex64, common.HeapLen)
 	for i := range v {
 		v[i] = complex(3.0, 4.0)
 		h[i] = complex(0.0, 5.0)
@@ -168,6 +168,57 @@ func TestEncodeChannelHeap_PayloadInterleavesVHRealImag(t *testing.T) {
 	}
 	if got := int8(payload[3]); got != wantHImag {
 		t.Fatalf("payload[3] (Himag) = %d, want %d", got, wantHImag)
+	}
+}
+
+func TestEncodeChannelHeap_FixedQuantizeScaleOverridesAdaptive(t *testing.T) {
+	station := &common.StationConfig{StationID: 1}
+	p := NewSpsPacketizer(station, nil)
+
+	v := make([]complex64, common.HeapLen)
+	h := make([]complex64, common.HeapLen)
+	for i := range v {
+		v[i] = complex(3.0, 4.0) // magnitude 5
+		h[i] = complex(0.0, 5.0) // magnitude 5
+	}
+	heap := &common.ChannelHeap{ChannelID: 0, VSamples: v, HSamples: h, HeapStartTime: 1_700_000_000.0}
+
+	// A fixed scale of exactly 1.0 (nothing like the adaptive 127/5=25.4
+	// TestEncodeChannelHeap_PayloadInterleavesVHRealImag exercises) --
+	// confirms SetQuantizeScale actually takes effect instead of being
+	// silently ignored in favor of the adaptive scan.
+	p.SetQuantizeScale(1.0)
+	raw, err := p.EncodeChannelHeap(heap)
+	if err != nil {
+		t.Fatalf("EncodeChannelHeap: %v", err)
+	}
+	_, payload := decodeHeap(t, raw)
+
+	wantVReal, wantVImag := int8(3), int8(4) // round(3*1.0), round(4*1.0) -- NOT the adaptive 76/102
+	wantHReal, wantHImag := int8(0), int8(5)
+	if got := int8(payload[0]); got != wantVReal {
+		t.Fatalf("payload[0] (Vreal) = %d, want %d (fixed scale=1.0 should give exact unscaled rounding)", got, wantVReal)
+	}
+	if got := int8(payload[1]); got != wantVImag {
+		t.Fatalf("payload[1] (Vimag) = %d, want %d", got, wantVImag)
+	}
+	if got := int8(payload[2]); got != wantHReal {
+		t.Fatalf("payload[2] (Hreal) = %d, want %d", got, wantHReal)
+	}
+	if got := int8(payload[3]); got != wantHImag {
+		t.Fatalf("payload[3] (Himag) = %d, want %d", got, wantHImag)
+	}
+
+	// SetQuantizeScale(0) must restore the original adaptive behavior --
+	// same expectation as TestEncodeChannelHeap_PayloadInterleavesVHRealImag.
+	p.SetQuantizeScale(0)
+	raw, err = p.EncodeChannelHeap(heap)
+	if err != nil {
+		t.Fatalf("EncodeChannelHeap after resetting to adaptive: %v", err)
+	}
+	_, payload = decodeHeap(t, raw)
+	if got := int8(payload[0]); got != 76 {
+		t.Fatalf("payload[0] (Vreal) after SetQuantizeScale(0) = %d, want 76 (adaptive scale should be restored)", got)
 	}
 }
 
@@ -263,7 +314,7 @@ func TestEncodeChannelHeapInto_RejectsWrongDstLength(t *testing.T) {
 func TestQuantize8bit_ScalesByComplexMagnitude(t *testing.T) {
 	// Both samples have magnitude 5 (3-4-5 triangle) -> scale = 127/5 =
 	// 25.4, applied per-component.
-	samples := []complex128{complex(3, 4), complex(-3, -4)}
+	samples := []complex64{complex(3, 4), complex(-3, -4)}
 	realOut, imagOut := quantize8bit(samples)
 	if realOut[0] != 76 { // round(3 * 25.4) = round(76.2)
 		t.Fatalf("realOut[0] = %d, want 76", realOut[0])
@@ -283,7 +334,7 @@ func TestQuantize8bit_ClipsToInt8Range(t *testing.T) {
 	// One large outlier sets the scale; a component that would otherwise
 	// round past +/-127 due to floating point must be clipped, not
 	// overflow/wrap.
-	samples := []complex128{complex(1000, 1000), complex(1, 0)}
+	samples := []complex64{complex(1000, 1000), complex(1, 0)}
 	realOut, _ := quantize8bit(samples)
 	if realOut[0] > 127 || realOut[0] < -128 {
 		t.Fatalf("realOut[0] = %d, out of int8 range", realOut[0])
@@ -291,11 +342,54 @@ func TestQuantize8bit_ClipsToInt8Range(t *testing.T) {
 }
 
 func TestQuantize8bit_AllZeroSamplesDoesNotPanic(t *testing.T) {
-	samples := make([]complex128, common.HeapLen)
+	samples := make([]complex64, common.HeapLen)
 	realOut, imagOut := quantize8bit(samples)
 	for i := range realOut {
 		if realOut[i] != 0 || imagOut[i] != 0 {
 			t.Fatalf("expected all-zero output for all-zero input, got (%d, %d) at %d", realOut[i], imagOut[i], i)
 		}
 	}
+}
+
+// BenchmarkEncodeChannelHeapInto isolates the per-heap encode cost (scale
+// pass + quantize/round/clamp + header/item writes) from noise
+// generation/copying -- the real-hardware profile that motivated
+// quantizeComponent/quantize8bitScale's sqrt/round fixes measured this
+// path (spead.BatchSendLoop's per-heap work) at ~46% of ALL CPU time on
+// the target EPYC box, dominated by a per-sample math.Sqrt and two
+// per-sample math.Round calls (see those functions' doc comments). Not a
+// substitute for a real target-hardware profile -- this dev machine's
+// core count/microarchitecture differ -- but a same-machine before/after
+// comparison here is a direct, cheap way to confirm those fixes actually
+// reduced CPU time before the target hardware confirms the real-world
+// magnitude.
+func BenchmarkEncodeChannelHeapInto(b *testing.B) {
+	station := &common.StationConfig{StationID: 1, SubstationID: 0, SubarrayID: 1, BeamID: 1, ScanID: 1}
+	heap := testHeap(0, 1_700_000_000.0)
+	dst := make([]byte, heapWireSizeBytes)
+
+	// Sub-benchmarks the DEFAULT adaptive per-heap scale (quantize8bitScale
+	// re-scanning heap.VSamples/HSamples for their own max magnitude, every
+	// call) against a FIXED scale (SetQuantizeScale, see
+	// synth.DirectSynthesisStreamer.QuantizeScale) -- isolates exactly the
+	// cost the fixed-scale path is meant to remove.
+	b.Run("adaptive", func(b *testing.B) {
+		p := NewSpsPacketizer(station, nil)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := p.EncodeChannelHeapInto(dst, heap); err != nil {
+				b.Fatalf("EncodeChannelHeapInto: %v", err)
+			}
+		}
+	})
+	b.Run("fixed_scale", func(b *testing.B) {
+		p := NewSpsPacketizer(station, nil)
+		p.SetQuantizeScale(127.0 / 200.0) // arbitrary but representative fixed scale
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := p.EncodeChannelHeapInto(dst, heap); err != nil {
+				b.Fatalf("EncodeChannelHeapInto: %v", err)
+			}
+		}
+	})
 }

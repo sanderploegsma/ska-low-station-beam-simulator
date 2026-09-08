@@ -19,8 +19,8 @@ func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
 	for _, numChannels := range []int{96, 384} {
 		b.Run("channels="+strconv.Itoa(numChannels), func(b *testing.B) {
 			acc := NewHeapAccumulator(numChannels, 0, 1.0, nil)
-			vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
-			hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(c), float64(r)) })
+			vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return complex64(complex(float64(r), float64(c))) })
+			hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return complex64(complex(float64(c), float64(r))) })
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				acc.Add("V", vChunk)
@@ -40,8 +40,8 @@ func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
 // makeChunk builds a flat, CHANNEL-MAJOR (numChannels, rows) chunk
 // (index = ch*rows+row), matching Streamer.GenerateNextTick's real
 // output layout -- see common.Streamer's doc comment.
-func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex128) []complex128 {
-	chunk := make([]complex128, rows*numChannels)
+func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex64) []complex64 {
+	chunk := make([]complex64, rows*numChannels)
 	for c := 0; c < numChannels; c++ {
 		for r := 0; r < rows; r++ {
 			chunk[c*rows+r] = valueFor(r, c)
@@ -53,7 +53,7 @@ func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex128) []c
 func TestHeapAccumulator_NoHeapUntilFull(t *testing.T) {
 	numChannels := 3
 	acc := NewHeapAccumulator(numChannels, 0, 1.0, nil)
-	chunk := makeChunk(numChannels, HeapLen-1, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
+	chunk := makeChunk(numChannels, HeapLen-1, func(r, c int) complex64 { return complex64(complex(float64(r), float64(c))) })
 	acc.Add("V", chunk)
 	acc.Add("H", chunk)
 	if heaps := acc.PopReadyHeaps(); len(heaps) != 0 {
@@ -65,8 +65,8 @@ func TestHeapAccumulator_EmitsOneHeapPerChannel(t *testing.T) {
 	numChannels := 4
 	acc := NewHeapAccumulator(numChannels, 100.0, 2.0, nil)
 
-	vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(r), float64(c)) })
-	hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return complex(float64(c), float64(r)) })
+	vChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return complex64(complex(float64(r), float64(c))) })
+	hChunk := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return complex64(complex(float64(c), float64(r))) })
 	acc.Add("V", vChunk)
 	acc.Add("H", hChunk)
 
@@ -86,7 +86,7 @@ func TestHeapAccumulator_EmitsOneHeapPerChannel(t *testing.T) {
 			t.Fatalf("channel %d: HeapStartTime = %v, want 100.0", h.ChannelID, h.HeapStartTime)
 		}
 		// Spot-check a couple of samples landed in the right column.
-		if real(h.VSamples[5]) != 5 || imag(h.VSamples[5]) != float64(h.ChannelID) {
+		if real(h.VSamples[5]) != 5 || float64(imag(h.VSamples[5])) != float64(h.ChannelID) {
 			t.Fatalf("channel %d: VSamples[5] = %v, want (5+%di)", h.ChannelID, h.VSamples[5], h.ChannelID)
 		}
 	}
@@ -102,7 +102,7 @@ func TestHeapAccumulator_SecondHeapAdvancesStartTime(t *testing.T) {
 	sampleRate := 4.0
 	acc := NewHeapAccumulator(numChannels, 0.0, sampleRate, nil)
 
-	full := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return 0 })
+	full := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return 0 })
 	acc.Add("V", full)
 	acc.Add("H", full)
 	acc.Add("V", full)
@@ -138,8 +138,8 @@ func TestHeapAccumulator_PrepareWriteDirectFill(t *testing.T) {
 			t.Fatalf("channel %d: target length v=%d h=%d, want %d", ch, len(vTargets[ch]), len(hTargets[ch]), HeapLen)
 		}
 		for i := 0; i < HeapLen; i++ {
-			vTargets[ch][i] = complex(float64(i), float64(ch))
-			hTargets[ch][i] = complex(float64(ch), float64(i))
+			vTargets[ch][i] = complex64(complex(float64(i), float64(ch)))
+			hTargets[ch][i] = complex64(complex(float64(ch), float64(i)))
 		}
 	}
 
@@ -148,10 +148,10 @@ func TestHeapAccumulator_PrepareWriteDirectFill(t *testing.T) {
 		t.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
 	}
 	for _, h := range heaps {
-		if real(h.VSamples[5]) != 5 || imag(h.VSamples[5]) != float64(h.ChannelID) {
+		if real(h.VSamples[5]) != 5 || float64(imag(h.VSamples[5])) != float64(h.ChannelID) {
 			t.Fatalf("channel %d: VSamples[5] = %v, want (5+%di) -- direct-write target wasn't reflected in the popped heap", h.ChannelID, h.VSamples[5], h.ChannelID)
 		}
-		if real(h.HSamples[5]) != float64(h.ChannelID) || imag(h.HSamples[5]) != 5 {
+		if float64(real(h.HSamples[5])) != float64(h.ChannelID) || imag(h.HSamples[5]) != 5 {
 			t.Fatalf("channel %d: HSamples[5] = %v, want (%d+5i)", h.ChannelID, h.HSamples[5], h.ChannelID)
 		}
 	}
@@ -165,8 +165,8 @@ func TestHeapAccumulator_ReleaseAndReusePreservesCorrectness(t *testing.T) {
 	hTargets := acc.PrepareWrite("H", HeapLen)
 	for ch := 0; ch < numChannels; ch++ {
 		for i := 0; i < HeapLen; i++ {
-			vTargets[ch][i] = complex(1.0, float64(ch))
-			hTargets[ch][i] = complex(2.0, float64(ch))
+			vTargets[ch][i] = complex64(complex(1.0, float64(ch)))
+			hTargets[ch][i] = complex64(complex(2.0, float64(ch)))
 		}
 	}
 	heaps := acc.PopReadyHeaps()
@@ -185,19 +185,19 @@ func TestHeapAccumulator_ReleaseAndReusePreservesCorrectness(t *testing.T) {
 	hTargets = acc.PrepareWrite("H", HeapLen)
 	for ch := 0; ch < numChannels; ch++ {
 		for i := 0; i < HeapLen; i++ {
-			vTargets[ch][i] = complex(3.0, float64(ch))
-			hTargets[ch][i] = complex(4.0, float64(ch))
+			vTargets[ch][i] = complex64(complex(3.0, float64(ch)))
+			hTargets[ch][i] = complex64(complex(4.0, float64(ch)))
 		}
 	}
 	heaps = acc.PopReadyHeaps()
 	for _, h := range heaps {
 		for i, v := range h.VSamples {
-			if v != complex(3.0, float64(h.ChannelID)) {
+			if v != complex64(complex(3.0, float64(h.ChannelID))) {
 				t.Fatalf("channel %d: VSamples[%d] = %v, want (3+%di) -- stale released data leaked through", h.ChannelID, i, v, h.ChannelID)
 			}
 		}
 		for i, v := range h.HSamples {
-			if v != complex(4.0, float64(h.ChannelID)) {
+			if v != complex64(complex(4.0, float64(h.ChannelID))) {
 				t.Fatalf("channel %d: HSamples[%d] = %v, want (4+%di)", h.ChannelID, i, v, h.ChannelID)
 			}
 		}
@@ -214,7 +214,7 @@ func TestHeapAccumulator_CustomChannelIDMap(t *testing.T) {
 	channelIDMap := []int{64, 72} // e.g. a station's first_channel_id offset
 	acc := NewHeapAccumulator(numChannels, 0, 1.0, channelIDMap)
 
-	full := makeChunk(numChannels, HeapLen, func(r, c int) complex128 { return 0 })
+	full := makeChunk(numChannels, HeapLen, func(r, c int) complex64 { return 0 })
 	acc.Add("V", full)
 	acc.Add("H", full)
 

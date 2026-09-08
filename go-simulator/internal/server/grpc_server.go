@@ -195,6 +195,15 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 
+	// Updates the SHARED SenderPool's packetizer -- that pool was created
+	// once at Start(), before this (or any) scan's noise/tone config was
+	// known, and may outlive many scans with different configs, so this
+	// must be a live update, not a construction-time value (see
+	// spead.SpsPacketizer.SetQuantizeScale's doc comment).
+	if s.senderPool != nil {
+		s.senderPool.SetQuantizeScale(streamer.QuantizeScale())
+	}
+
 	s.delayFeeds = delayFeeds
 	s.scanRunner = common.NewScanRunner(streamer, s.sendQueue, req.ObsTimeEpochS, req.ScanDurationS)
 	s.scanRunner.Start()

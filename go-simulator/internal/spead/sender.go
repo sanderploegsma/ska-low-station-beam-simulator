@@ -140,8 +140,9 @@ func UDPSenderSockets(localAddr, destAddr *net.UDPAddr, n, sndBufBytes int) ([]*
 // setup/teardown both the gRPC-served simulator and the standalone
 // noise-only CLI need around UDPSenderSockets/BatchSendLoop.
 type SenderPool struct {
-	conns []*net.UDPConn
-	wg    sync.WaitGroup
+	conns      []*net.UDPConn
+	wg         sync.WaitGroup
+	packetizer *SpsPacketizer
 }
 
 // NewSenderPool dials n sockets (see UDPSenderSockets) and starts one
@@ -158,7 +159,7 @@ func NewSenderPool(station *common.StationConfig, recv <-chan *common.ChannelHea
 	// supplies its own BatchSender/socket as a separate argument.
 	packetizer := NewSpsPacketizer(station, nil)
 
-	pool := &SenderPool{conns: conns}
+	pool := &SenderPool{conns: conns, packetizer: packetizer}
 	for _, conn := range conns {
 		sender := NewUDPBatchSender(conn)
 		pool.wg.Add(1)
@@ -168,6 +169,17 @@ func NewSenderPool(station *common.StationConfig, recv <-chan *common.ChannelHea
 		}()
 	}
 	return pool, nil
+}
+
+// SetQuantizeScale updates the shared packetizer's fixed quantization
+// scale (see SpsPacketizer.SetQuantizeScale) -- safe to call while
+// sender goroutines are already running (atomic under the hood), and
+// safe to call more than once across a process's lifetime, since one
+// SenderPool -- and the single packetizer its goroutines share -- can
+// outlive many scans with different noise/tone configs on the
+// gRPC-served path (see server.Server.Start's doc comment).
+func (p *SenderPool) SetQuantizeScale(scale float64) {
+	p.packetizer.SetQuantizeScale(scale)
 }
 
 // Close waits for every sender goroutine to return, then closes all

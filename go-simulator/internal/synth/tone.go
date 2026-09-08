@@ -42,12 +42,12 @@ func synthToneChannel(
 	isHPol bool,
 	tLocalRelStart, sampleRatePerChannel float64,
 	nSamples int,
-) (channelIdx int, samples []complex128) {
+) (channelIdx int, samples []complex64) {
 	channelIdx = int(math.Round((freqHz - baseFreqHz) / channelWidthHz))
 	channelCenter := baseFreqHz + float64(channelIdx)*channelWidthHz
 	residualFreq := freqHz - channelCenter
 
-	samples = make([]complex128, nSamples)
+	samples = make([]complex64, nSamples)
 	for i := 0; i < nSamples; i++ {
 		tLocal := tLocalRelStart + float64(i)/sampleRatePerChannel
 		tPoly := polyTRelStart + float64(i)/sampleRatePerChannel
@@ -56,8 +56,12 @@ func synthToneChannel(
 			tauNs += ypolOffsetNs
 		}
 		tauS := tauNs * 1e-9
+		// Phase accumulation/delay evaluation stays float64 throughout
+		// (see this function's own doc comment on precision) -- only the
+		// finished sample narrows to complex64 on store, matching
+		// ChannelHeap's doc comment.
 		phase := 2.0*math.Pi*residualFreq*tLocal - 2.0*math.Pi*freqHz*tauS
-		samples[i] = cmplx.Rect(amplitude, phase)
+		samples[i] = complex64(cmplx.Rect(amplitude, phase))
 	}
 	return channelIdx, samples
 }

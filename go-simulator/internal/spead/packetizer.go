@@ -18,6 +18,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"sync/atomic"
 
 	"github.com/skao/station-beam-simulator-go/internal/common"
 )
@@ -63,6 +64,33 @@ func packAntennaInfo(substationID, subarrayID uint8, stationID uint16) uint64 {
 	return (uint64(substationID) << 40) | (uint64(subarrayID) << 32) | (uint64(stationID) << 16)
 }
 
+// quantizeComponent rounds v to the nearest int8 (half away from zero,
+// matching math.Round's convention) and clamps to [-128, 127], in one
+// branch-light pass. Replaces a separate math.Round + clampToInt8 call
+// pair: profiling a real end-to-end run at 384 channels found math.Round
+// alone at ~8% of ALL CPU time on this hot path (quantize8bitIntoPayload
+// runs it twice per sample, ~1.57M samples/tick at 384 channels) --
+// disproportionate for what it does here, since math.Round's
+// implementation spends real work on NaN/Inf/magnitude-≥2^52 cases that
+// can never occur for a synthesized sample scaled into roughly [-127,
+// 127]. v+copysign(0.5, v) then truncating (via the int8 conversion,
+// which truncates toward zero) gives the identical round-half-away-from-
+// zero result for every value in that range, without math.Round's
+// call/branch overhead.
+func quantizeComponent(v float64) int8 {
+	v += math.Copysign(0.5, v)
+	if v > 127 {
+		return 127
+	}
+	if v < -128 {
+		return -128
+	}
+	return int8(v)
+}
+
+// clampToInt8 clamps an already-rounded value to [-128, 127]. Kept
+// separate from quantizeComponent for quantize8bit/tests, which want the
+// clamp alone against a value someone else already rounded.
 func clampToInt8(v float64) int8 {
 	if v > 127 {
 		v = 127
@@ -73,35 +101,41 @@ func clampToInt8(v float64) int8 {
 }
 
 // quantize8bitScale computes the shared per-call scale factor quantize8bit
-// and quantize8bitIntoPayload both use. math.Sqrt, not cmplx.Abs
-// (=math.Hypot): profiling EncodeChannelHeap under real per-tick load
-// (see quantize8bitIntoPayload's doc comment) showed math.Hypot's
-// overflow/underflow-safe scaling as a measurable chunk of total CPU on
-// this hot path; that safety margin is unneeded here (synthesized sample
-// magnitudes are always small and finite, never anywhere near
-// float64's under/overflow range), so the plain, faster form is used.
-func quantize8bitScale(samples []complex128) float64 {
-	maxAbs := 0.0
+// and quantize8bitIntoPayload both use. Tracks the max SQUARED magnitude
+// across the loop and takes a single math.Sqrt at the end, not one per
+// sample: sqrt is monotonic for non-negative inputs, so
+// sqrt(re²+im²) > maxAbs is equivalent to re²+im² > maxAbs² without ever
+// computing the intermediate sqrt. Profiling found this loop's own
+// math.Sqrt call (one per sample, e.g. ~1.57M/tick at 384 channels) at
+// ~10% of ALL CPU time -- this eliminates all but one sqrt call per
+// channel/pol/tick (2047 of 2048 at HeapLen=2048), leaving the loop as a
+// plain multiply-add-compare. math.Sqrt, not cmplx.Abs (=math.Hypot):
+// Hypot's overflow/underflow-safe scaling is unneeded here (synthesized
+// sample magnitudes are always small and finite, nowhere near float64's
+// under/overflow range), so the plain, faster form is used for the final
+// sqrt too.
+func quantize8bitScale(samples []complex64) float64 {
+	maxSq := 0.0
 	for _, s := range samples {
-		re, im := real(s), imag(s)
-		if a := math.Sqrt(re*re + im*im); a > maxAbs {
-			maxAbs = a
+		re, im := float64(real(s)), float64(imag(s))
+		if sq := re*re + im*im; sq > maxSq {
+			maxSq = sq
 		}
 	}
-	return 127.0 / (maxAbs + 1e-12)
+	return 127.0 / (math.Sqrt(maxSq) + 1e-12)
 }
 
 // quantize8bit does per-call independent scaling to int8, matching
 // Python's quantize_8bit. Allocates a fresh pair of slices every call --
 // fine for tests and other one-off callers, but NOT used by
 // EncodeChannelHeap's hot path (see quantize8bitIntoPayload).
-func quantize8bit(samples []complex128) (outReal, outImag []int8) {
+func quantize8bit(samples []complex64) (outReal, outImag []int8) {
 	scale := quantize8bitScale(samples)
 	outReal = make([]int8, len(samples))
 	outImag = make([]int8, len(samples))
 	for i, s := range samples {
-		outReal[i] = clampToInt8(math.Round(real(s) * scale))
-		outImag[i] = clampToInt8(math.Round(imag(s) * scale))
+		outReal[i] = quantizeComponent(float64(real(s)) * scale)
+		outImag[i] = quantizeComponent(float64(imag(s)) * scale)
 	}
 	return outReal, outImag
 }
@@ -122,11 +156,10 @@ func quantize8bit(samples []complex128) (outReal, outImag []int8) {
 // budget. Fixed by writing every piece of a heap directly into its
 // (exactly-once-allocated) wire buffer instead: this function for the
 // payload, and EncodeChannelHeap's header/item-pointer writes below.
-func quantize8bitIntoPayload(samples []complex128, dst []byte, realOffset, stride int) {
-	scale := quantize8bitScale(samples)
+func quantize8bitIntoPayload(samples []complex64, dst []byte, realOffset, stride int, scale float64) {
 	for i, s := range samples {
-		dst[i*stride+realOffset] = byte(clampToInt8(math.Round(real(s) * scale)))
-		dst[i*stride+realOffset+1] = byte(clampToInt8(math.Round(imag(s) * scale)))
+		dst[i*stride+realOffset] = byte(quantizeComponent(float64(real(s)) * scale))
+		dst[i*stride+realOffset+1] = byte(quantizeComponent(float64(imag(s)) * scale))
 	}
 }
 
@@ -187,12 +220,60 @@ type Sender interface {
 type SpsPacketizer struct {
 	station *common.StationConfig
 	sender  Sender // nil: EncodeChannelHeap still works, SendChannelHeap does not
+
+	// quantizeScaleBits: math.Float64bits of a FIXED quantization scale
+	// (see SetQuantizeScale), 0 (its zero value) meaning "none set --
+	// fall back to the original per-heap ADAPTIVE scale" (quantize8bit's
+	// own quantize8bitScale scan). atomic, not a plain float64: a
+	// SpsPacketizer is shared read-only across every BatchSendLoop
+	// goroutine in a SenderPool (see NewSenderPool's doc comment), but
+	// this ONE field is the exception -- callers with a fixed noise/
+	// tone config known up front (synth.DirectSynthesisStreamer.
+	// QuantizeScale) set it once before a scan starts; the gRPC-served
+	// path's SenderPool outlives many scans with potentially different
+	// noise/tone configs (see server.Server.Start's doc comment: the
+	// pool is created once at process Start(), before any scan's config
+	// is known), so StartScan must be able to update it later, safely,
+	// while sender goroutines are already running against the previous
+	// scan's heaps draining out of the queue.
+	quantizeScaleBits atomic.Uint64
 }
 
 // NewSpsPacketizer constructs a packetizer. sender may be nil if only
-// EncodeChannelHeap (not SendChannelHeap) will be used.
+// EncodeChannelHeap (not SendChannelHeap) will be used. Quantization
+// defaults to the original adaptive per-heap scale until/unless
+// SetQuantizeScale is called.
 func NewSpsPacketizer(station *common.StationConfig, sender Sender) *SpsPacketizer {
 	return &SpsPacketizer{station: station, sender: sender}
+}
+
+// SetQuantizeScale sets a FIXED per-sample quantization scale, replacing
+// the default adaptive behavior (quantize8bitScale re-scanning every
+// heap's actual samples for their max magnitude, every tick). Pass 0 to
+// go back to adaptive. See synth.DirectSynthesisStreamer.QuantizeScale
+// for how a safe fixed scale is derived from a streamer's noise/tone
+// config -- this method only stores whatever value it's given, with no
+// opinion of its own about where it came from.
+//
+// Safe to call concurrently with EncodeChannelHeapInto (atomic store) --
+// required, not just convenient, since BatchSendLoop goroutines may
+// already be running against a SenderPool's shared packetizer by the
+// time a new scan's StartScan call wants to update this.
+func (p *SpsPacketizer) SetQuantizeScale(scale float64) {
+	p.quantizeScaleBits.Store(math.Float64bits(scale))
+}
+
+// resolveQuantizeScale returns the fixed scale if one is set (SKIPPING
+// samples entirely -- no per-heap scan, the whole point: see
+// quantize8bitScale's doc comment for the cost this avoids), otherwise
+// falls back to scanning samples adaptively, preserving this package's
+// original per-heap-optimal-scale behavior for any caller that hasn't
+// opted into a fixed scale.
+func (p *SpsPacketizer) resolveQuantizeScale(samples []complex64) float64 {
+	if bits := p.quantizeScaleBits.Load(); bits != 0 {
+		return math.Float64frombits(bits)
+	}
+	return quantize8bitScale(samples)
 }
 
 // EncodeChannelHeap builds the raw SPEAD-64-48 heap bytes for one
@@ -272,8 +353,8 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 	}
 
 	payload := dst[heapPayloadOffset:]
-	quantize8bitIntoPayload(heap.VSamples, payload, 0, 4) // Vreal at +0, Vimag at +1 of each 4-byte sample
-	quantize8bitIntoPayload(heap.HSamples, payload, 2, 4) // Hreal at +2, Himag at +3
+	quantize8bitIntoPayload(heap.VSamples, payload, 0, 4, p.resolveQuantizeScale(heap.VSamples)) // Vreal at +0, Vimag at +1 of each 4-byte sample
+	quantize8bitIntoPayload(heap.HSamples, payload, 2, 4, p.resolveQuantizeScale(heap.HSamples)) // Hreal at +2, Himag at +3
 	return nil
 }
 

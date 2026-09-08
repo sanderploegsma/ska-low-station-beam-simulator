@@ -45,7 +45,7 @@ type Streamer interface {
 	// downstream consumer (per-channel heap encoding) wants one
 	// channel's samples contiguous — see HeapAccumulator's doc comment
 	// for the transpose-elimination history this layout choice predates.
-	GenerateNextTick(t float64, n int, dst map[string][][]complex128)
+	GenerateNextTick(t float64, n int, dst map[string][][]complex64)
 }
 
 // HeapSender is anything that can send a ChannelHeap onward (SPEAD/UDP in
@@ -173,7 +173,7 @@ func (r *ScanRunner) run() {
 			}
 		}
 
-		dst := map[string][][]complex128{
+		dst := map[string][][]complex64{
 			"V": r.accumulator.PrepareWrite("V", r.nSamplesPerTick),
 			"H": r.accumulator.PrepareWrite("H", r.nSamplesPerTick),
 		}

@@ -40,7 +40,7 @@ func BenchmarkProducerTick(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				t := 1_700_000_000.0 + float64(i)*common.BlockDurationS
-				dst := map[string][][]complex128{
+				dst := map[string][][]complex64{
 					"V": acc.PrepareWrite("V", nSamples),
 					"H": acc.PrepareWrite("H", nSamples),
 				}

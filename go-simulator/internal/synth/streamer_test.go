@@ -14,12 +14,12 @@ func testStation() *common.StationConfig {
 // newDst builds a fresh V/H destination map for GenerateNextTick -- one
 // nSamples-long slice per channel, per pol, matching what
 // HeapAccumulator.PrepareWrite hands the real ScanRunner every tick.
-func newDst(numChannels, nSamples int) map[string][][]complex128 {
-	dst := make(map[string][][]complex128, 2)
+func newDst(numChannels, nSamples int) map[string][][]complex64 {
+	dst := make(map[string][][]complex64, 2)
 	for _, pol := range [...]string{"V", "H"} {
-		chBufs := make([][]complex128, numChannels)
+		chBufs := make([][]complex64, numChannels)
 		for ch := range chBufs {
-			chBufs[ch] = make([]complex128, nSamples)
+			chBufs[ch] = make([]complex64, nSamples)
 		}
 		dst[pol] = chBufs
 	}
@@ -29,12 +29,12 @@ func newDst(numChannels, nSamples int) map[string][][]complex128 {
 // flatten concatenates dst[pol] (per-channel slices) into one flat,
 // channel-major slice -- a convenience for tests written against the
 // old flat-buffer return value.
-func flatten(chBufs [][]complex128) []complex128 {
+func flatten(chBufs [][]complex64) []complex64 {
 	if len(chBufs) == 0 {
 		return nil
 	}
 	nSamples := len(chBufs[0])
-	out := make([]complex128, 0, len(chBufs)*nSamples)
+	out := make([]complex64, 0, len(chBufs)*nSamples)
 	for _, chBuf := range chBufs {
 		out = append(out, chBuf...)
 	}
@@ -124,7 +124,8 @@ func TestDirectSynthesisStreamer_ToneLandsInConfiguredChannel(t *testing.T) {
 			chSamples := out[ch]
 			for i := 0; i < n; i++ {
 				v := chSamples[i]
-				mag += real(v)*real(v) + imag(v)*imag(v)
+				re, im := float64(real(v)), float64(imag(v))
+				mag += re*re + im*im
 			}
 			if ch == channelIdx {
 				if mag < 1e-6 {
@@ -194,7 +195,7 @@ func TestDirectSynthesisStreamer_NoiseIsDeterministicAcrossRepeatedCalls(t *test
 func TestDirectSynthesisStreamer_NoiseIndependentAcrossStationSeeds(t *testing.T) {
 	n := 8
 	numChannels := 8
-	buildBankOutput := func(seed int64) []complex128 {
+	buildBankOutput := func(seed int64) []complex64 {
 		s, err := NewDirectSynthesisStreamer(StreamerConfig{
 			Station:      testStation(),
 			ObsTimeRef:   0,
@@ -270,7 +271,7 @@ func TestDirectSynthesisStreamer_NoiseNeverDelayCorrected(t *testing.T) {
 	feedB := common.NewDelayFeed("b")
 	feedB.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{1e6}}) // large delay
 
-	build := func(feed *common.DelayFeed) []complex128 {
+	build := func(feed *common.DelayFeed) []complex64 {
 		s, err := NewDirectSynthesisStreamer(StreamerConfig{
 			Station:     testStation(),
 			ObsTimeRef:  0,
@@ -300,6 +301,57 @@ func TestDirectSynthesisStreamer_NoiseNeverDelayCorrected(t *testing.T) {
 		if outA[i] != outB[i] {
 			t.Fatalf("sample %d differs between a zero-delay and a large-delay source (%v vs %v) -- noise must be delay-independent", i, outA[i], outB[i])
 		}
+	}
+}
+
+func TestDirectSynthesisStreamer_QuantizeScale_NoSourcesIsZero(t *testing.T) {
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{Station: testStation(), ObsTimeRef: 0, NumChannels: 8})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := s.QuantizeScale(); got != 0 {
+		t.Fatalf("QuantizeScale() with no noise/tone configured = %v, want 0 (moot -- every sample is zero anyway)", got)
+	}
+}
+
+func TestDirectSynthesisStreamer_QuantizeScale_NoiseOnlyMatchesSigmaMargin(t *testing.T) {
+	const std = 0.05
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{
+		Station: testStation(), ObsTimeRef: 0, NumChannels: 8,
+		Noise: &NoiseConfig{Std: std, Seed: 1},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := 127.0 / (quantizeSigmaMargin*std + 1e-12)
+	if got := s.QuantizeScale(); math.Abs(got-want) > 1e-6 {
+		t.Fatalf("QuantizeScale() = %v, want %v (127 / %v-sigma noise headroom)", got, want, quantizeSigmaMargin)
+	}
+}
+
+func TestDirectSynthesisStreamer_QuantizeScale_SumsAllToneAmplitudes(t *testing.T) {
+	feedA := common.NewDelayFeed("a")
+	feedA.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{0.0}})
+	feedB := common.NewDelayFeed("b")
+	feedB.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{0.0}})
+
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{
+		Station: testStation(), ObsTimeRef: 0, NumChannels: 8,
+		ToneSources: []ToneSourceConfig{
+			{DelayFeed: feedA, FreqHz: common.BaseFreqHz, Amplitude: 2.0},
+			{DelayFeed: feedB, FreqHz: common.BaseFreqHz + 8*common.ChannelWidthHz, Amplitude: 3.0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Worst case: both tones land in the same channel and add exactly in
+	// phase -- the bound must cover 2.0+3.0=5.0, not just the larger of
+	// the two, even though these two tones are actually configured in
+	// different channels here.
+	want := 127.0 / (5.0 + 1e-12)
+	if got := s.QuantizeScale(); math.Abs(got-want) > 1e-6 {
+		t.Fatalf("QuantizeScale() = %v, want %v (127 / sum-of-amplitudes)", got, want)
 	}
 }
 

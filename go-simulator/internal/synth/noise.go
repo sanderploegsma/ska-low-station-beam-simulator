@@ -62,9 +62,9 @@ func splitmix64Hash(seed, index uint64) uint64 {
 // see CLAUDE.md bug #16. Writing into disjoint slices of one
 // preallocated slice, as here, avoids that class of bug entirely, by
 // construction, not by later measurement).
-func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels int) []complex128 {
+func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels int) []complex64 {
 	tileLen := tileNSamples * numChannels
-	bank := make([]complex128, nTiles*tileLen)
+	bank := make([]complex64, nTiles*tileLen)
 	if nTiles == 0 {
 		return bank
 	}
@@ -103,7 +103,13 @@ func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels i
 			for i := start; i < start+chunk; i++ {
 				tile := bank[i*tileLen : (i+1)*tileLen]
 				for j := range tile {
-					tile[j] = complex(rng.NormFloat64()*std, rng.NormFloat64()*std)
+					// Box-Muller itself runs in float64 (rand/v2's
+					// NormFloat64) -- only the final draw narrows to
+					// complex64 on store, same principle as every other
+					// precision-sensitive-computation/lossy-final-output
+					// split in this codebase (see ChannelHeap's doc
+					// comment).
+					tile[j] = complex64(complex(rng.NormFloat64()*std, rng.NormFloat64()*std))
 				}
 			}
 		}(start, chunk, workerSeed1, workerSeed2)
@@ -114,7 +120,7 @@ func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels i
 }
 
 // bankMemoryBytes returns the total resident memory for a noise bank
-// across nPols polarisations (complex128 = 16 bytes).
+// across nPols polarisations (complex64 = 8 bytes).
 func bankMemoryBytes(nTiles, tileNSamples, numChannels, nPols int) int64 {
-	return int64(nTiles) * int64(tileNSamples) * int64(numChannels) * 16 * int64(nPols)
+	return int64(nTiles) * int64(tileNSamples) * int64(numChannels) * 8 * int64(nPols)
 }

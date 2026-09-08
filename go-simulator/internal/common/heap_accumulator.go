@@ -9,7 +9,7 @@ import (
 // available per channel, then emits one ChannelHeap per channel.
 //
 // Storage is PER-CHANNEL (bufV[ch]/bufH[ch], each its own growable,
-// contiguous []complex128), not one shared flat buffer — deliberately
+// contiguous []complex64), not one shared flat buffer — deliberately
 // matching Streamer.GenerateNextTick's channel-major (numChannels,
 // nSamples) output layout (see that interface's doc comment). This
 // replaced an earlier flat, sample-major design that had to TRANSPOSE
@@ -58,7 +58,7 @@ type HeapAccumulator struct {
 	channelIDMap         []int
 	numWorkers           int
 
-	bufV, bufH      [][]complex128 // per-channel, len == numChannels; bufV[ch] grows as ticks are added
+	bufV, bufH      [][]complex64 // per-channel, len == numChannels; bufV[ch] grows as ticks are added
 	rowsV, rowsH    int            // samples buffered per channel so far (same for every channel: Add always delivers every channel's share together)
 	samplesConsumed int64          // total per-channel samples already popped, for timestamping
 }
@@ -81,8 +81,8 @@ func NewHeapAccumulator(numChannels int, obsTime, sampleRatePerChannel float64, 
 		sampleRatePerChannel: sampleRatePerChannel,
 		channelIDMap:         channelIDMap,
 		numWorkers:           defaultParallelism(numChannels),
-		bufV:                 make([][]complex128, numChannels),
-		bufH:                 make([][]complex128, numChannels),
+		bufV:                 make([][]complex64, numChannels),
+		bufH:                 make([][]complex64, numChannels),
 	}
 }
 
@@ -141,14 +141,14 @@ func forEachChannelRange(numWorkers, numChannels int, fn func(chStart, chEnd int
 	wg.Wait()
 }
 
-// sampleBufferPool holds reusable, HeapLen-capacity []complex128 buffers
+// sampleBufferPool holds reusable, HeapLen-capacity []complex64 buffers
 // -- shared package-wide, not per-HeapAccumulator, since a buffer is
 // fungible once its previous contents have been fully consumed (see
 // ReleaseSampleBuffers): there is nothing accumulator-, channel-, or
 // pol-specific baked into the memory itself.
 var sampleBufferPool = sync.Pool{
 	New: func() any {
-		return make([]complex128, HeapLen)
+		return make([]complex64, HeapLen)
 	},
 }
 
@@ -160,8 +160,8 @@ var sampleBufferPool = sync.Pool{
 // zero-fill branch) always WRITES every cell before anything ever reads
 // it; nothing in this codebase relies on a fresh buffer starting at
 // zero.
-func getSampleBuffer() []complex128 {
-	return sampleBufferPool.Get().([]complex128)
+func getSampleBuffer() []complex64 {
+	return sampleBufferPool.Get().([]complex64)
 }
 
 // ReleaseSampleBuffers returns heap.VSamples/HSamples to
@@ -221,7 +221,7 @@ func ReleaseSampleBuffers(heap *ChannelHeap) {
 // Each channel's growth is independent (disjoint bufV[ch]/bufH[ch]
 // slices), so -- like Add and PopReadyHeaps -- this is split across
 // a.numWorkers goroutines by channel range.
-func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 {
+func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex64 {
 	if nSamples <= 0 {
 		return nil
 	}
@@ -229,7 +229,7 @@ func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 
 	if pol == "H" {
 		bufs = a.bufH
 	}
-	targets := make([][]complex128, a.numChannels)
+	targets := make([][]complex64, a.numChannels)
 	forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
 		for ch := chStart; ch < chEnd; ch++ {
 			old := bufs[ch]
@@ -243,7 +243,7 @@ func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 
 				copy(pooled, old) // no-op in the normal case: old is empty right after the previous PopReadyHeaps handoff
 				bufs[ch] = pooled[:newLen]
 			default:
-				grown := make([]complex128, newLen)
+				grown := make([]complex64, newLen)
 				copy(grown, old)
 				bufs[ch] = grown
 			}
@@ -267,7 +267,7 @@ func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 
 // path calls PrepareWrite directly instead, so generation can write into
 // the target slices without ever building chunk in the first place (see
 // PrepareWrite's doc comment).
-func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
+func (a *HeapAccumulator) Add(pol string, chunk []complex64) {
 	if len(chunk) == 0 {
 		return
 	}
@@ -307,7 +307,7 @@ func (a *HeapAccumulator) PopReadyHeaps() []*ChannelHeap {
 		// here, so takeHeapSlice below just reslices the array Add
 		// already built (one copy, in Add's append) instead of copying
 		// it a second time.
-		takeHeapSlice := func(buf []complex128) (heapSlice, remainder []complex128) {
+		takeHeapSlice := func(buf []complex64) (heapSlice, remainder []complex64) {
 			heapSlice = buf[:HeapLen:HeapLen] // 3-index: cap HeapLen so a future append by any holder can't alias into the leftover below
 			leftoverLen := len(buf) - HeapLen
 			if leftoverLen == 0 {
@@ -319,7 +319,7 @@ func (a *HeapAccumulator) PopReadyHeaps() []*ChannelHeap {
 			// rather than assuming. The old backing array is now owned
 			// by heapSlice, so the leftover must be copied OUT into a
 			// fresh array, not shifted in place.
-			remainder = make([]complex128, leftoverLen)
+			remainder = make([]complex64, leftoverLen)
 			copy(remainder, buf[HeapLen:])
 			return heapSlice, remainder
 		}

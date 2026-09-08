@@ -150,6 +150,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("starting SPEAD/UDP sender pool: %v", err)
 	}
+	pool.SetQuantizeScale(streamer.QuantizeScale())
 
 	runner := common.NewScanRunner(streamer, queue, obsTime, *scanDuration)
 	runner.Start()

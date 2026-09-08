@@ -414,3 +414,238 @@ defaults this whole session) trade meaningfully against the ~45% noise-
 copy cost above; real multi-pod co-scheduling on one physical node
 (every measurement above was one `noise-stream` process alone on the
 target box).
+
+### Follow-up: attacking the ~45%/~46% split directly (implemented, NOT yet target-hardware-validated)
+
+Re-reading the `cpu-384ch.pprof` capture behind the ~45%/~46% split
+above line by line (not just the two rollup percentages) found three
+concrete, mechanically-verifiable costs inside them that hadn't been
+addressed yet -- none of them require more threads (the "irreducible,
+regardless of core count" lesson from item 2e above still holds for a
+bulk copy's THREAD COUNT; it says nothing about the copy's total BYTE
+COUNT, which is a different lever):
+
+- **`runtime.memmove` (the noise-copy ~45%) moves twice the bytes it
+  needs to.** The whole pipeline -- noise tile bank, `HeapAccumulator`
+  storage, the SPEAD quantize passes that read it back out -- stored
+  samples as `complex128` (16 bytes), even though the wire format
+  quantizes every component down to int8 in the end (~2 decimal digits
+  of real resolution). `complex64` (8 bytes) leaves several orders of
+  magnitude more precision than that final step needs, while halving
+  every byte moved by the noise-copy AND by both quantize passes reading
+  the same buffer straight afterward. Phase-sensitive computation
+  (tone's NCO/delay-polynomial evaluation, noise's Box-Muller draw)
+  still happens entirely in `float64` -- only the FINAL sample value
+  narrows on store, the same precision-vs-storage split this codebase
+  already applies elsewhere. Changed throughout: `ChannelHeap`,
+  `HeapAccumulator`'s buffers/pool, `Streamer.GenerateNextTick`'s `dst`
+  type, the noise tile bank, `synthToneChannel`'s output, and the
+  `spead.quantize*` functions' input type. `go test -race ./...` clean
+  after.
+- **`quantize8bitScale` (~10% of total CPU) called `math.Sqrt` once per
+  SAMPLE** (e.g. ~1.57M calls/tick at 384 channels) just to find one
+  per-channel max magnitude. Since sqrt is monotonic for non-negative
+  inputs, tracking the max SQUARED magnitude across the loop and taking
+  ONE `math.Sqrt` at the end is exactly equivalent -- cuts 2047 of every
+  2048 sqrt calls at `HeapLen`=2048.
+- **`math.Round` (~8% of total CPU) ran twice per sample** in
+  `quantize8bitIntoPayload`, paying for NaN/Inf/magnitude-≥2^52 handling
+  that can never trigger on a sample already scaled into roughly
+  [-127, 127]. Replaced (`quantizeComponent`) with
+  `v + math.Copysign(0.5, v)` then truncate-on-conversion to int8 --
+  identical round-half-away-from-zero result for every value in that
+  range, fused with the clamp in one pass instead of two separate calls.
+
+**Not done, and deliberately left for a decision AFTER a real profile,
+not before**: `defaultParallelism`'s scheduler-overhead question raised
+while investigating this (a `findRunnable`/`schedule`/`stealWork`
+cluster at roughly 13% of one capture) wasn't touched -- item 2e above
+already found "throw more goroutines at a bandwidth-bound copy" to be a
+dead end once, and the fixes above change how much data that copy
+actually moves; re-chunking goroutine counts against a workload that's
+about to look different would be reasoning ahead of measurement. Get a
+fresh target-hardware profile with the changes above first.
+
+**Existing correctness tests all pass unchanged** (same rounding/clamp
+behavior verified bit-for-bit by `TestEncodeChannelHeap_
+PayloadInterleavesVHRealImag`'s exact expected byte values, which
+weren't touched), plus a new `BenchmarkEncodeChannelHeapInto` isolating
+just the per-heap encode cost. Dev-machine-only numbers (Apple M5, NOT
+the target box -- see this section's own opening caveat for why that
+matters): `BenchmarkProducerTick/channels=384` (noise-copy path) at
+212µs/tick, `BenchmarkEncodeChannelHeapInto` (quantize+encode path) at
+8.0µs/heap, 0 allocs. Useful as a "did this obviously break something or
+get slower" sanity check, NOT as a replacement for a real target-hardware
+profile -- next step is exactly that: re-profile `noise-stream` on the
+EPYC box the way the timeline above did, and confirm the ~45%/~46% split
+actually shrunk, not just that it should have.
+
+### Target-hardware validation of the above (`cpu-384ch.pprof`, 2026-09-08 13:25 CEST)
+
+Confirmed real, not just theoretical. New profile, same 384-channel
+noise-only workload, same box: 16.20s capture, 247.32s total samples
+(1526.71% -- avg. concurrency 15.27 cores), vs. the profile the fixes
+above were based on (60.59s, 1318.46s total, avg. concurrency 21.76
+cores). Comparing CPU-seconds-per-wall-clock-second (the fair way to
+compare two captures of different lengths):
+
+| cost | before (core-rate) | after (core-rate) | change |
+|---|---|---|---|
+| `runtime.memmove` (noise-copy) | 9.73 | 5.09 | **-47.7%** -- matches the theoretical complex64 halving almost exactly |
+| quantize+encode (`quantize8bitIntoPayload` cum) | 7.57 | 5.27 | **-30.4%** |
+| `spead.BatchSendLoop` cum (encode+send together) | 10.00 | 7.73 | -22.6% |
+| `WriteBatch` cum (network syscalls ALONE) | 2.19 | 2.24 | +2.3% (flat, as expected -- untouched code) |
+| **total avg. concurrency** | **21.76** | **15.27** | **-29.8%** |
+
+`WriteBatch` sitting flat while `BatchSendLoop`'s total dropped
+confirms the reduction is coming from the encode side, exactly where
+the fixes targeted it, not from some unrelated variance between runs.
+Total CPU-rate needed to sustain the same 384-channel workload dropped
+~30% -- a real, substantial reduction, not noise.
+
+**Still not enough to clear budget comfortably.** Per the logs from this
+same session: occasional drift of 1-10ms still occurs (down sharply from
+the pre-fix "occasional, self-recovering drift under 100ms" in the
+timeline above -- roughly a 10x reduction in overrun MAGNITUDE -- but
+still present). That's the correct signal to trust here, not profile
+arithmetic (see this section's own repeated "trust a direct measurement"
+caveat) -- occasional drift, even small, means the pipeline is still
+running close enough to the edge that it occasionally loses the race,
+not comfortably underneath it.
+
+**What's now dominant, ranked, from the fresh profile**:
+1. `runtime.memmove` -- still #1 even after halving (33.32% flat, was
+   44.70%). The noise-tile-bank copy remains the single largest line
+   item; it's now byte-width-minimal (complex64) short of not storing
+   full-precision samples for noise at all (see below).
+2. `quantizeComponent` (round+clamp) itself -- 15.90% flat/18.87% cum.
+   This is real per-sample work (two calls/sample, ~1.57M samples/tick
+   at 384ch) that the sqrt/round fixes made cheaper per-call but didn't
+   eliminate -- there's no further "wrong algorithm" fix left here, only
+   "do it to fewer samples" (see below) or SIMD, which Go's stdlib
+   doesn't expose.
+3. `quantize8bitScale`'s own loop -- dropped from 9.66% to 6.38%, a
+   real but smaller-than-hoped win: eliminating per-sample `math.Sqrt`
+   only removed part of this function's cost -- the remaining per-sample
+   multiply-add-compare loop (now also doing a `complex64`-to-`float64`
+   promotion per component) is still real work.
+4. Network send (`WriteBatch`/`sendmmsg`) -- ~14.2% cum, unchanged in
+   absolute rate, now proportionally more visible simply because
+   everything else got cheaper (Amdahl's law, not a regression).
+
+**Caveat on this specific capture**: 16.20s is short enough that a
+one-time cost (the noise tile bank's own construction --
+`fillNoiseBank.func1`/`NormFloat64`/`PCG.Uint64` show up at a combined
+~5.5% cum, which should be near-zero in true steady state) may be
+inflating the numbers above somewhat. Doesn't change the ranking or the
+core conclusion, but a longer capture (or one that starts profiling only
+after the bank fill completes) would give a cleaner steady-state-only
+read next time.
+
+**Next lever, implemented after review**: `memmove` staying #1 even at
+half the byte width pointed at the copy-then-separately-quantize round
+trip as the next target. The FULL version of that idea -- pre-quantizing
+the noise tile bank itself into int8 and skipping the complex64
+intermediate entirely for noise-only channels -- would need a bigger
+pipeline change (Streamer/HeapAccumulator/ChannelHeap all currently
+promise complex64 samples, not pre-quantized bytes) and was NOT done
+here; left as a still-open, larger follow-up if `memmove` remains the
+top cost after everything else below.
+
+What WAS implemented is the piece of that idea that doesn't require a
+pipeline change: replacing the ADAPTIVE per-heap scale
+(`quantize8bitScale` re-scanning every heap's actual samples for their
+own max magnitude, every tick -- itself still 6.38% of total CPU per the
+fresh profile above) with a FIXED scale computed ONCE from the streamer's
+own configuration and reused for every heap, removing that scan from the
+per-tick hot path entirely.
+
+**The science, for anyone revisiting this**: this changes ONLY how the
+already-generated noise gets digitized to fit int8 on the wire -- NOT
+how it's generated. Noise generation (independent per-station/per-pol
+seeded Box-Muller draws, full float64 precision, no delay-correction --
+see the Noise section of the parent Python CLAUDE.md, which this port
+follows) is completely untouched. The adaptive scheme finds each heap's
+own actual peak sample and scales so that peak exactly fills ±127; the
+fixed scheme instead reserves headroom based on the KNOWN statistics of
+Gaussian noise plus the largest configured tone amplitude, once, instead
+of re-measuring every heap. A complex sample's magnitude follows a
+Rayleigh(std) distribution, whose tail is `P(magnitude > k·std) =
+exp(-k²/2)` -- `synth.quantizeSigmaMargin = 8.0` was chosen so that even
+at 384 channels × 2 pols × ~10^8 ticks (a deliberately absurd
+multi-year-continuous-scanning upper bound, nowhere near real usage),
+the expected number of samples that would EVER exceed this bound across
+that whole lifetime is under 0.001 -- i.e. clipping risk is negligible,
+not just "low." The tradeoff that DOES exist: the fixed scheme doesn't
+re-optimize per heap, so a typical heap uses somewhat less of the full
+±127 range than the adaptive scheme's always-exactly-optimal fit --
+concretely, a pure-noise channel's quantization-noise-to-signal-power
+ratio works out to roughly 1/3000 (fixed, `quantizeSigmaMargin=8`) vs.
+roughly 1/12700 (adaptive, using a typical heap's actual ~3.9σ observed
+max over 2048 samples) -- about 4x more quantization noise with the
+fixed scheme, but both figures are utterly negligible next to the
+noise's own power (σ²) and unrelated to anything a delay-tracking/
+correlation/beamforming test could detect.
+`DirectSynthesisStreamer.QuantizeScale()` computes this bound as the SUM
+of every configured tone source's amplitude (worst case: all of them
+land in the same channel and add exactly in phase) plus
+`quantizeSigmaMargin` standard deviations of noise; 0 (meaning "use the
+original adaptive scale") if neither noise nor tone is configured.
+
+**Plumbing**: `spead.SpsPacketizer` gained `SetQuantizeScale`/an internal
+atomic scale field (0 = adaptive, the untouched default -- every existing
+test's exact expected byte values still pass unchanged with no call to
+`SetQuantizeScale` at all). `spead.SenderPool.SetQuantizeScale` forwards
+to its one shared packetizer -- needed because the gRPC-served path's
+`SenderPool` is created once at process `Start()`, before any scan's
+noise/tone config is known, and can outlive many scans with DIFFERENT
+configs (see `server.Server.Start`'s doc comment), so this has to be a
+live, thread-safe update (`StartScan` calls it), not a construction-time
+value. `cmd/noise-stream` calls it once right after constructing its
+streamer, since its config is known upfront from CLI flags.
+
+**Measured (dev machine, Apple M5, NOT the target box)**:
+`BenchmarkEncodeChannelHeapInto/adaptive` at 8058 ns/op vs.
+`/fixed_scale` at 4951 ns/op -- a 38.6% reduction in per-heap encode
+cost, isolating exactly the scan this removes. Same caveat as every
+other dev-machine number in this file: directional only, next real
+confirmation is another target-hardware profile.
+
+### Target-hardware validation of the fixed-scale fix (`cpu-384ch.pprof`, 2026-09-08 13:44 CEST)
+
+**Worked exactly as designed at the function level, but the aggregate
+effect was small and the observable outcome (drift) didn't meaningfully
+improve.** Both results matter and are recorded here, not just the
+first one.
+
+`quantize8bitScale` is now COMPLETELY ABSENT from the profile's top
+nodes -- direct confirmation the scan is gone. `EncodeChannelHeapInto`'s
+own cumulative cost dropped 17.2% (core-rate 5.31->4.40) between the two
+target-hardware captures (16.20s/247.32 samples -> 15.81s/235.04
+samples). Exactly what the fixed-scale change was supposed to do, and it
+did it.
+
+**But total avg. concurrency only dropped 15.27->14.87 cores (-2.6%)**,
+far short of the ~30% swing the complex64 change produced. Why: (a)
+`quantize8bitScale` was already down to a minority cost (6.38%, ~0.97
+core-rate) before this fix -- there was only ever a small amount left to
+remove here, unlike memmove; (b) `runtime.memmove` (untouched this
+round) moved core-rate 5.09->5.44 (+6.9%) between the two captures --
+almost certainly ordinary run-to-run variance on a shared host, not a
+regression (nothing in this change touches noise generation/copying),
+but it happened to offset a real chunk of the quantize win in this
+specific pair of captures.
+
+**Per the logs from this same test: largest drift 0.018s (18ms) --
+"similar performance" to before, per direct user observation.** Not
+better in any way that shows up in the metric that actually matters. This
+is the honest, expected result of a fix that targeted an already-minor
+cost: it was real, it's confirmed in the profile, and it still wasn't
+enough to move the needle on pacing. `memmove` remains the dominant,
+still-unaddressed cost (36.59% in this capture, arguably now MORE
+clearly the top target since the smaller win around it has been
+captured) -- the earlier-flagged "pre-quantize the tile bank into int8,
+skip the complex64 round-trip for noise-only channels" pipeline change
+remains the next real lever, and after this result it looks like the
+one actually worth the bigger engineering investment, not an optional
+nice-to-have alongside smaller wins.
