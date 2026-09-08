@@ -175,7 +175,11 @@ func TestDirectSynthesisStreamer_NoiseIndependentAcrossStationSeeds(t *testing.T
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		out := s.GenerateNextTick(0, s.TickNSamples())["V"]
+		// nSamples must match TileNSamples (n) here, not TickNSamples()
+		// (a fixed, much larger ICD-derived constant) -- a tile only
+		// has n*numChannels elements, and generation reads exactly one
+		// whole tile per call (see fillNoiseRange).
+		out := s.GenerateNextTick(0, n)["V"]
 		return append([]complex128(nil), out...)
 	}
 

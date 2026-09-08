@@ -1,5 +1,10 @@
 package common
 
+import (
+	"runtime"
+	"sync"
+)
+
 // HeapAccumulator buffers per-channel samples until HeapLen samples are
 // available per channel, then emits one ChannelHeap per channel.
 //
@@ -17,11 +22,25 @@ package common
 // to per-channel bulk memmoves (append/copy), never a per-element loop —
 // the same total bytes moved, but via the runtime's optimized memmove
 // instead of a scalar loop, and with far fewer, far larger allocations.
+//
+// Add and PopReadyHeaps both split their per-channel work across
+// numWorkers goroutines (see forEachChannelRange): profiling a real
+// end-to-end run on the target hardware found ScanRunner's single
+// producer goroutine (this type plus DirectSynthesisStreamer.
+// GenerateNextTick) running at ~99% duty cycle on ONE core for the
+// whole scan, unable to keep pace even after removing every allocation
+// this method used to make -- unlike sending (already parallelized
+// across SenderPool's goroutines), the producer had never been split
+// across cores at all. Each channel's work here is already fully
+// independent (disjoint bufV[ch]/bufH[ch] slices), so this is a direct
+// channel-range split, the same approach GenerateNextTick uses for its
+// own dominant cost.
 type HeapAccumulator struct {
 	numChannels          int
 	obsTime              float64
 	sampleRatePerChannel float64
 	channelIDMap         []int
+	numWorkers           int
 
 	bufV, bufH      [][]complex128 // per-channel, len == numChannels; bufV[ch] grows as ticks are added
 	rowsV, rowsH    int            // samples buffered per channel so far (same for every channel: Add always delivers every channel's share together)
@@ -45,9 +64,54 @@ func NewHeapAccumulator(numChannels int, obsTime, sampleRatePerChannel float64, 
 		obsTime:              obsTime,
 		sampleRatePerChannel: sampleRatePerChannel,
 		channelIDMap:         channelIDMap,
+		numWorkers:           defaultParallelism(numChannels),
 		bufV:                 make([][]complex128, numChannels),
 		bufH:                 make([][]complex128, numChannels),
 	}
+}
+
+// defaultParallelism caps worker/goroutine counts consistently with
+// internal/synth's identical helper (kept separate, not shared, since
+// common must not depend on synth): runtime.GOMAXPROCS(0) (which —
+// unlike runtime.NumCPU() — respects a Kubernetes pod's CPU
+// request/limit) capped to n and to 16.
+func defaultParallelism(n int) int {
+	w := runtime.GOMAXPROCS(0)
+	if w > n {
+		w = n
+	}
+	if w > 16 {
+		w = 16
+	}
+	if w < 1 {
+		w = 1
+	}
+	return w
+}
+
+// forEachChannelRange splits [0, numChannels) into numWorkers contiguous
+// ranges and runs fn on each in its own goroutine, waiting for all to
+// finish before returning. numWorkers<=1 (or too few channels to split)
+// runs fn once, synchronously, with no goroutine spawned at all.
+func forEachChannelRange(numWorkers, numChannels int, fn func(chStart, chEnd int)) {
+	if numWorkers <= 1 || numChannels <= 1 {
+		fn(0, numChannels)
+		return
+	}
+	chunkSize := (numChannels + numWorkers - 1) / numWorkers
+	var wg sync.WaitGroup
+	for chStart := 0; chStart < numChannels; chStart += chunkSize {
+		chEnd := chStart + chunkSize
+		if chEnd > numChannels {
+			chEnd = numChannels
+		}
+		wg.Add(1)
+		go func(chStart, chEnd int) {
+			defer wg.Done()
+			fn(chStart, chEnd)
+		}(chStart, chEnd)
+	}
+	wg.Wait()
 }
 
 // Add appends one tick's chunk -- flat, CHANNEL-MAJOR (numChannels,
@@ -55,7 +119,9 @@ func NewHeapAccumulator(numChannels int, obsTime, sampleRatePerChannel float64, 
 // Streamer.GenerateNextTick's output layout -- for the given
 // polarisation ("V" or "H"). Each channel's nSamples segment is a
 // contiguous run in chunk, so distributing it into bufV/bufH is
-// numChannels bulk appends, never a per-element copy.
+// numChannels bulk appends, never a per-element copy -- and, since each
+// channel's append is independent of every other's, split across
+// a.numWorkers goroutines by channel range.
 func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
 	if len(chunk) == 0 {
 		return
@@ -65,9 +131,11 @@ func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
 	if pol == "H" {
 		bufs = a.bufH
 	}
-	for ch := 0; ch < a.numChannels; ch++ {
-		bufs[ch] = append(bufs[ch], chunk[ch*nSamples:(ch+1)*nSamples]...)
-	}
+	forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
+		for ch := chStart; ch < chEnd; ch++ {
+			bufs[ch] = append(bufs[ch], chunk[ch*nSamples:(ch+1)*nSamples]...)
+		}
+	})
 	switch pol {
 	case "V":
 		a.rowsV += nSamples
@@ -92,27 +160,33 @@ func (a *HeapAccumulator) PopReadyHeaps() []*ChannelHeap {
 		// contiguous in bufV[ch]/bufH[ch]).
 		flatV := make([]complex128, a.numChannels*HeapLen)
 		flatH := make([]complex128, a.numChannels*HeapLen)
-		for ch := 0; ch < a.numChannels; ch++ {
-			copy(flatV[ch*HeapLen:(ch+1)*HeapLen], a.bufV[ch])
-			copy(flatH[ch*HeapLen:(ch+1)*HeapLen], a.bufH[ch])
+		iterHeaps := make([]*ChannelHeap, a.numChannels)
 
-			heaps = append(heaps, &ChannelHeap{
-				ChannelID:     a.channelIDMap[ch],
-				VSamples:      flatV[ch*HeapLen : (ch+1)*HeapLen],
-				HSamples:      flatH[ch*HeapLen : (ch+1)*HeapLen],
-				HeapStartTime: heapStartTime,
-			})
+		forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
+			for ch := chStart; ch < chEnd; ch++ {
+				copy(flatV[ch*HeapLen:(ch+1)*HeapLen], a.bufV[ch])
+				copy(flatH[ch*HeapLen:(ch+1)*HeapLen], a.bufH[ch])
 
-			// Shift each channel's leftover tail down IN PLACE (reusing
-			// its backing array's capacity) rather than reallocating --
-			// in the normal case (one HeapLen-sample tick per pop) the
-			// leftover is empty and this is a no-op.
-			remV := copy(a.bufV[ch], a.bufV[ch][HeapLen:])
-			a.bufV[ch] = a.bufV[ch][:remV]
-			remH := copy(a.bufH[ch], a.bufH[ch][HeapLen:])
-			a.bufH[ch] = a.bufH[ch][:remH]
-		}
+				iterHeaps[ch] = &ChannelHeap{
+					ChannelID:     a.channelIDMap[ch],
+					VSamples:      flatV[ch*HeapLen : (ch+1)*HeapLen],
+					HSamples:      flatH[ch*HeapLen : (ch+1)*HeapLen],
+					HeapStartTime: heapStartTime,
+				}
 
+				// Shift each channel's leftover tail down IN PLACE
+				// (reusing its backing array's capacity) rather than
+				// reallocating -- in the normal case (one HeapLen-sample
+				// tick per pop) the leftover is empty and this is a
+				// no-op.
+				remV := copy(a.bufV[ch], a.bufV[ch][HeapLen:])
+				a.bufV[ch] = a.bufV[ch][:remV]
+				remH := copy(a.bufH[ch], a.bufH[ch][HeapLen:])
+				a.bufH[ch] = a.bufH[ch][:remH]
+			}
+		})
+
+		heaps = append(heaps, iterHeaps...)
 		a.rowsV -= HeapLen
 		a.rowsH -= HeapLen
 	}
