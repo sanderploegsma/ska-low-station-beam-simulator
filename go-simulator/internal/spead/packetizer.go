@@ -18,7 +18,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"math/cmplx"
 
 	"github.com/skao/station-beam-simulator-go/internal/common"
 )
@@ -40,6 +39,18 @@ const (
 // PayloadLengthBytes: HeapLen * 4 bytes/sample, fixed by the ICD.
 const PayloadLengthBytes = 0x2000
 
+// numHeapItems: the ICD's fixed 6-item heap (see SpsPacketizer's doc
+// comment for the layout) -- never varies, so the wire buffer's total
+// size is a compile-time constant, not something EncodeChannelHeap needs
+// to compute per call.
+const (
+	numHeapItems      = 6
+	speadHeaderSize   = 8
+	itemPointerBytes  = 8
+	heapPayloadOffset = speadHeaderSize + numHeapItems*itemPointerBytes // 56
+	heapWireSizeBytes = heapPayloadOffset + PayloadLengthBytes          // 8248
+)
+
 // packChannelInfo builds the 0x3000 item value: 16 bits reserved | 16
 // bits beam_id | 16 bits frequency_id.
 func packChannelInfo(beamID, frequencyID uint32) uint64 {
@@ -52,26 +63,6 @@ func packAntennaInfo(substationID, subarrayID uint8, stationID uint16) uint64 {
 	return (uint64(substationID) << 40) | (uint64(subarrayID) << 32) | (uint64(stationID) << 16)
 }
 
-// buildHeapPayloadBytes interleaves as Vreal, Vimag, Hreal, Himag per
-// sample, per the ICD diagram.
-func buildHeapPayloadBytes(vI8, vQ8, hI8, hQ8 []int8) ([]byte, error) {
-	n := len(vI8)
-	if len(vQ8) != n || len(hI8) != n || len(hQ8) != n {
-		return nil, fmt.Errorf("mismatched sample slice lengths: v_i=%d v_q=%d h_i=%d h_q=%d", n, len(vQ8), len(hI8), len(hQ8))
-	}
-	payload := make([]byte, n*4)
-	for i := 0; i < n; i++ {
-		payload[4*i+0] = byte(vI8[i])
-		payload[4*i+1] = byte(vQ8[i])
-		payload[4*i+2] = byte(hI8[i])
-		payload[4*i+3] = byte(hQ8[i])
-	}
-	if len(payload) != PayloadLengthBytes {
-		return nil, fmt.Errorf("payload size %d != expected %d bytes", len(payload), PayloadLengthBytes)
-	}
-	return payload, nil
-}
-
 func clampToInt8(v float64) int8 {
 	if v > 127 {
 		v = 127
@@ -81,16 +72,31 @@ func clampToInt8(v float64) int8 {
 	return int8(v)
 }
 
-// quantize8bit does per-call independent scaling to int8, matching
-// Python's quantize_8bit.
-func quantize8bit(samples []complex128) (outReal, outImag []int8) {
+// quantize8bitScale computes the shared per-call scale factor quantize8bit
+// and quantize8bitIntoPayload both use. math.Sqrt, not cmplx.Abs
+// (=math.Hypot): profiling EncodeChannelHeap under real per-tick load
+// (see quantize8bitIntoPayload's doc comment) showed math.Hypot's
+// overflow/underflow-safe scaling as a measurable chunk of total CPU on
+// this hot path; that safety margin is unneeded here (synthesized sample
+// magnitudes are always small and finite, never anywhere near
+// float64's under/overflow range), so the plain, faster form is used.
+func quantize8bitScale(samples []complex128) float64 {
 	maxAbs := 0.0
 	for _, s := range samples {
-		if a := cmplx.Abs(s); a > maxAbs {
+		re, im := real(s), imag(s)
+		if a := math.Sqrt(re*re + im*im); a > maxAbs {
 			maxAbs = a
 		}
 	}
-	scale := 127.0 / (maxAbs + 1e-12)
+	return 127.0 / (maxAbs + 1e-12)
+}
+
+// quantize8bit does per-call independent scaling to int8, matching
+// Python's quantize_8bit. Allocates a fresh pair of slices every call --
+// fine for tests and other one-off callers, but NOT used by
+// EncodeChannelHeap's hot path (see quantize8bitIntoPayload).
+func quantize8bit(samples []complex128) (outReal, outImag []int8) {
+	scale := quantize8bitScale(samples)
 	outReal = make([]int8, len(samples))
 	outImag = make([]int8, len(samples))
 	for i, s := range samples {
@@ -100,35 +106,56 @@ func quantize8bit(samples []complex128) (outReal, outImag []int8) {
 	return outReal, outImag
 }
 
-// speadHeaderBytes builds the 8-byte SPEAD packet header: magic
-// (0x53)+version(0x04), the item-ID field width and heap-address field
-// width (fixed at SPEAD-64-48's 2 and 6 bytes), then the item-pointer
-// count. Layout matches the real SPEAD wire format (checked against
-// spead2's own source on the Python side); what differs from spead2 is
-// only WHICH items follow this header.
-func speadHeaderBytes(nItems int) []byte {
+// quantize8bitIntoPayload quantizes samples directly into dst at
+// dst[i*stride+realOffset] (real component) / dst[i*stride+realOffset+1]
+// (imag component) for each sample i -- no intermediate []int8
+// allocation at all, unlike quantize8bit. dst is the heap's own final
+// wire buffer (see EncodeChannelHeap): profiling a real end-to-end run
+// at 384 channels found EncodeChannelHeap consuming roughly a third of
+// all CPU time, dominated by per-heap allocation/zeroing overhead (~12
+// small allocations/heap previously: 4 quantize8bit slices, 1 payload
+// slice, 7 more from speadHeaderBytes/speadItemPointer each returning
+// their own []byte) at the required per-tick heap rate (e.g. ~174k
+// heaps/sec at 384 channels) -- competing for CPU with the producer
+// goroutine badly enough to explain "falling behind pacing" even though
+// the producer's OWN cost, measured in isolation, was well within
+// budget. Fixed by writing every piece of a heap directly into its
+// (exactly-once-allocated) wire buffer instead: this function for the
+// payload, and EncodeChannelHeap's header/item-pointer writes below.
+func quantize8bitIntoPayload(samples []complex128, dst []byte, realOffset, stride int) {
+	scale := quantize8bitScale(samples)
+	for i, s := range samples {
+		dst[i*stride+realOffset] = byte(clampToInt8(math.Round(real(s) * scale)))
+		dst[i*stride+realOffset+1] = byte(clampToInt8(math.Round(imag(s) * scale)))
+	}
+}
+
+// writeSpeadHeader writes the 8-byte SPEAD packet header into dst[:8]:
+// magic (0x53)+version(0x04), the item-ID field width and heap-address
+// field width (fixed at SPEAD-64-48's 2 and 6 bytes), then the
+// item-pointer count. Layout matches the real SPEAD wire format (checked
+// against spead2's own source on the Python side); what differs from
+// spead2 is only WHICH items follow this header.
+func writeSpeadHeader(dst []byte, nItems int) {
 	const heapAddressBytes = uint64(SpeadHeapAddressBits / 8)
 	const idBytes = uint64(SpeadItemPointerBits/8) - heapAddressBytes
 	word := (uint64(0x5300|SpeadVersion) << 48) | (idBytes << 40) | (heapAddressBytes << 32) | uint64(nItems)
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, word)
-	return b
+	binary.BigEndian.PutUint64(dst, word)
 }
 
-// speadItemPointer builds one IMMEDIATE SPEAD-64-48 item pointer (mode
-// bit set, value embedded directly in the pointer's low 48 bits). CBF's
-// 6-item heap never needs an ADDRESS-mode pointer.
-func speadItemPointer(itemID uint16, value uint64) ([]byte, error) {
+// writeSpeadItemPointer writes one IMMEDIATE SPEAD-64-48 item pointer
+// (mode bit set, value embedded directly in the pointer's low 48 bits)
+// into dst[:8]. CBF's 6-item heap never needs an ADDRESS-mode pointer.
+func writeSpeadItemPointer(dst []byte, itemID uint16, value uint64) error {
 	if uint64(itemID) > speadIDMask {
-		return nil, fmt.Errorf("item id %#x does not fit in %d bits", itemID, speadIDBits)
+		return fmt.Errorf("item id %#x does not fit in %d bits", itemID, speadIDBits)
 	}
 	if value > speadValueMask {
-		return nil, fmt.Errorf("value %#x for item %#x does not fit in %d bits", value, itemID, SpeadHeapAddressBits)
+		return fmt.Errorf("value %#x for item %#x does not fit in %d bits", value, itemID, SpeadHeapAddressBits)
 	}
 	pointer := (uint64(1) << 63) | (uint64(itemID) << SpeadHeapAddressBits) | value
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, pointer)
-	return b, nil
+	binary.BigEndian.PutUint64(dst, pointer)
+	return nil
 }
 
 // Sender is anything the encoded heap bytes can be written to — a
@@ -169,13 +196,17 @@ func NewSpsPacketizer(station *common.StationConfig, sender Sender) *SpsPacketiz
 }
 
 // EncodeChannelHeap builds the raw SPEAD-64-48 heap bytes for one
-// channel — the full on-wire payload of one UDP packet.
+// channel — the full on-wire payload of one UDP packet. Allocates
+// EXACTLY ONCE per call (buf itself, sized to the ICD's fixed 6-item/
+// HeapLen-payload wire size) -- everything else (header, item pointers,
+// quantized V/H payload) is written directly into buf at fixed offsets,
+// never through an intermediate slice. See quantize8bitIntoPayload's doc
+// comment for why this matters: at the real per-tick heap rate, the
+// previous per-call allocations (~12 small slices/heap) were themselves
+// a dominant cost, not just quantize8bit's own math.
 func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, error) {
-	vReal, vImag := quantize8bit(heap.VSamples)
-	hReal, hImag := quantize8bit(heap.HSamples)
-	payload, err := buildHeapPayloadBytes(vReal, vImag, hReal, hImag)
-	if err != nil {
-		return nil, err
+	if len(heap.VSamples) != PayloadLengthBytes/4 || len(heap.HSamples) != PayloadLengthBytes/4 {
+		return nil, fmt.Errorf("heap ch=%d: VSamples/HSamples must have length %d, got v=%d h=%d", heap.ChannelID, PayloadLengthBytes/4, len(heap.VSamples), len(heap.HSamples))
 	}
 
 	// "packet count since SKA epoch" -- count of HeapLen-sample BLOCKS
@@ -194,7 +225,7 @@ func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, err
 		id    uint16
 		value uint64
 	}
-	items := [...]item{
+	items := [numHeapItems]item{
 		{0x0001, heapCounter},
 		{0x0004, PayloadLengthBytes},
 		{0x3010, uint64(p.station.ScanID)},
@@ -203,16 +234,19 @@ func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, err
 		{0x3300, 0x0},
 	}
 
-	buf := make([]byte, 0, 8+8*len(items)+len(payload))
-	buf = append(buf, speadHeaderBytes(len(items))...)
+	buf := make([]byte, heapWireSizeBytes)
+	writeSpeadHeader(buf[:speadHeaderSize], numHeapItems)
+	offset := speadHeaderSize
 	for _, it := range items {
-		ptr, err := speadItemPointer(it.id, it.value)
-		if err != nil {
+		if err := writeSpeadItemPointer(buf[offset:offset+itemPointerBytes], it.id, it.value); err != nil {
 			return nil, err
 		}
-		buf = append(buf, ptr...)
+		offset += itemPointerBytes
 	}
-	buf = append(buf, payload...)
+
+	payload := buf[heapPayloadOffset:]
+	quantize8bitIntoPayload(heap.VSamples, payload, 0, 4) // Vreal at +0, Vimag at +1 of each 4-byte sample
+	quantize8bitIntoPayload(heap.HSamples, payload, 2, 4) // Hreal at +2, Himag at +3
 	return buf, nil
 }
 

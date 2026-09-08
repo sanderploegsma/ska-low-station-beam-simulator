@@ -13,6 +13,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 )
 
 func main() {
+	cpuProfile := flag.String("cpuprofile", "", "write a CPU profile (whole process, generation + sending) to this file, for use with 'go tool pprof'")
 	destIP := flag.String("dest-ip", "127.0.0.1", "CBF SPEAD/UDP destination IP")
 	destPort := flag.Int("dest-port", 8000, "CBF SPEAD/UDP destination port")
 	sourceInterface := flag.String("spead-interface", "", "network interface to bind the outbound SPEAD/UDP socket to (e.g. net1 for a Multus-attached secondary NIC); empty leaves this to the OS's default route selection")
@@ -48,6 +50,17 @@ func main() {
 	udpSendBufferBytes := flag.Int("udp-send-buffer-bytes", spead.DefaultUDPSendBufferBytes, "SO_SNDBUF size for each outbound SPEAD/UDP socket, in bytes (0: leave at OS default)")
 
 	flag.Parse()
+
+	if *cpuProfile != "" {
+		f, err := os.Create(*cpuProfile)
+		if err != nil {
+			log.Fatalf("creating -cpuprofile file %q: %v", *cpuProfile, err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			log.Fatalf("starting CPU profile: %v", err)
+		}
+		defer pprof.StopCPUProfile()
+	}
 
 	obsTime, err := parseObsTime(*obsTimeFlag)
 	if err != nil {
