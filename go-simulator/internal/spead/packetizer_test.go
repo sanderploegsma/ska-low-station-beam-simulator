@@ -171,6 +171,33 @@ func TestEncodeChannelHeap_PayloadInterleavesVHRealImag(t *testing.T) {
 	}
 }
 
+// TestCopyQuantizedVHIntoPayload_MatchesTwoIndependentPasses is the
+// correctness proof behind EncodeChannelHeapInto's combined fast path
+// (copyQuantizedVHIntoPayload): given the SAME V/H pre-quantized bytes,
+// it must produce byte-for-byte identical payload output to calling
+// copyQuantizedIntoPayload independently for each pol -- the combined
+// pass is a performance change ONLY (see its doc comment for why it's
+// faster), never a behavior change.
+func TestCopyQuantizedVHIntoPayload_MatchesTwoIndependentPasses(t *testing.T) {
+	v := make([]byte, common.HeapLen*2)
+	h := make([]byte, common.HeapLen*2)
+	for i := range v {
+		v[i] = byte(7*i + 1)
+		h[i] = byte(11*i + 2)
+	}
+
+	wantPayload := make([]byte, PayloadLengthBytes)
+	copyQuantizedIntoPayload(v, wantPayload, 0, 4)
+	copyQuantizedIntoPayload(h, wantPayload, 2, 4)
+
+	gotPayload := make([]byte, PayloadLengthBytes)
+	copyQuantizedVHIntoPayload(v, h, gotPayload)
+
+	if !bytes.Equal(gotPayload, wantPayload) {
+		t.Fatalf("copyQuantizedVHIntoPayload result differs from two independent copyQuantizedIntoPayload passes")
+	}
+}
+
 func TestEncodeChannelHeap_FixedQuantizeScaleOverridesAdaptive(t *testing.T) {
 	station := &common.StationConfig{StationID: 1}
 	p := NewSpsPacketizer(station, nil)

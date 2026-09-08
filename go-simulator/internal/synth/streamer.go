@@ -76,7 +76,7 @@ type DirectSynthesisStreamer struct {
 
 	nTiles       int
 	tileNSamples int
-	banks        map[string][]complex64 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels), full-precision -- only ever built/read for toneChannelPositions' columns, see NewDirectSynthesisStreamer
+	banks        map[string][]complex64 // "V"/"H" -> flat (nTiles, tileNSamples, len(toneChannelPositions)) -- full-precision, but SUBSET-width, not numChannels-width: see NewDirectSynthesisStreamer
 	quantBanks   map[string][]byte      // "V"/"H" -> flat quantized (nTiles, tileNSamples, numChannels) -- 2 bytes/sample, read for noiseOnlyChannelPositions (see GenerateQuantizedHeaps)
 
 	// toneChannelPositions: channel positions (0..numChannels-1) with at
@@ -196,9 +196,18 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		// Full-precision bank: only needed by channels that have to
 		// combine noise with tone before quantizing -- skip entirely if
 		// no tone is configured at all, since nothing would ever read it.
+		// Sized to len(toneChannelPositions), NOT numChannels: this
+		// subset is usually tiny (a handful of tone sources at most), so
+		// building it at full channel width would waste real
+		// construction time/memory on ~384 columns nothing ever reads,
+		// just because ONE channel needed the complex path (a real,
+		// previously-unflagged cost found reviewing a real-hardware
+		// profile of a mixed tone+noise config -- see the go-simulator
+		// README). fillNoiseRange reads this bank by SUBSET position
+		// directly (not the raw channel index) to match.
 		if len(toneChannelPositions) > 0 {
-			s.banks["V"] = fillNoiseBank(s.noiseSeedV, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
-			s.banks["H"] = fillNoiseBank(s.noiseSeedH, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
+			s.banks["V"] = fillNoiseBank(s.noiseSeedV, s.noiseStd, s.nTiles, s.tileNSamples, len(toneChannelPositions))
+			s.banks["H"] = fillNoiseBank(s.noiseSeedH, s.noiseStd, s.nTiles, s.tileNSamples, len(toneChannelPositions))
 		}
 		// Pre-quantized bank: only needed by noise-only channels -- skip
 		// if every channel has a tone (nothing left for it to serve).
@@ -287,7 +296,7 @@ func (s *DirectSynthesisStreamer) TickNSamples() int {
 func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
 	var total int64
 	if len(s.banks) > 0 {
-		total += bankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.banks))
+		total += bankMemoryBytes(s.nTiles, s.tileNSamples, len(s.toneChannelPositions), len(s.banks))
 	}
 	if len(s.quantBanks) > 0 {
 		total += quantizedBankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.quantBanks))
@@ -490,9 +499,10 @@ func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol stri
 // than one bulk copy across the whole range -- same total bytes moved,
 // no cross-worker synchronization needed beyond the caller's WaitGroup
 // either way, since disjoint dst[j] slices can never alias.
-// toneChannelPositions[j] is the ACTUAL bank column to read (the bank
-// itself is still full-width, 0..numChannels-1 -- only dst is
-// subset-sized, see NewDirectSynthesisStreamer).
+// The bank itself is SUBSET-width too now (see NewDirectSynthesisStreamer's
+// doc comment on why), so j is both dst's index AND the bank's column --
+// no separate raw-channel lookup needed for the bank read, unlike an
+// earlier version of this method.
 func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64, subsetStart, subsetEnd int) {
 	if s.noiseCfg == nil {
 		for j := subsetStart; j < subsetEnd; j++ {
@@ -504,11 +514,10 @@ func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, d
 		return
 	}
 	bank := s.banks[pol]
-	tileLen := s.tileNSamples * s.numChannels
+	tileLen := s.tileNSamples * len(s.toneChannelPositions)
 	tileIdx := s.currentTileIndex(noiseSeed, tLocalRelStart, nSamples)
 	for j := subsetStart; j < subsetEnd; j++ {
-		ch := s.toneChannelPositions[j]
-		bankOffset := tileIdx*tileLen + ch*nSamples
+		bankOffset := tileIdx*tileLen + j*nSamples
 		copy(dst[j], bank[bankOffset:bankOffset+nSamples])
 	}
 }

@@ -172,10 +172,46 @@ func quantize8bitIntoPayload(samples []complex64, dst []byte, realOffset, stride
 // already computed, which is the entire point: this is what
 // ChannelHeap.VQuantized/HQuantized exist to let EncodeChannelHeapInto
 // skip.
+//
+// Used only as a FALLBACK for a pol whose OTHER pol isn't also
+// pre-quantized (not the case for any real DirectSynthesisStreamer
+// channel today -- see ChannelHeap's doc comment -- but ChannelHeap
+// allows it per-pol independently, so this stays correct for that case).
+// EncodeChannelHeapInto's common case is copyQuantizedVHIntoPayload
+// below: a real end-to-end profile on target hardware found THIS
+// function's strided two-bytes-out-of-four write pattern costing 36% of
+// ALL CPU time on its own once it became the hot path (each of V's and
+// H's passes only half-writes every 4-byte block in dst, needing its
+// own read-for-ownership of that cache line -- twice per block, once per
+// pol -- instead of one full write).
 func copyQuantizedIntoPayload(quantized []byte, dst []byte, realOffset, stride int) {
 	for i := 0; i < len(quantized)/2; i++ {
 		dst[i*stride+realOffset] = quantized[i*2]
 		dst[i*stride+realOffset+1] = quantized[i*2+1]
+	}
+}
+
+// copyQuantizedVHIntoPayload is EncodeChannelHeapInto's common-case fast
+// path: writes BOTH pols' pre-quantized bytes for each sample in ONE
+// pass (all 4 bytes of dst's per-sample block: Vreal, Vimag, Hreal,
+// Himag), instead of copyQuantizedIntoPayload's two separate
+// half-writing passes. Halves how many times each of dst's cache lines
+// needs touching, and every 4-byte block gets fully populated by a
+// single sequential write instead of two interleaved partial ones --
+// confirmed faster on a same-machine before/after (BenchmarkCopyVariants
+// during development, not kept: -17% just from combining passes on this
+// dev machine; the real-hardware win is expected to be larger, since
+// this pattern is memory-bandwidth/cache-behavior-sensitive in a way a
+// warm-cache microbenchmark understates -- confirm on the next target
+// profile).
+func copyQuantizedVHIntoPayload(vQuantized, hQuantized, dst []byte) {
+	n := len(vQuantized) / 2
+	for i := 0; i < n; i++ {
+		j := i * 4
+		dst[j] = vQuantized[i*2]
+		dst[j+1] = vQuantized[i*2+1]
+		dst[j+2] = hQuantized[i*2]
+		dst[j+3] = hQuantized[i*2+1]
 	}
 }
 
@@ -381,15 +417,24 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 	}
 
 	payload := dst[heapPayloadOffset:]
-	if heap.VQuantized != nil { // Vreal at +0, Vimag at +1 of each 4-byte sample
-		copyQuantizedIntoPayload(heap.VQuantized, payload, 0, 4)
-	} else {
-		quantize8bitIntoPayload(heap.VSamples, payload, 0, 4, p.resolveQuantizeScale(heap.VSamples))
-	}
-	if heap.HQuantized != nil { // Hreal at +2, Himag at +3
-		copyQuantizedIntoPayload(heap.HQuantized, payload, 2, 4)
-	} else {
-		quantize8bitIntoPayload(heap.HSamples, payload, 2, 4, p.resolveQuantizeScale(heap.HSamples))
+	switch {
+	case heap.VQuantized != nil && heap.HQuantized != nil:
+		// The common case in production: every noise-only channel sets
+		// both (see synth.DirectSynthesisStreamer.GenerateQuantizedHeaps).
+		// One combined pass, not two -- see copyQuantizedVHIntoPayload's
+		// doc comment for why that matters.
+		copyQuantizedVHIntoPayload(heap.VQuantized, heap.HQuantized, payload)
+	default:
+		if heap.VQuantized != nil { // Vreal at +0, Vimag at +1 of each 4-byte sample
+			copyQuantizedIntoPayload(heap.VQuantized, payload, 0, 4)
+		} else {
+			quantize8bitIntoPayload(heap.VSamples, payload, 0, 4, p.resolveQuantizeScale(heap.VSamples))
+		}
+		if heap.HQuantized != nil { // Hreal at +2, Himag at +3
+			copyQuantizedIntoPayload(heap.HQuantized, payload, 2, 4)
+		} else {
+			quantize8bitIntoPayload(heap.HSamples, payload, 2, 4, p.resolveQuantizeScale(heap.HSamples))
+		}
 	}
 	return nil
 }
