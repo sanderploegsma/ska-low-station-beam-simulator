@@ -70,6 +70,8 @@ api/
 cmd/
   simulator/                   gRPC-served entrypoint: StartScan/StopScan/GetStatus/PushDelayUpdate
   noise-stream/                standalone CLI: noise (+ optional single tone), no gRPC, no Tango
+  pcap-dump/                   standalone CLI: write a small pcap file of generated SPEAD heaps,
+                                no network socket at all -- see "Inspecting SPEAD structure" below
 
 internal/
   common/                      backend-agnostic plumbing: DelayPolynomial/DelayFeed, StationConfig/
@@ -79,6 +81,8 @@ internal/
   spead/                       SPEAD-64-48 heap encoding (SpsPacketizer) + batched UDP sending
   netutil/                     resolves a named network interface's IPv4 address (Multus support)
   server/                      the gRPC service itself, wiring common/synth/spead/netutil together
+  pcap/                        minimal pcap file writer (synthetic Ethernet/IPv4/UDP framing),
+                                used only by cmd/pcap-dump
 
 tango/
   src/ska_low_station_beam_simulator/
@@ -193,6 +197,28 @@ obs time, scan duration, noise std/seed, sender-goroutine count,
 `-spead-interface` for binding to a named network interface such as a
 Multus-attached secondary NIC).
 
+#### Inspecting SPEAD structure
+
+To look at the SPEAD-64-48 heap structure itself (e.g. in Wireshark)
+without standing up any network destination at all, use
+`cmd/pcap-dump`:
+
+```
+go run ./cmd/pcap-dump -out spead.pcap
+```
+
+This writes noise-only heaps straight to a small pcap file — no gRPC, no
+UDP socket, no Tango. `-out` is the only thing you'll usually set;
+`-num-channels` (default: 8, the ICD minimum) and `-num-ticks` (default:
+1) exist only to make the file bigger if you need more than one
+`frequency_id`/`heap_counter` value to look at, and are deliberately kept
+small by default (8 channels x 1 tick = 8 heaps, ~65KB) — this tool is
+for looking at wire STRUCTURE, not for producing a large or realistic
+capture; sample content is noise-only and not meaningful. Each heap is
+wrapped in a synthetic Ethernet/IPv4/UDP frame (fixed placeholder
+MAC/IP/port values, real IPv4 header checksum) so the file opens
+directly in Wireshark/tcpdump.
+
 ### Python (Tango device server)
 
 Python 3.10 (`.python-version`), dependency management via `uv`
@@ -280,6 +306,10 @@ push it. There is no equivalent image/CI for the Python side yet.
   address, and erroring for an unknown interface name — portable across
   Linux/macOS (looked up by interface flag, not a hardcoded name like
   `"lo"`/`"lo0"`).
+- **`internal/pcap`**: a written packet round-trips back to an
+  Ethernet/IPv4/UDP frame with a valid IPv4 header checksum and the
+  original payload intact; an oversized payload is rejected rather than
+  silently producing a malformed IPv4 total-length field.
 
 Not covered: a live end-to-end SPEAD capture decoded by an external tool;
 real multi-pod co-scheduling on one physical node (every real-hardware
