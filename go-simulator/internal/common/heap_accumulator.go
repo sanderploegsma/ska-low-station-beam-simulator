@@ -86,18 +86,29 @@ func NewHeapAccumulator(numChannels int, obsTime, sampleRatePerChannel float64, 
 	}
 }
 
-// defaultParallelism caps worker/goroutine counts consistently with
+// defaultParallelism picks a worker/goroutine count consistently with
 // internal/synth's identical helper (kept separate, not shared, since
 // common must not depend on synth): runtime.GOMAXPROCS(0) (which —
 // unlike runtime.NumCPU() — respects a Kubernetes pod's CPU
-// request/limit) capped to n and to 16.
+// request/limit), capped only to n.
+//
+// This used to also cap at a flat 16, matching fillNoiseBank's identical
+// cap for its one-time noise-bank *construction* cost -- wrong to share
+// here, caught by real-hardware profiling: this method's work runs on
+// EVERY tick under the fixed per-tick budget, not once at startup, and
+// the Python CLAUDE.md's own EPYC benchmarking already established that
+// this class of per-channel-independent work keeps scaling well past 16
+// threads once allocation overhead is out of the way (see its "Target
+// server results" section: throughput kept improving monotonically up
+// to 96 threads). A real profile on 2-socket EPYC target hardware showed
+// average concurrency pinned at ~15.18 -- suspiciously exactly this cap
+// -- while the machine had far more cores sitting idle and pacing was
+// still falling behind. Removed; GOMAXPROCS is now trusted on its own,
+// same as it already is for NumWorkers callers who set it explicitly.
 func defaultParallelism(n int) int {
 	w := runtime.GOMAXPROCS(0)
 	if w > n {
 		w = n
-	}
-	if w > 16 {
-		w = 16
 	}
 	if w < 1 {
 		w = 1
