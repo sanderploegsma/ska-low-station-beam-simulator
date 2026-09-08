@@ -828,3 +828,195 @@ confirmed:
   the whole 90s) would directly confirm or rule out a
   construction/warm-up-related cause vs. a steady-state one. Worth
   doing before assuming either explanation over the other.
+
+### Tick-clustering analysis (`noise-stream.log`, 2026-09-08 13:44-ish CEST run, same config as above) -- distinguishes the two hypotheses
+
+Did the check proposed above by parsing every "falling behind pacing"
+line's tick number into a time-since-scan-start (`tick *
+BlockDurationS`) and bucketing into 5s windows, instead of just eyeballing
+the log. Answer: **overwhelmingly clustered at the start, not spread
+evenly** -- 2641 total events across the 90s scan, 76% of them (≈2010)
+land in the first ~18s, with a clean, near-zero gap from 18-27s and only
+scattered, much rarer events afterward. Within that first-18s window the
+per-second event count isn't monotonically decaying either -- it's a
+repeating sawtooth (bursts of drift, brief recovery, another burst),
+settling out entirely by ~18-20s.
+
+This is the same "elevated for the first ~15-20s, then settles" signature
+independently documented for this exact target machine in the parent
+Python `CLAUDE.md` (idles at 1.5GHz, needs sustained load before
+`schedutil` ramps to boost clocks -- that project's own benchmark sweep
+script carries a 15s clock-ramp burn-in for exactly this reason). Not
+proof by itself (a GC/allocator-warmup explanation would also plausibly
+show an early-and-settling pattern), but a strong prior toward the
+CPU-frequency-scaling hypothesis over the oversized-bank/GC hypothesis,
+given the ~15-20s timescale match is specific, not just "early vs. late."
+
+**Operationally more important than which hypothesis is right**: real
+scans do not run back-to-back. Each station pod starts/stops per
+integration test with multi-second gaps between successive scans (control
+software overhead), and the full integration suite runs only a few times
+a day -- easily enough idle time for `schedutil` to drop the CPU back
+down between scans. So whichever mechanism this turns out to be, it is
+NOT a one-off benchmarking artifact that only shows up on a cold process's
+very first scan ever -- it will recur on every single real scan.
+
+### CPU governor test: `performance` mode + Dell "HPC" BIOS profile (`cpu-384ch`/`cpu-384ch.pprof`/`noise-stream.log`, 2026-09-08 15:03-15:05 CEST, 90s scan, 384ch, one tone)
+
+Directly tests the clock-ramp hypothesis above by removing the variable
+it depends on: CPU governor switched from `schedutil` to `performance`
+(fixed max frequency, no ramp-up delay) at the OS level, plus the Dell
+R7525's "HPC" BIOS power profile enabled, then the same 90s/384-channel/
+one-tone test re-run.
+
+**Result: drift events dropped from 2641 to 301 -- an 8.8x reduction --
+strongly confirming CPU clock ramp was a major real contributor, not a
+red herring.** But it did NOT fully eliminate the pattern: of the 301
+remaining events, 270 (90%) still land in the first 10s (237 in 0-5s, 33
+in 5-10s), tapering to a scattered handful (1-4 per 5s window) through
+the rest of the scan out to 78s. Max single-event drift was 25ms here vs.
+18ms in the earlier (non-`performance`-governor) capture -- higher, not
+lower, on the single worst event, though from 8.8x fewer samples, so this
+is one data point, not yet repeatability-checked per this project's own
+"don't trust a single-pass result" rule.
+
+**Reading this**: `performance` mode/HPC removed most, but evidently not
+all, of the early-scan drift -- with CPU frequency ramp now controlled
+for, the STILL-clustered-at-start residual (90% of what's left, in the
+same 0-10s window) is now better evidence for the secondary hypothesis
+(GC/allocator/page-fault settling right after `Start()`) than it was
+before, since the dominant confound has been removed. `Duration:
+90.39s, Total samples = 307.21s (339.87%)` in this capture's profile is
+an aggregate over the whole scan (no per-time-bucket resolution, same
+limitation as the 14:13 capture above) and so can't itself confirm
+this -- the profile's top costs
+(`internal/runtime/syscall/linux.Syscall6` 42.20% flat,
+`spead.copyQuantizedVHIntoPayload` 29.29% flat, `runtime.memmove` 9.42%
+flat) are steady-state send/copy work, consistent with earlier captures,
+not something new at 90s duration.
+
+**Next step to actually settle the residual, not yet done**: `GODEBUG=
+gctrace=1` is a Go runtime environment variable read at process startup
+-- it works on the already-compiled binary with no Go toolchain needed on
+the target host (just prepend it when invoking, e.g. `sudo GODEBUG=
+gctrace=1 ./noise-stream-linux-amd64 ...` or `sudo env GODEBUG=gctrace=1
+...` if plain `sudo` strips the environment). Since `performance` mode
+now controls for clock ramp, a short (~15-20s is enough to cover the
+warm-up window) capture with `gctrace=1` would give a much cleaner signal
+than before on whether GC cycles specifically cluster in the first 5-10s
+to match the remaining drift.
+
+**This also reframes the fix target, not just the diagnosis.** Given
+scans genuinely cold-start every time in production (see above), "accept
+it as a warm-up characteristic" isn't sufficient even now that it's
+smaller. Two real fix directions, not mutually exclusive, deliberately
+not implemented yet pending a decision:
+1. **Infrastructure-level (this session's `performance`/HPC change is a
+   first step here)**: keep pinning CPU governor/power profile at the
+   node level rather than working around it in application code -- the
+   8.8x reduction already measured (2641 events down to 301) suggests
+   this is the higher-leverage fix if it can be made a standard part of
+   how these nodes are provisioned. Outside this codebase's control:
+   needs whoever owns the actual K8s node fleet, not just this one
+   manually-configured test box.
+2. **Application-level**: an explicit CPU/memory warm-up burn-in
+   immediately before `ScanRunner.Start()` begins real pacing (mirroring
+   the 15s burn-in this project's own Python benchmark sweep script
+   already uses). Deliberately NOT implemented: this delays real heap
+   output by however long the burn-in runs, which is a genuine
+   operational-timing change (multi-station scan synchronization, CSP
+   LMC's expectations of how quickly `StartScan` produces real data) that
+   needs sign-off, not just an internal implementation swap -- unlike
+   this project's usual "different implementation, same output" bar for
+   unilateral changes.
+
+### `GODEBUG=gctrace=1` result: GC ruled out (`noise-stream.log`, 2026-09-08 13:11 CEST run, `performance`/HPC still on)
+
+Ran with `GODEBUG=gctrace=1` (works on the compiled binary directly, no Go
+toolchain needed on the target -- confirmed: set it as part of the
+invocation, e.g. `sudo env GODEBUG=gctrace=1 ./noise-stream-linux-amd64
+...`, since plain `VAR=val sudo cmd` doesn't survive most sudoers'
+`env_reset`). **GC is not the cause.** Only 10 GC cycles across the whole
+90s scan, every one with a sub-2ms total STW pause (e.g. `gc 4 @12.899s:
+0.34+1.6+0.059 ms clock`), and after the first three (heap ramping up to
+its steady-state ~787MB live size once, not per-tick) they're spaced
+evenly roughly every 12s across the ENTIRE scan -- not clustered early the
+way the drift is. That run's drift was still 91% concentrated in the
+first 5s (210 of 231 events), with no GC cycle anywhere near large enough
+to plausibly cause it. A second, un-gctraced repeat (231 -> 136 events,
+continuing the run-to-run improvement trend) showed the identical
+first-5s-dominant shape. GC/allocator warm-up is eliminated as a
+hypothesis.
+
+### CPU frequency trace: clock ramp ALSO ruled out under `performance`/HPC (`cpu_freq.log`, 2026-09-08 15:24-15:28 CEST, 384ch, one tone, 90s scan)
+
+Built `scripts/capture_cpu_freq.sh` (not committed) to log per-core
+frequency at 0.2s resolution to a file instead of requiring a live-watched
+terminal -- first attempt silently produced an empty file (this exact
+EPYC's `amd_pstate` driver doesn't populate `scaling_cur_freq`, and
+`turbostat` wasn't installed on the target, so the fallback path had
+nothing to poll); fixed by adding a `/proc/cpuinfo` "cpu MHz" fallback
+(near-universal on x86 Linux) plus explicit diagnostics so a future empty
+file fails loudly instead of silently.
+
+Re-ran and got 21,409 real samples across 48 cores over the full 90s.
+Bucketed into 1s windows and compared against the matching
+`noise-stream.log`'s own timestamp (epoch-aligned via the ~2h UTC/CEST
+offset between the two machines' clocks): **mean per-core frequency is
+essentially flat the entire scan, ~2860-2920MHz from t=0s straight
+through t=90s, with no ramp-up shape at all** -- t=0's mean (2950MHz) is
+if anything slightly HIGHER than several later buckets (e.g. t=50s:
+2858MHz), the opposite of what a clock-ramp hypothesis predicts. Per-core
+min/max within each 1s bucket varies widely (roughly 1700-3900MHz), but
+that's ordinary boost/idle variation across 48 cores under a workload
+that doesn't peg every core at 100% simultaneously, not a systematic
+early-vs-late difference.
+
+**This rules out CPU clock ramp too, under `performance` governor +
+HPC.** Between this and the GC result above, BOTH originally proposed
+hypotheses for the residual first-5-10s drift clustering are now
+eliminated -- the governor/HPC change's real 8.8x-and-climbing event
+reduction across repeated runs was real, but whatever's left isn't either
+of the two things that reduction was originally attributed to controlling
+for.
+
+### New hypothesis, implemented as a candidate fix: cold `sync.Pool`s at scan start
+
+With clock-ramp and GC both ruled out, the next candidate is
+`sampleBufferPool`/`quantizedBufferPool` (`internal/common/
+heap_accumulator.go`) starting completely empty every time a scan begins
+-- not just on a fresh process (which is all `noise-stream`, a one-shot
+CLI, ever exercises), but in the real long-running device-server pod too:
+Go's runtime drops every `sync.Pool` entry on EVERY GC cycle, and given
+real scans have multi-second-plus gaps between them (control-software
+overhead, per the parent Python `CLAUDE.md`'s documented cadence), it's
+close to certain at least one GC cycle lands in that gap -- so the pools
+are just as cold at the start of scan N+1 as they were for scan 1. Until
+enough buffers have cycled through `ReleaseSampleBuffers` to refill the
+pools "for free," every `Get()` in that window pays `make()`'s cost
+instead -- a plausible, previously un-considered mechanism that fits the
+observed "elevated only for the first several hundred/thousand ticks,
+then settles and never recurs mid-scan" shape exactly, without touching
+CPU frequency or GC at all.
+
+**Fixed** (this is a pure implementation-detail change -- same output,
+same wire content, so implemented directly per this project's standing
+autonomy rule rather than asking first): added `common.WarmBufferPools
+(numChannels int)`, called once from `NewScanRunner` before `Start()` can
+ever begin ticking. Puts `numChannels*2` fresh buffers into EACH pool
+(covering V+H for every channel regardless of which pool a given
+channel's path actually draws from -- an oversized Put on the "wrong"
+pool is harmless, just a few extra entries that age out on the next GC
+like anything else already in the pool). Verified: `go build`/`go vet`/
+`go test ./...`/`go test -race ./internal/common/... ./internal/synth/...`
+all clean.
+
+**Not yet target-hardware-validated** -- this is a candidate fix for the
+now-GC-and-clock-ramp-eliminated residual, not a confirmed one. Next real
+step: re-run the same 90s/384ch/one-tone test on the target server with
+this change and compare drift-event count/clustering against the 136-event
+baseline above. If the first-5s cluster shrinks substantially, that
+confirms cold pools as the (or a) real mechanism; if it doesn't move,
+something else is still at play (goroutine/OS-thread pool spin-up to fill
+48 `P`s is the next candidate, since it wouldn't show up in either GC
+trace or CPU frequency either).

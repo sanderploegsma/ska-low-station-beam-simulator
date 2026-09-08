@@ -215,6 +215,37 @@ func ReleaseSampleBuffers(heap *ChannelHeap) {
 	}
 }
 
+// WarmBufferPools pre-populates sampleBufferPool and quantizedBufferPool
+// with numChannels*2 buffers each (covering V+H for every channel,
+// regardless of which pool a given channel's path actually draws from --
+// an oversized Put on the "wrong" pool is harmless, just a few unused
+// entries that age out on the next GC like anything else in a
+// sync.Pool) before a scan's first tick ever runs.
+//
+// Exists to close a real gap: sync.Pool starts completely empty --
+// process-fresh for a one-shot CLI run, and just as importantly, EVERY
+// entry a pool held is dropped on each GC cycle even in a long-running
+// process (a Tango device server pod handling many scans over its
+// lifetime) -- so if a real gap between scans (multi-second-plus,
+// control-software overhead, per the parent Python CLAUDE.md's
+// documented deployment cadence) lets even one GC cycle land in between,
+// the NEXT scan starts with empty pools too, not just the very first
+// scan a process ever runs. Without this, the first several hundred
+// ticks of every scan pay make()'s cost on every Get() until enough
+// buffers have cycled through ReleaseSampleBuffers to fill the pool
+// "for free" -- a plausible contributor to the early-scan pacing drift
+// this project's real-hardware captures keep showing (see
+// go-simulator/README.md's profiling log), independent of and
+// additional to the CPU-clock-ramp/GC causes already investigated and
+// ruled out or mitigated there.
+func WarmBufferPools(numChannels int) {
+	n := numChannels * 2
+	for i := 0; i < n; i++ {
+		sampleBufferPool.Put(make([]complex64, HeapLen))
+		quantizedBufferPool.Put(make([]byte, HeapLen*2))
+	}
+}
+
 // PrepareWrite grows each channel's buffer for pol by nSamples and
 // returns, per channel, the newly-added nSamples-length slice as a
 // direct write target -- the caller (ScanRunner, via

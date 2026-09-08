@@ -124,6 +124,7 @@ func NewScanRunner(streamer Streamer, sender HeapSender, obsTime, scanDurationS 
 	if m, ok := streamer.(ComplexPathChannelIDMapper); ok {
 		complexChannelIDMap = m.ComplexPathChannelIDMap()
 	}
+	WarmBufferPools(streamer.NumChannels())
 	return &ScanRunner{
 		streamer:          streamer,
 		sender:            sender,
