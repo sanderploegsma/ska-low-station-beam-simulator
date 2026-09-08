@@ -1020,3 +1020,44 @@ confirms cold pools as the (or a) real mechanism; if it doesn't move,
 something else is still at play (goroutine/OS-thread pool spin-up to fill
 48 `P`s is the next candidate, since it wouldn't show up in either GC
 trace or CPU frequency either).
+
+### Target-hardware validation: `WarmBufferPools` -- real, substantial improvement (`noise-stream.log`, 2026-09-08 13:34 CEST, 90s scan, 384ch, one tone, `performance`/HPC still on)
+
+**Confirms cold `sync.Pool`s were a real, meaningful contributor, not a
+dead end.** Total drift events: 51, down from the 136-event baseline
+immediately prior (a further 2.7x reduction on top of everything else
+this session -- the full chain across this session's fixes is now 2641 ->
+301 -> 231 -> 136 -> **51**, roughly 52x from where it started). Max
+single-event drift also dropped to 7ms, the lowest yet.
+
+**More important than the count: the SHAPE changed, not just the
+total.** Every prior capture (pre- and post-`performance`-governor alike)
+had its very first drift event within the first handful of ticks (tick 3,
+tick 357, etc. -- essentially immediately). This run's first drift event
+doesn't happen until **tick 1001, ~2.2s into the scan** -- a genuinely
+different signature, not just a scaled-down version of the same one. The
+remaining 51 events are also much less front-loaded as a fraction: 23 in
+0-5s (45%, vs. 72-91% in every earlier capture), with the largest single
+5s bucket now at 30-35s (17 events) rather than 0-5s -- checked the
+matching `cpu_freq.log` for that window and the whole capture stays flat
+at the same ~2860-2950MHz mean seen everywhere else with no anomaly
+around 30-35s either (note: this run's derived clock-offset between the
+two logs came out ~433s different from the prior run's -- worth treating
+with a little less certainty than the earlier alignment, but doesn't
+change the conclusion, since NOTHING in the entire frequency trace stands
+out anywhere, regardless of exactly which window maps to which).
+
+**Reading this**: pool cold-start was a real, independent contributor
+alongside (not instead of) clock ramp -- fixing it didn't just reduce
+drift, it eliminated the immediate-first-tick burst specifically,
+consistent with the "pays make() until the pool fills" mechanism this fix
+targets. There's still a smaller residual (roughly half the remaining
+events in 0-10s, plus that one unexplained 30-35s bump), so this isn't
+fully solved -- but three real, independent causes have now been found
+and addressed (clock ramp via infra config, GC ruled out entirely, cold
+pools via this fix), each confirmed by actually measuring before/after
+rather than assumed. Whether to keep chasing the residual (goroutine/
+OS-thread spin-up remains the next candidate) or treat ~51 events/90s
+scan (mostly sub-10ms) as acceptable for this project's actual test
+tolerance is a call for whoever owns the CBF-side acceptance criteria,
+not something to keep optimizing blind.
