@@ -3,7 +3,7 @@ Tango device server entry point for the SPS station-beam simulator.
 
 This device no longer generates SPEAD/UDP content itself. Signal
 generation, heap accumulation, and SPEAD/UDP sending have moved to a
-separate Go process (see the repo root's ``cmd/simulator``,
+separate Go process (see the repo root's ``cmd/server``,
 ``api/simulator.proto``) that this device drives over gRPC — this
 module now owns only the Tango-facing bits: device properties,
 StartScan/StopScan command handling, and subscribing to CBF's
@@ -32,7 +32,7 @@ properties, used to tag delay-poly pushes with this station's ID (see
 ``parse_delay_polynomial_from_attr_value``) — they are NOT forwarded to
 the Go process over gRPC, which gets its own station_id/substation_id
 independently at deploy time (its own CLI flags, see
-``cmd/simulator/main.go``) and must already agree with this device's
+``cmd/server/main.go``) and must already agree with this device's
 values. ``dest_ip``/``dest_port`` are gone from this device entirely:
 the Go process owns the CBF SPEAD/UDP destination now (also its own CLI
 flags), not this device.
@@ -122,7 +122,7 @@ class StationSimulatorDevice(Device):
     station_id = device_property(dtype=int, default_value=1)
     substation_id = device_property(dtype=int, default_value=0)
     # host:port of the Go gRPC simulator this device drives -- see
-    # cmd/simulator's -listen flag (default matches here). Must already
+    # cmd/server's -listen flag (default matches here). Must already
     # be running with the SAME station_id/substation_id and the real CBF
     # dest_ip/dest_port (its own CLI flags now, not device properties on
     # this side -- see module docstring).

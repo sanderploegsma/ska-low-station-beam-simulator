@@ -25,7 +25,7 @@ fullnameOverride: ""
 
 # This station pod's identity and CBF destination — the Go equivalent of
 # simulator.py's station_id/substation_id/dest_ip/dest_port device
-# properties (see go-simulator/cmd/simulator's flags, which these values
+# properties (see go-simulator/cmd/server's flags, which these values
 # are passed through as).
 simulator:
   stationId: 1
@@ -90,7 +90,7 @@ service:
   loadBalancerSourceRanges: []
 
 # grpc_health_probe / a registered grpc.health.v1.Health service isn't
-# implemented by cmd/simulator yet, so probes default to a plain TCP
+# implemented by cmd/server yet, so probes default to a plain TCP
 # check against the gRPC port (confirms the process is up and listening,
 # not that it's actually healthy at the gRPC layer). Switch to
 # `grpc: {port: ...}` probes once that health service exists.

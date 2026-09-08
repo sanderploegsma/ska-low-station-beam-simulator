@@ -28,7 +28,7 @@ Tango device server (Python, tango/)
         |
         | gRPC (api/simulator.proto)
         v
-Go simulator process (cmd/simulator)
+Go simulator process (cmd/server)
   - StartScan/StopScan/GetStatus/PushDelayUpdate (internal/server)
   - signal generation: tone + per-pol station noise (internal/synth)
   - SPEAD-64-48 heap encoding + UDP send (internal/spead)
@@ -68,7 +68,7 @@ api/
   simulatorpb/                 generated Go stubs (protoc-gen-go/protoc-gen-go-grpc)
 
 cmd/
-  simulator/                   gRPC-served entrypoint: StartScan/StopScan/GetStatus/PushDelayUpdate
+  server/                      gRPC-served entrypoint: StartScan/StopScan/GetStatus/PushDelayUpdate
   noise-stream/                standalone CLI: noise (+ optional single tone), no gRPC, no Tango
   pcap-dump/                   standalone CLI: write a small pcap file of generated SPEAD heaps,
                                 no network socket at all -- see "Inspecting SPEAD structure" below
@@ -97,7 +97,7 @@ docs/
   history.md                   design history, past bugs, benchmark/profiling investigations
 
 images/
-  go-simulator/                 container image for cmd/simulator
+  go-simulator/                 container image for cmd/server
   tango-device-server/          container image for tango/ -- each is a Dockerfile plus its own
                                  Dockerfile.dockerignore, built with the repo root as context
 
@@ -177,10 +177,10 @@ go test ./...
 Run the gRPC-served simulator:
 
 ```
-go run ./cmd/simulator -listen :50051 -station-id 1 -dest-ip 127.0.0.1 -dest-port 8000
+go run ./cmd/server -listen :50051 -station-id 1 -dest-ip 127.0.0.1 -dest-port 8000
 ```
 
-`cmd/simulator`'s flags mirror `simulator.py`'s static device properties
+`cmd/server`'s flags mirror `simulator.py`'s static device properties
 (`station_id`/`substation_id`/`dest_ip`/`dest_port`); everything that
 varies per scan (`subarray_id`, `beam_id`, tone sources, noise config) is
 a `StartScan` gRPC request field instead, matching the Python
@@ -271,7 +271,7 @@ to it (Docker/buildx prefers a Dockerfile-specific ignore file over a
 top-level `.dockerignore`, which is what lets the two images keep
 opposite include/exclude lists sharing one context):
 
-- **`images/go-simulator/Dockerfile`** builds `cmd/simulator` into a
+- **`images/go-simulator/Dockerfile`** builds `cmd/server` into a
   minimal, non-root image (`golang:1.25-alpine` build stage,
   `gcr.io/distroless/static-debian12:nonroot` runtime — no shell, no
   package manager, matching this binary's actual needs: a gRPC listen

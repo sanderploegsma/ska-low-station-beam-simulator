@@ -1,4 +1,4 @@
-# Builds cmd/simulator (the gRPC-served numeric core -- see README.md)
+# Builds cmd/server (the gRPC-served numeric core -- see README.md)
 # into a minimal, non-root runtime image. Build context is the repo
 # root -- this module's go.mod/go.sum live there too, alongside the
 # unrelated Python simulator under tango/ (excluded via the
@@ -20,16 +20,16 @@ RUN go mod download
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
-    -o /out/simulator ./cmd/simulator
+    -o /out/server ./cmd/server
 
 # distroless static + nonroot: no shell, no package manager, minimal
 # attack surface for a statically-linked Go binary that only needs to
 # open a gRPC listen socket and a UDP socket to CBF.
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
 
-COPY --from=build /out/simulator /usr/local/bin/simulator
+COPY --from=build /out/server /usr/local/bin/server
 
-# gRPC control-plane port (see cmd/simulator's -listen flag default).
+# gRPC control-plane port (see cmd/server's -listen flag default).
 EXPOSE 50051
 
-ENTRYPOINT ["/usr/local/bin/simulator"]
+ENTRYPOINT ["/usr/local/bin/server"]

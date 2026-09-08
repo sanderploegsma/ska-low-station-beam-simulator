@@ -4,7 +4,7 @@ logging setup and delay-polynomial parsing.
 
 Signal generation, heap accumulation, and SPEAD/UDP sending all live in
 the Go process this device drives over gRPC (see the repo root's
-``cmd/simulator``) — nothing in this module generates content.
+``cmd/server``) — nothing in this module generates content.
 """
 
 from __future__ import annotations

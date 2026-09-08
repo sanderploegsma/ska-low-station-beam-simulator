@@ -1,4 +1,4 @@
-// Command simulator runs the Go station-beam simulator's gRPC service:
+// Command server runs the Go station-beam simulator's gRPC service:
 // one process per station pod, mirroring the Python project's one
 // Tango-device-server-per-pod deployment model, minus Tango itself (see
 // api/simulator.proto's doc comment for the intended split with a

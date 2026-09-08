@@ -13,7 +13,7 @@ import (
 
 // Sender-pool defaults. Chosen to give a comfortable margin over the
 // single-goroutine/single-syscall-per-heap baseline without needing any
-// per-deployment tuning; override via cmd/simulator's flags or
+// per-deployment tuning; override via cmd/server's flags or
 // noise-stream's flags if a specific target host needs something else.
 const (
 	// DefaultNumSenders: parallel UDP sockets/goroutines draining the
@@ -48,7 +48,7 @@ const (
 // as the confirmed real-hardware baseline and proportionally fewer for
 // a narrower configuration -- a station running fewer channels sends
 // proportionally less data, so needs proportionally fewer sockets
-// draining it. Not used by every caller: cmd/simulator's gRPC server
+// draining it. Not used by every caller: cmd/server's gRPC server
 // creates its SenderPool once at process Start(), before any scan (and
 // therefore its num_channels) is known, so it still uses the flat
 // DefaultNumSenders unless a caller overrides it explicitly via
