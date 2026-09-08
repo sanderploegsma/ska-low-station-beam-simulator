@@ -381,29 +381,32 @@ scale with `numChannels × HeapLen`, not with source count:
   dominated by scalar `math.Round`/clamp work (the int8 quantization
   path) plus network syscalls, not allocation or copying anymore.
 
-**Open: tone's real cost, not yet measured on real hardware.** Given how
-thin the margin above is, the natural next question was whether adding
-tone sources (not yet exercised in this profiling — `noise-stream` was
-noise-only until this session) would push 384 channels over budget.
-`-tone-freq-hz`/`-tone-amplitude` were added to `noise-stream` (see
-above) specifically to answer this with a real profile instead of
-argument. The analytical expectation, not yet confirmed: tone injection
-is O(`nSamples`) per source (`synthToneChannel` computes one channel's
+**Resolved: tone's real cost, confirmed negligible for a single source.**
+Given how thin the margin above is, the natural next question was
+whether adding tone sources would push 384 channels over budget.
+Profiled on the real hardware with `-tone-freq-hz 250000000` (384
+channels): `synthToneChannel` doesn't even appear in the profile's
+top ~95% of CPU time — its total contribution across a 16.5s run fell
+below the 2.09-CPU-second display cutoff, out of 418.18s total (under
+~0.5%). The margin estimate came out at ~100.0%, statistically
+indistinguishable from the noise-only run's ~101% — run-to-run
+measurement noise on shared hardware is larger than tone's actual
+contribution. This matches the analytical prediction: tone injection is
+O(`nSamples`) per source (`synthToneChannel` computes one channel's
 contribution in closed form, via the same NCO phase-accumulator trick
 the Python pulsar work established, then adds `nSamples`=2048 values
-into ONE channel) — roughly 0.26% of one polarization's per-tick element
-count per tone source, independent of `numChannels`. But tone injection
-currently runs SEQUENTIALLY (unlike noise-fill/quantize, which already
-use every available core), so its full cost lands on the critical path
-with no parallel speedup — and with ~0% existing margin, even a small
-absolute addition is expected to show up as measurably more/larger
-drift, not be absorbed invisibly the way it would be at a more
-comfortable baseline utilization. **Next session: profile
-`noise-stream -num-channels 384 -tone-freq-hz <freq>` on the real
-hardware and update this section with what actually happens** — if tone
-injection turns out to matter more than expected, parallelizing it
-(mirroring the noise-fill/`HeapAccumulator` channel-range-split pattern)
-is the natural next lever, not yet implemented.
+into ONE channel) — negligible next to the ~45%/~46% costs above, which
+scale with `numChannels`, not source count.
+
+**Caveat, not yet tested: this was ONE tone source.** Tone injection
+still runs SEQUENTIALLY (unlike noise-fill/quantize, which already use
+every available core) — fine when one source's cost is unmeasurably
+small, but if a real deployment configures many tone sources (tens, not
+one or two), their costs land on the critical path and add up linearly
+with no parallel speedup, unlike the rest of the pipeline. Not
+parallelized because it hasn't needed to be yet; revisit (mirroring the
+noise-fill/`HeapAccumulator` channel-range-split pattern) if a future
+profile with many tone sources configured shows otherwise.
 
 **Not yet tried**: whether `n_tiles`/`tile_n_samples` (the noise
 tile-bank's own size/fidelity knobs, unchanged from their Go-port
