@@ -123,16 +123,17 @@ earlier guess — see `docs/history.md` for the corrections this required):
   (`HEAP_LEN`), both polarisations interleaved per sample (Vreal, Vimag,
   Hreal, Himag, each int8). `packet_payload_length` is fixed at `0x2000`
   (8192 bytes = 2048 × 4 bytes).
-- Six SPEAD-64-48 immediate item pointers per heap, no more:
+- Six SPEAD-64-48 item pointers per heap, no more — five IMMEDIATE, one
+  (`0x3300`) ADDRESS mode:
 
-  | item ID | bit layout |
-  |---|---|
-  | `0x0001` | 8 bits reserved \| 40 bits `heap_counter` |
-  | `0x0004` | 48 bits `packet_payload_length` (fixed: `0x2000`) |
-  | `0x3010` | 48 bits `scan_id` |
-  | `0x3000` | 16 bits reserved \| 16 bits `beam_id` \| 16 bits `frequency_id` |
-  | `0x3001` | 8 bits `substation_id` \| 8 bits `subarray_id` \| 16 bits `station_id` \| 16 bits reserved |
-  | `0x3300` | 48 bits `payload_offset` (fixed: `0x0` — heaps are always exactly one packet) |
+  | item ID | mode | bit layout |
+  |---|---|---|
+  | `0x0001` | IMMEDIATE | 8 bits reserved \| 40 bits `heap_counter` |
+  | `0x0004` | IMMEDIATE | 48 bits `packet_payload_length` (fixed: `0x2000`) |
+  | `0x3010` | IMMEDIATE | 48 bits `scan_id` |
+  | `0x3000` | IMMEDIATE | 16 bits reserved \| 16 bits `beam_id` \| 16 bits `frequency_id` |
+  | `0x3001` | IMMEDIATE | 8 bits `substation_id` \| 8 bits `subarray_id` \| 16 bits `station_id` \| 16 bits reserved |
+  | `0x3300` | ADDRESS | 48-bit byte offset of the payload, fixed at `0x0` — heaps are always exactly one packet, and the payload always starts immediately after the last item pointer |
 
   ...followed immediately by the 8192-byte interleaved V/H I/Q payload at
   a fixed byte offset (56 bytes in) — no 7th "payload" item pointer; CBF

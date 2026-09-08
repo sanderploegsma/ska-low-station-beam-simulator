@@ -12,6 +12,7 @@ import (
 type decodedItem struct {
 	id    uint16
 	value uint64
+	mode  uint64 // 1 = IMMEDIATE, 0 = ADDRESS -- see writeSpeadItemPointer
 }
 
 // decodeHeap parses raw SPEAD-64-48 bytes back into (itemID, value)
@@ -43,12 +44,9 @@ func decodeHeap(t *testing.T, raw []byte) (items []decodedItem, payload []byte) 
 		ptr := binary.BigEndian.Uint64(raw[offset : offset+8])
 		offset += 8
 		mode := ptr >> 63
-		if mode != 1 {
-			t.Fatalf("item pointer %d is not IMMEDIATE mode", i)
-		}
 		id := uint16((ptr >> 48) & 0x7FFF)
 		value := ptr & ((uint64(1) << 48) - 1)
-		items = append(items, decodedItem{id: id, value: value})
+		items = append(items, decodedItem{id: id, value: value, mode: mode})
 	}
 	payload = raw[offset:]
 	return items, payload
@@ -58,6 +56,17 @@ func findItem(items []decodedItem, id uint16) (uint64, bool) {
 	for _, it := range items {
 		if it.id == id {
 			return it.value, true
+		}
+	}
+	return 0, false
+}
+
+// findItemMode returns the mode bit (1 = IMMEDIATE, 0 = ADDRESS) of the
+// item pointer for id.
+func findItemMode(items []decodedItem, id uint16) (uint64, bool) {
+	for _, it := range items {
+		if it.id == id {
+			return it.mode, true
 		}
 	}
 	return 0, false
@@ -99,6 +108,29 @@ func TestEncodeChannelHeap_ItemLayoutMatchesICD(t *testing.T) {
 	}
 	if v, ok := findItem(items, 0x3300); !ok || v != 0 {
 		t.Fatalf("0x3300 payload_offset = %v (ok=%v), want 0", v, ok)
+	}
+
+	// Mode bit: every item is IMMEDIATE except 0x3300 payload_offset,
+	// which is ADDRESS mode -- the one item that addresses the payload
+	// rather than carrying a scalar value (regression guard: an earlier
+	// version hardcoded every item, including this one, as IMMEDIATE,
+	// which a real CNIC reference capture's SPEAD traffic contradicted).
+	wantImmediate := map[uint16]bool{
+		0x0001: true, 0x0004: true, 0x3010: true, 0x3000: true, 0x3001: true,
+		0x3300: false,
+	}
+	for id, wantImm := range wantImmediate {
+		mode, ok := findItemMode(items, id)
+		if !ok {
+			t.Fatalf("missing item %#04x", id)
+		}
+		wantMode := uint64(0)
+		if wantImm {
+			wantMode = 1
+		}
+		if mode != wantMode {
+			t.Fatalf("item %#04x mode = %d, want %d (immediate=%v)", id, mode, wantMode, wantImm)
+		}
 	}
 	channelInfo, ok := findItem(items, 0x3000)
 	if !ok {

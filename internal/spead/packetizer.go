@@ -206,17 +206,28 @@ func writeSpeadHeader(dst []byte, nItems int) {
 	binary.BigEndian.PutUint64(dst, word)
 }
 
-// writeSpeadItemPointer writes one IMMEDIATE SPEAD-64-48 item pointer
-// (mode bit set, value embedded directly in the pointer's low 48 bits)
-// into dst[:8]. CBF's 6-item heap never needs an ADDRESS-mode pointer.
-func writeSpeadItemPointer(dst []byte, itemID uint16, value uint64) error {
+// writeSpeadItemPointer writes one SPEAD-64-48 item pointer into dst[:8].
+// immediate selects IMMEDIATE mode (mode bit set, value embedded directly
+// in the pointer's low 48 bits) vs. ADDRESS mode (mode bit clear, value
+// interpreted as a byte offset into the heap's payload area). Every item
+// in CBF's 6-item heap is IMMEDIATE except 0x3300 payload_offset, which
+// is the one item that addresses the payload rather than carrying a
+// scalar value of its own -- see EncodeChannelHeapInto's item table and
+// docs/history.md for how this was found (an earlier version of this
+// function hardcoded every item as IMMEDIATE, including 0x3300, which a
+// real CNIC reference capture's SPEAD traffic contradicted).
+func writeSpeadItemPointer(dst []byte, itemID uint16, value uint64, immediate bool) error {
 	if uint64(itemID) > speadIDMask {
 		return fmt.Errorf("item id %#x does not fit in %d bits", itemID, speadIDBits)
 	}
 	if value > speadValueMask {
 		return fmt.Errorf("value %#x for item %#x does not fit in %d bits", value, itemID, SpeadHeapAddressBits)
 	}
-	pointer := (uint64(1) << 63) | (uint64(itemID) << SpeadHeapAddressBits) | value
+	var modeBit uint64
+	if immediate {
+		modeBit = 1
+	}
+	pointer := (modeBit << 63) | (uint64(itemID) << SpeadHeapAddressBits) | value
 	binary.BigEndian.PutUint64(dst, pointer)
 	return nil
 }
@@ -233,16 +244,18 @@ type Sender interface {
 // per SPS-CBF ICD, via the hand-rolled SPEAD-64-48 encoder above.
 //
 // ITEM LAYOUT (six items total, confirmed against the real ICD on the
-// Python side):
+// Python side, and against a real CNIC reference capture -- see
+// docs/history.md):
 //
-//	0x0001  8 bits reserved | 40 bits heap_counter
-//	0x0004  48 bits packet_payload_length (fixed: 0x2000)
-//	0x3010  48 bits scan_id
-//	0x3000  16 bits reserved | 16 bits beam_id | 16 bits frequency_id
-//	0x3001  8 bits substation_id | 8 bits subarray_id | 16 bits
-//	        station_id | 16 bits reserved
-//	0x3300  48 bits payload_offset (fixed: 0x0 -- heaps are always
-//	        exactly one packet, never fragmented)
+//	0x0001  IMMEDIATE  8 bits reserved | 40 bits heap_counter
+//	0x0004  IMMEDIATE  48 bits packet_payload_length (fixed: 0x2000)
+//	0x3010  IMMEDIATE  48 bits scan_id
+//	0x3000  IMMEDIATE  16 bits reserved | 16 bits beam_id | 16 bits frequency_id
+//	0x3001  IMMEDIATE  8 bits substation_id | 8 bits subarray_id | 16 bits
+//	                   station_id | 16 bits reserved
+//	0x3300  ADDRESS    48-bit byte offset of the payload, always 0x0 -- the
+//	                   only non-immediate item, and the payload always
+//	                   starts immediately after the last item pointer
 //
 // ...followed immediately by the 8192-byte interleaved V/H I/Q payload.
 // There is no 7th "payload" item pointer — CBF firmware addresses the
@@ -364,22 +377,27 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 	heapCounter := uint64(heapCounterF)
 
 	type item struct {
-		id    uint16
-		value uint64
+		id        uint16
+		value     uint64
+		immediate bool
 	}
 	items := [numHeapItems]item{
-		{0x0001, heapCounter},
-		{0x0004, PayloadLengthBytes},
-		{0x3010, uint64(p.station.ScanID)},
-		{0x3000, packChannelInfo(uint32(p.station.BeamID), uint32(common.ChannelStart+heap.ChannelID))},
-		{0x3001, packAntennaInfo(uint8(p.station.SubstationID), uint8(p.station.SubarrayID), uint16(p.station.StationID))},
-		{0x3300, 0x0},
+		{0x0001, heapCounter, true},
+		{0x0004, PayloadLengthBytes, true},
+		{0x3010, uint64(p.station.ScanID), true},
+		{0x3000, packChannelInfo(uint32(p.station.BeamID), uint32(common.ChannelStart+heap.ChannelID)), true},
+		{0x3001, packAntennaInfo(uint8(p.station.SubstationID), uint8(p.station.SubarrayID), uint16(p.station.StationID)), true},
+		// ADDRESS mode, not immediate -- see this type's ITEM LAYOUT doc
+		// comment: this is the one item that addresses the payload rather
+		// than carrying a scalar value, and the payload always starts
+		// immediately after the last item pointer (offset 0).
+		{0x3300, 0x0, false},
 	}
 
 	writeSpeadHeader(dst[:speadHeaderSize], numHeapItems)
 	offset := speadHeaderSize
 	for _, it := range items {
-		if err := writeSpeadItemPointer(dst[offset:offset+itemPointerBytes], it.id, it.value); err != nil {
+		if err := writeSpeadItemPointer(dst[offset:offset+itemPointerBytes], it.id, it.value, it.immediate); err != nil {
 			return err
 		}
 		offset += itemPointerBytes

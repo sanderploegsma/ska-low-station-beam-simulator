@@ -460,12 +460,16 @@ int8). `pkt_len = 0x2000` (8192 bytes) confirms this: 2048 × 4 bytes.
 The bit-field layout for `channel_info`/`antenna_info` used to be read off
 a screenshot of the ICD diagram, flagged for a long time as the project's
 top unverified risk. It was later confirmed against the real ICD text
-directly: six items total, each an immediate SPEAD-64-48 item pointer
-(48-bit value field) — see `README.md` for the current table. No 7th
-"payload" item pointer; CBF firmware reads the payload at a fixed byte
-offset rather than doing a generic SPEAD parse. `pack_channel_info`/
-`pack_antenna_info`'s bit widths matched this exactly, bit for bit, once
-confirmed.
+directly: six items total, each a SPEAD-64-48 item pointer (48-bit value
+field) — see `README.md` for the current table. No 7th "payload" item
+pointer; CBF firmware reads the payload at a fixed byte offset rather
+than doing a generic SPEAD parse. `pack_channel_info`/`pack_antenna_info`'s
+bit widths matched this exactly, bit for bit, once confirmed.
+
+(Every item is IMMEDIATE mode except `0x3300 payload_offset`, which is
+ADDRESS mode — this was initially gotten wrong on the Go side too, see
+"Known bugs (fixed)" #20 below for how a real CNIC reference capture
+caught it.)
 
 `BASE_FREQ_HZ` itself went through two corrections in sequence: first from
 an initial `0.0` placeholder to 50.78125MHz (coarse channel 65) — this
@@ -620,6 +624,25 @@ code itself has since been deleted.
     `spead.SpsPacketizer` doesn't use spead2" above.
 19. **Three channelization assumptions were wrong** — see "SPS-CBF ICD
     corrections" above.
+20. **`writeSpeadItemPointer` (Go) hardcoded every one of the 6 item
+    pointers as IMMEDIATE mode**, including `0x3300 payload_offset`. Found
+    by building `cmd/pcap-dump` (a small CLI that writes generated heaps
+    straight to a pcap file, no network socket needed — see `README.md`'s
+    "Inspecting SPEAD structure") and comparing its output byte-for-byte
+    against a real CNIC reference capture (`source.pcap`, captured
+    separately, unrelated content/parameters — only header/framing
+    structure was compared): every one of 34,257 real `0x3300` item
+    pointers in the reference capture had its mode bit clear (ADDRESS),
+    while all of ours had it set (IMMEDIATE) — 100% systematic, not noise.
+    `payload_offset` addresses the payload rather than carrying a scalar
+    value of its own, so ADDRESS mode is the correct choice regardless of
+    the fact that its value is always `0x0` (the payload always starts
+    immediately after the last item pointer — see "Why `spead.SpsPacketizer`
+    doesn't use spead2" above for the layout this depends on). Every other
+    item matched the reference capture exactly already, including header
+    shape (magic/version/id_bytes/addr_bytes), item order, and
+    `0x3001`'s full-width bit packing. Fixed: `writeSpeadItemPointer` now
+    takes an `immediate bool`; only `0x3300` passes `false`.
 
 ## Python/Tango benchmarking history
 
