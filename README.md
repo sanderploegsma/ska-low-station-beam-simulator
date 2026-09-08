@@ -96,7 +96,12 @@ tango/
 docs/
   history.md                   design history, past bugs, benchmark/profiling investigations
 
-go.mod / go.sum / Dockerfile    Go module + container image, at the repo root
+images/
+  go-simulator/                 container image for cmd/simulator
+  tango-device-server/          container image for tango/ -- each is a Dockerfile plus its own
+                                 Dockerfile.dockerignore, built with the repo root as context
+
+go.mod / go.sum                 Go module, at the repo root
 pyproject.toml / uv.lock        Python package, also at the repo root (see "Setup" below for why)
 ```
 
@@ -258,28 +263,51 @@ sed -i '' 's/^import simulator_pb2 as simulator__pb2$/from . import simulator_pb
 no separate `protoc`/plugin binaries to install beyond what `uv sync`
 already pulls in, unlike the Go side's regeneration command.
 
-### Container image
+### Container images
 
-`Dockerfile` builds `cmd/simulator` into a minimal, non-root image
-(`golang:1.25-alpine` build stage, `gcr.io/distroless/static-debian12:nonroot`
-runtime — no shell, no package manager, matching this binary's actual
-needs: a gRPC listen socket and a UDP socket to CBF). Build context is
-the repo root (`.dockerignore` excludes the unrelated Python simulator
-under `tango/`):
+Each image lives at `images/<image-name>/Dockerfile`, built with the
+repo root as context and its own `Dockerfile.dockerignore` sitting next
+to it (Docker/buildx prefers a Dockerfile-specific ignore file over a
+top-level `.dockerignore`, which is what lets the two images keep
+opposite include/exclude lists sharing one context):
 
-```
-docker build -t station-beam-simulator-go .
-docker run --rm -p 50051:50051 station-beam-simulator-go \
-    -listen :50051 -station-id 1 -dest-ip <cbf-host> -dest-port 8000
-```
+- **`images/go-simulator/Dockerfile`** builds `cmd/simulator` into a
+  minimal, non-root image (`golang:1.25-alpine` build stage,
+  `gcr.io/distroless/static-debian12:nonroot` runtime — no shell, no
+  package manager, matching this binary's actual needs: a gRPC listen
+  socket and a UDP socket to CBF):
 
-`.github/workflows/go-simulator-docker.yml` runs `go build`/`go vet`/
-`go test -race` on every push/PR touching the Go sources at the repo
-root, then builds and publishes a multi-arch (`linux/amd64`,
-`linux/arm64`) image to `ghcr.io/<owner>/<repo>/go-simulator` on pushes to
-`main` (tag `latest`) and on `go-simulator-v*` tags (semver tag) — pull
-requests build the image (to catch a broken Dockerfile early) but never
-push it. There is no equivalent image/CI for the Python side yet.
+  ```
+  docker build -f images/go-simulator/Dockerfile -t station-beam-simulator-go .
+  docker run --rm -p 50051:50051 station-beam-simulator-go \
+      -listen :50051 -station-id 1 -dest-ip <cbf-host> -dest-port 8000
+  ```
+
+  `.github/workflows/go-simulator-docker.yml` runs `go build`/`go vet`/
+  `go test -race` on every push/PR touching the Go sources, then builds
+  and publishes a multi-arch (`linux/amd64`, `linux/arm64`) image to
+  `ghcr.io/<owner>/<repo>/go-simulator` on pushes to `main` (tag
+  `latest`) and on `go-simulator-v*` tags (semver tag) — pull requests
+  build the image (to catch a broken Dockerfile early) but never push
+  it.
+
+- **`images/tango-device-server/Dockerfile`** builds the Tango device
+  server on top of SKAO's `ska-tango-images-tango-python` base image,
+  adapted from
+  [ska-low-csp-testware's Dockerfile](https://gitlab.com/ska-telescope/ska-low-csp-testware/-/blob/main/Dockerfile)
+  for this repo's `tango/src` layout:
+
+  ```
+  docker build -f images/tango-device-server/Dockerfile -t station-beam-simulator-tango .
+  ```
+
+  `.github/workflows/tango-device-server-docker.yml` runs `uv run
+  pytest` on every push/PR touching the Python sources, then builds and
+  publishes an image to `ghcr.io/<owner>/<repo>/tango-device-server` on
+  pushes to `main` (tag `latest`) and on `tango-device-server-v*` tags
+  (semver tag) — pull requests build the image but never push it. This
+  image is `linux/amd64`-only, since the SKAO base images it builds on
+  don't publish `arm64` variants.
 
 ## Testing notes
 

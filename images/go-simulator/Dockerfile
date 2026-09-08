@@ -1,9 +1,10 @@
 # Builds cmd/simulator (the gRPC-served numeric core -- see README.md)
 # into a minimal, non-root runtime image. Build context is the repo
 # root -- this module's go.mod/go.sum live there too, alongside the
-# unrelated Python simulator under tango/ (excluded via .dockerignore).
+# unrelated Python simulator under tango/ (excluded via the
+# Dockerfile.dockerignore next to this file).
 #
-#   docker build -t station-beam-simulator-go .
+#   docker build -f images/go-simulator/Dockerfile -t station-beam-simulator-go .
 #   docker run --rm -p 50051:50051 station-beam-simulator-go \
 #       -listen :50051 -station-id 1 -dest-ip <cbf-host> -dest-port 8000
 

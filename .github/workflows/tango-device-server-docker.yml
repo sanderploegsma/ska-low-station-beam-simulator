@@ -1,31 +1,27 @@
-# Tests, then builds and publishes the Go simulator prototype (now at
-# the repo root -- see CLAUDE.md's "Code layout") as a container image
-# to the GitHub Container Registry, from images/go-simulator/Dockerfile.
-# Scoped to the Go sources via the paths filter below -- changes to the
-# Python simulator under tango/ don't trigger this workflow.
-name: go-simulator image
+# Tests, then builds and publishes the Tango device server (tango/, see
+# CLAUDE.md's "Code layout") as a container image to the GitHub
+# Container Registry, from images/tango-device-server/Dockerfile.
+# Scoped to the Python sources via the paths filter below -- changes to
+# the Go simulator don't trigger this workflow.
+name: tango-device-server image
 
 on:
   push:
     branches: [main]
-    tags: ["go-simulator-v*"]
+    tags: ["tango-device-server-v*"]
     paths:
-      - "cmd/**"
-      - "internal/**"
-      - "api/**"
-      - "go.mod"
-      - "go.sum"
-      - "images/go-simulator/**"
-      - ".github/workflows/go-simulator-docker.yml"
+      - "tango/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "images/tango-device-server/**"
+      - ".github/workflows/tango-device-server-docker.yml"
   pull_request:
     paths:
-      - "cmd/**"
-      - "internal/**"
-      - "api/**"
-      - "go.mod"
-      - "go.sum"
-      - "images/go-simulator/**"
-      - ".github/workflows/go-simulator-docker.yml"
+      - "tango/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "images/tango-device-server/**"
+      - ".github/workflows/tango-device-server-docker.yml"
   workflow_dispatch: {}
 
 # A ref (branch/tag) that pushes a new commit while an older run for the
@@ -40,7 +36,7 @@ env:
   # ghcr.io requires a lowercase path; github.repository can contain
   # uppercase (e.g. an org name), so this is normalized in the "image
   # metadata" step below rather than assumed lowercase here.
-  IMAGE_BASE: ${{ github.repository }}/go-simulator
+  IMAGE_BASE: ${{ github.repository }}/tango-device-server
 
 jobs:
   test:
@@ -48,14 +44,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v5
+      - uses: astral-sh/setup-uv@v5
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          enable-cache: true
 
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+      - run: uv sync --locked
+      - run: uv run pytest
 
   build-and-push:
     needs: test
@@ -70,7 +64,6 @@ jobs:
         id: image
         run: echo "name=$(echo '${{ env.IMAGE_BASE }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -89,18 +82,20 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}},prefix=go-simulator-v
+            type=semver,pattern={{version}},prefix=tango-device-server-v
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
 
       # Pull requests build (to catch a broken Dockerfile/build early)
-      # but never push -- publishing only happens from main/tags.
+      # but never push -- publishing only happens from main/tags. The
+      # base images (artefact.skao.int) are amd64-only, so this doesn't
+      # go multi-arch the way the go-simulator image does.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: images/go-simulator/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          file: images/tango-device-server/Dockerfile
+          platforms: linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

@@ -1,0 +1,24 @@
+.git
+.github
+*.md
+!tango/README.md
+charts
+docs
+images
+
+# Go simulator -- irrelevant to this Python image build, just present
+# in the same repo root; excluding keeps the build context small and
+# stops unrelated Go edits from busting the Docker layer cache.
+cmd
+internal
+api
+go.mod
+go.sum
+
+tango/tests
+tango/src/**/__pycache__
+.venv
+.python-version
+__pycache__
+.pytest_cache
+.ruff_cache
