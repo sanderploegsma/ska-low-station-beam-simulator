@@ -2,7 +2,7 @@
 name = "ska-low-station-beam-simulator"
 version = "0.1.0"
 description = "Add your description here"
-readme = "README.md"
+readme = "tango/README.md"
 requires-python = ">=3.10"
 dependencies = [
     "astropy>=6.1.7",
@@ -18,6 +18,16 @@ url = "https://artefact.skao.int/repository/pypi-internal/simple"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Python sources live under tango/src (repo root is shared with the Go
+# simulator prototype, see CLAUDE.md's "Code layout") -- hatchling's
+# default src-layout autodetection only looks at <root>/src, so the
+# package location must be given explicitly.
+[tool.hatch.build.targets.wheel]
+packages = ["tango/src/ska_low_station_beam_simulator"]
+
+[tool.pytest.ini_options]
+testpaths = ["tango/tests"]
 
 [dependency-groups]
 dev = [

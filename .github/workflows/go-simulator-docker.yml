@@ -1,7 +1,8 @@
-# Tests, then builds and publishes the Go simulator prototype
-# (go-simulator/) as a container image to the GitHub Container Registry.
-# Scoped to go-simulator/ via the paths filter below -- changes to the
-# Python simulator don't trigger this workflow.
+# Tests, then builds and publishes the Go simulator prototype (now at
+# the repo root -- see CLAUDE.md's "Code layout") as a container image
+# to the GitHub Container Registry. Scoped to the Go sources via the
+# paths filter below -- changes to the Python simulator under tango/
+# don't trigger this workflow.
 name: go-simulator image
 
 on:
@@ -9,11 +10,23 @@ on:
     branches: [main]
     tags: ["go-simulator-v*"]
     paths:
-      - "go-simulator/**"
+      - "cmd/**"
+      - "internal/**"
+      - "api/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - ".dockerignore"
       - ".github/workflows/go-simulator-docker.yml"
   pull_request:
     paths:
-      - "go-simulator/**"
+      - "cmd/**"
+      - "internal/**"
+      - "api/**"
+      - "go.mod"
+      - "go.sum"
+      - "Dockerfile"
+      - ".dockerignore"
       - ".github/workflows/go-simulator-docker.yml"
   workflow_dispatch: {}
 
@@ -34,16 +47,13 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go-simulator
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go-simulator/go.mod
-          cache-dependency-path: go-simulator/go.sum
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
 
       - run: go build ./...
       - run: go vet ./...
@@ -90,7 +100,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: go-simulator
+          context: .
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}

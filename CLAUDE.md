@@ -61,7 +61,7 @@ Benchmarking below for updated resource/timing numbers at the real
 ## Code layout
 
 ```
-src/ska_low_station_beam_simulator/
+tango/src/ska_low_station_beam_simulator/
   common.py                    shared plumbing, backend-agnostic
   spead.py                      hand-rolled SPEAD-64-48 heap encoding (SpsPacketizer) -- not spead2,
                                 see the ICD section below and bug #17 -- split out of common.py so
@@ -81,6 +81,12 @@ src/ska_low_station_beam_simulator/
                                 to disk -- the only module that imports both direct_synthesis.py
                                 (build_pulsar_template) and pulsar_catalog.py (to save the result)
 ```
+
+(This lives under `tango/` at the repo root, alongside an experimental
+Go port of the same numeric core -- `cmd/`/`internal/`/`api/` at the
+repo root, `go.mod`/`go.sum`/`Dockerfile` included, see its own
+`README.md` at the repo root. `pyproject.toml`/`uv.lock` stay at the
+repo root too, covering only the Python package under `tango/src/`.)
 
 **This used to be two backends plus three separate experimental
 prototype modules; all of that has been converged into the one file
@@ -560,7 +566,7 @@ wire), whereas `DirectSynthesisStreamer`'s own callers (tests,
 `benchmark_direct_synthesis.py`) now pass already-typed config objects
 directly and get that checked by Python's own type system rather than by
 runtime dict-shape assertions. `build_source_cfg` is unit-tested in
-`tests/test_simulator_source_cfg.py` (kind dispatch, `delay_attr_uri`
+`tango/tests/test_simulator_source_cfg.py` (kind dispatch, `delay_attr_uri`
 correctly not forwarded as a dataclass field, both/neither pulsar-config
 rejection) without standing up a Tango device — this codebase otherwise
 doesn't unit test that layer at all (see Setup).
@@ -595,7 +601,7 @@ one, at the cost of the slower construction path.
 lookups. `load_pulsar_from_catalog` returns a `LoadedPulsarTemplate`
 (`template`/`period_s`/`n_period_samples`/`width_s`/`dm_pc_cm3`/
 `sky_seed`) instead of a dict, which is what `DirectSynthesisStreamer`'s
-`PulsarByNameConfig` branch and `tests/test_pulsar_catalog.py` both
+`PulsarByNameConfig` branch and `tango/tests/test_pulsar_catalog.py` both
 consume. The on-disk `catalog.json` record itself (`save_pulsar_to_catalog`'s
 per-name dict, including `npy_filename`/`num_channels`/`base_freq_hz`/
 `channel_width_hz`/`channel_output_rate`) deliberately stays a plain
@@ -797,7 +803,7 @@ entirely; nothing in this codebase uses it anymore (`SpsPacketizer` now
 sends over a plain UDP `socket`, with dependency injection for testing —
 see its docstring). Verified two ways: an item-by-item pytest check that
 parses the encoded bytes back into (ID, value) pairs independent of the
-encoder's own logic (`tests/test_spead_packetizer.py`), and a manual
+encoder's own logic (`tango/tests/test_spead_packetizer.py`), and a manual
 byte-by-byte decode of a real generated pcap's hex dump against the
 table above (every field matched, including `channel_info`'s packed
 `beam_id`/`frequency_id` and `antenna_info`'s packed station fields).
@@ -983,7 +989,7 @@ reintroduce a regression into.
     until roughly year 2091 — `encode_channel_heap` now also raises
     `ValueError` outright if a future change ever pushes it out of range
     again, rather than silently truncating. See
-    `tests/test_spead_packetizer.py` for the regression coverage
+    `tango/tests/test_spead_packetizer.py` for the regression coverage
     (present-day and 30-years-out checks, an out-of-range rejection
     check, plus an actual `send_channel_heap()` call against an injected
     fake socket, not just the arithmetic in isolation). (This bug
@@ -1524,12 +1530,12 @@ python -m ska_low_station_beam_simulator.generate_pulsar_catalog     # writes pu
 Correctness checks used to live in `direct_synthesis.py`'s
 `if __name__ == "__main__":` block (`python -m
 ska_low_station_beam_simulator.direct_synthesis`) — converted to real
-`pytest` tests under `tests/` this session, one assertion-group per test
+`pytest` tests under `tango/tests/` this session, one assertion-group per test
 instead of one long script, so a failure identifies exactly which
-property broke. `tests/test_direct_synthesis.py` covers tone/noise/pulsar
-(the old `__main__` checks); `tests/test_delay_feeds.py` covers
+property broke. `tango/tests/test_direct_synthesis.py` covers tone/noise/pulsar
+(the old `__main__` checks); `tango/tests/test_delay_feeds.py` covers
 `DelayFeed`/the required-delay_feed validation/the per-source-delay-divergence
-integration check; `tests/test_simulator_delay_wiring.py` covers the
+integration check; `tango/tests/test_simulator_delay_wiring.py` covers the
 Tango attribute subscription plumbing in `simulator.py` (against a fake
 `AttributeProxy`, not a live Tango context — this codebase still doesn't
 unit test the actual Tango device server layer).

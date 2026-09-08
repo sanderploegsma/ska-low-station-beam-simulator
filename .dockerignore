@@ -1,0 +1,19 @@
+.git
+.github
+*.md
+.dockerignore
+Dockerfile
+charts
+
+# Python simulator + uv environment -- irrelevant to this Go image build
+# but present in the same repo root now that Go moved out of its own
+# go-simulator/ subdirectory; excluding keeps the build context small
+# and stops unrelated Python edits from busting the Docker layer cache.
+tango
+.venv
+.python-version
+pyproject.toml
+uv.lock
+__pycache__
+.pytest_cache
+.ruff_cache

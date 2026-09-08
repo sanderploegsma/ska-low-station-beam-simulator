@@ -6,6 +6,9 @@ dist/
 wheels/
 *.egg-info
 
+# Also covers local `go build -o build/...` output (see go-simulator/*
+# history) -- `build/` above is not Python-specific.
+
 # Virtual environments
 .venv
 
@@ -17,4 +20,4 @@ CLAUDE.local.md
 # permanently bloat repo history). Generate locally with
 # `python -m ska_low_station_beam_simulator.generate_pulsar_catalog`, or
 # as an OCI image build step -- see CLAUDE.md's Pulsar catalog section.
-src/ska_low_station_beam_simulator/pulsar_catalog_data/
+tango/src/ska_low_station_beam_simulator/pulsar_catalog_data/
