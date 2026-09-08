@@ -1061,3 +1061,32 @@ OS-thread spin-up remains the next candidate) or treat ~51 events/90s
 scan (mostly sub-10ms) as acceptable for this project's actual test
 tolerance is a call for whoever owns the CBF-side acceptance criteria,
 not something to keep optimizing blind.
+
+### Decision: pausing here -- residual drift is acceptable as long as it recovers rather than compounds
+
+Confirmed, from the pacing loop itself rather than just from the logs,
+that this holds: `ScanRunner.run`'s `targetWall` (`scan_runner.go`) is
+`wallStart` (captured once, before the loop starts) plus `tick *
+blockDuration` -- an ABSOLUTE per-tick deadline, never derived from when
+the previous tick finished. A slow tick's overrun is therefore isolated
+to that tick; the next tick's deadline doesn't shift later to
+accommodate it, so as soon as one tick's actual work drops back under
+budget, normal sleep-based pacing resumes with no carried-over debt. This
+is also the structural reason every capture this session shows drift as
+isolated bursts followed by clean gaps rather than a monotonically
+growing overrun -- the one way this guarantee would break is per-tick
+production becoming SYSTEMATICALLY slower than the 2.21ms budget for a
+sustained stretch, not just occasionally, which nothing measured this
+session shows. `simTime` is likewise computed from `obsTime +
+tick*BlockDurationS`, independent of wall-clock time -- so a late tick's
+CONTENT (heap timestamps, `heap_counter`, delay-poly evaluation) is still
+exactly correct regardless of pacing drift; only when the heap goes out
+on the wire is ever late, never what it says.
+
+Given that guarantee plus the 52x reduction already achieved this
+session (2641 -> 51 drift events on the same 90s/384ch/one-tone test),
+decided to stop chasing the remaining residual here rather than pursue
+the goroutine/OS-thread-spin-up hypothesis further. Revisit if a future
+capture ever shows overrun growing tick-over-tick within a burst instead
+of recovering, or if CBF's actual delay-tracking test tolerance turns out
+to need tighter margins than this.
