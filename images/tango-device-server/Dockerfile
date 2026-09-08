@@ -50,11 +50,6 @@ FROM $BASE_IMAGE
 
 USER root
 
-RUN set -xe; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends \
-        tcpdump
-
 # Copy application from the build image
 COPY --from=build /app /app
 
