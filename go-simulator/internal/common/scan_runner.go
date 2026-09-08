@@ -19,19 +19,33 @@ type Streamer interface {
 	// produces close to exactly one heap's worth of per-channel samples.
 	TickNSamples() int
 
-	// GenerateNextTick returns pol ("V"/"H") -> a flat, CHANNEL-MAJOR
-	// (NumChannels(), n) complex128 slice (index = ch*n+sample) — each
-	// channel's n samples contiguous. Chosen deliberately over the more
-	// "natural" per-tick generation order (sample-major, matching a
-	// per-sample synthesis loop) because it's also HeapAccumulator's own
-	// storage order: every downstream consumer (per-channel heap
-	// encoding) wants one channel's samples contiguous, so producing
-	// that layout directly here avoids a transpose entirely instead of
-	// paying for one once per tick, once per pol, for the life of a scan
-	// (see HeapAccumulator's doc comment for the allocation/access-
-	// pattern bug this replaced, found via
-	// BenchmarkHeapAccumulator_OneTickPerPop and BenchmarkProducerTick).
-	GenerateNextTick(t float64, n int) map[string][]complex128
+	// GenerateNextTick writes this tick's samples directly into dst: for
+	// each pol ("V"/"H") present as a key, dst[pol] has NumChannels()
+	// entries, each already sized to exactly n samples (allocated by
+	// HeapAccumulator.PrepareWrite) — implementations write generated
+	// samples straight into dst[pol][ch], never build their own separate
+	// output buffer to hand back.
+	//
+	// This replaced an earlier "return a fresh/reused buffer, caller
+	// copies it into the accumulator" design: even after that buffer was
+	// made channel-major (see below) and reused across ticks (removing
+	// per-tick allocation), the accumulator's own Add still had to copy
+	// every sample out of it a second time. Profiling a real end-to-end
+	// run (384 channels, EPYC target hardware) found that second copy
+	// was the dominant remaining cost even after PARALLELIZING it across
+	// every available core — more threads don't help a fixed amount of
+	// memory traffic that a single copy doesn't need to move at all. See
+	// HeapAccumulator.PrepareWrite's doc comment for the full profiling
+	// trail.
+	//
+	// dst[pol][ch] being CHANNEL-MAJOR (one channel's samples contiguous,
+	// not interleaved sample-major as a per-sample synthesis loop would
+	// most naturally produce) is unchanged from before: it's also
+	// HeapAccumulator's own per-channel storage order, and every
+	// downstream consumer (per-channel heap encoding) wants one
+	// channel's samples contiguous — see HeapAccumulator's doc comment
+	// for the transpose-elimination history this layout choice predates.
+	GenerateNextTick(t float64, n int, dst map[string][][]complex128)
 }
 
 // HeapSender is anything that can send a ChannelHeap onward (SPEAD/UDP in
@@ -159,12 +173,11 @@ func (r *ScanRunner) run() {
 			}
 		}
 
-		rawResults := r.streamer.GenerateNextTick(simTime, r.nSamplesPerTick)
-		for pol, chunk := range rawResults {
-			if chunk != nil {
-				r.accumulator.Add(pol, chunk)
-			}
+		dst := map[string][][]complex128{
+			"V": r.accumulator.PrepareWrite("V", r.nSamplesPerTick),
+			"H": r.accumulator.PrepareWrite("H", r.nSamplesPerTick),
 		}
+		r.streamer.GenerateNextTick(simTime, r.nSamplesPerTick, dst)
 
 		for _, heap := range r.accumulator.PopReadyHeaps() {
 			if !r.sender.Send(heap) {

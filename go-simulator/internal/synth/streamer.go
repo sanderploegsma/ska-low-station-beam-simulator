@@ -77,7 +77,6 @@ type DirectSynthesisStreamer struct {
 	tileNSamples int
 	banks        map[string][]complex128 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels)
 
-	outBufs    map[string][]complex128 // reused per tick, per pol
 	numWorkers int
 }
 
@@ -129,7 +128,6 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		toneCfgs:          cfg.ToneSources,
 		noiseCfg:          cfg.Noise,
 		banks:             make(map[string][]complex128),
-		outBufs:           make(map[string][]complex128),
 	}
 
 	if cfg.Noise != nil {
@@ -217,39 +215,25 @@ func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
 	return bankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.banks))
 }
 
-func (s *DirectSynthesisStreamer) getOutputBuffer(pol string, nSamples int) []complex128 {
-	buf := s.outBufs[pol]
-	if len(buf) != nSamples*s.numChannels {
-		buf = make([]complex128, nSamples*s.numChannels)
-		s.outBufs[pol] = buf
-	}
-	return buf
-}
-
 // GenerateNextTick implements common.Streamer. t is the absolute epoch
 // time of this tick's first sample; nSamples is the per-channel sample
-// count for this tick (at channelOutputRate). Returns pol -> flat,
-// CHANNEL-MAJOR (numChannels, nSamples) complex128 (index =
-// channel*nSamples+sample) — see common.Streamer's doc comment for why.
+// count for this tick (at channelOutputRate). Writes directly into
+// dst[pol][ch] for each configured pol — see common.Streamer's doc
+// comment for why (this replaced an earlier "return a buffer, caller
+// copies it into the accumulator" design once profiling on real target
+// hardware found that copy dominating CPU time even after being
+// parallelized across every available core).
 //
-// Profiling a real end-to-end run on the target hardware found
-// ScanRunner's single producer goroutine (this method plus
-// HeapAccumulator's Add/PopReadyHeaps) running at ~99% duty cycle on ONE
-// core for the whole scan, unable to keep pace even after every
-// allocation-related fix upstream and downstream of it -- unlike
-// sending (already parallelized across SenderPool's goroutines),
-// generation had never been split across cores at all. Since noise
-// fill dominates this method's own cost (a bulk copy from the tile
-// bank, O(numChannels)) and every channel's copy is independent, it's
-// parallelized here across both pols AND channel ranges at once -- V
-// and H are already fully independent (separate seeds/buffers), and
-// channel-major layout means a channel range is one contiguous slice on
-// both the bank (source) and out (destination), so no worker ever
-// touches another's data. Tone injection is NOT parallelized: it's
-// already established elsewhere in this file as O(1) per tone,
-// negligible next to the noise fill, and splitting it would only
-// complicate the out-of-range-tone warning below for no real benefit.
-func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int) map[string][]complex128 {
+// Since noise fill dominates this method's own cost (a bulk copy from
+// the tile bank, O(numChannels)) and every channel's copy is
+// independent, it's parallelized here across both pols AND channel
+// ranges at once -- V and H are already fully independent (separate
+// seeds/buffers, separate dst entries), so no worker ever touches
+// another's data. Tone injection is NOT parallelized: it's already
+// established elsewhere in this file as O(1) per tone, negligible next
+// to the noise fill, and splitting it would only complicate the
+// out-of-range-tone warning below for no real benefit.
+func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst map[string][][]complex128) {
 	tLocalRelStart := t - s.obsTimeRef
 
 	pols := [...]struct {
@@ -261,19 +245,23 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int) map[
 		{"H", true, s.noiseSeedH},
 	}
 
-	results := make(map[string][]complex128, 2)
 	var wg sync.WaitGroup
 	for _, p := range pols {
-		out := s.getOutputBuffer(p.pol, nSamples)
-		results[p.pol] = out
+		target := dst[p.pol]
+		if target == nil {
+			continue
+		}
 		// Noise first, WRITTEN (not accumulated) so it covers every
 		// cell -- that's what lets tone below skip zeroing the buffer.
-		s.fillNoiseParallel(&wg, p.pol, p.noiseSeed, out, nSamples, tLocalRelStart)
+		s.fillNoiseParallel(&wg, p.pol, p.noiseSeed, target, nSamples, tLocalRelStart)
 	}
 	wg.Wait()
 
 	for _, p := range pols {
-		out := results[p.pol]
+		target := dst[p.pol]
+		if target == nil {
+			continue
+		}
 		for _, cfg := range s.toneCfgs {
 			poly := cfg.DelayFeed.Get(t)
 			polyTRelStart := t - poly.StartValiditySec
@@ -295,27 +283,24 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int) map[
 				log.Printf("tone freq_hz=%v maps to channel_idx=%d, outside the configured [0, %d) channel range — skipping", cfg.FreqHz, chIdx, s.numChannels)
 				continue
 			}
-			// Channel-major out: chIdx's samples are already contiguous,
-			// so this is a sequential add, not a strided one.
-			outCh := out[chIdx*nSamples : (chIdx+1)*nSamples]
+			outCh := target[chIdx]
 			for i, sample := range samples {
 				outCh[i] += sample
 			}
 		}
 	}
-	return results
 }
 
-// fillNoiseParallel fills out (channel-major, numChannels*nSamples) with
-// this tick's noise-bank tile (or zeros, if noise isn't configured),
-// registering s.numWorkers goroutines' worth of work on wg -- one
-// goroutine per channel range, split via fillNoiseRange. Does NOT call
-// wg.Wait() itself: GenerateNextTick calls this once per pol against one
-// shared WaitGroup, so both pols' fills run fully in parallel with each
-// other too, not just within a pol.
-func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol string, noiseSeed uint64, out []complex128, nSamples int, tLocalRelStart float64) {
+// fillNoiseParallel fills dst (per channel, each already nSamples long)
+// with this tick's noise-bank tile (or zeros, if noise isn't
+// configured), registering s.numWorkers goroutines' worth of work on wg
+// -- one goroutine per channel range, split via fillNoiseRange. Does NOT
+// call wg.Wait() itself: GenerateNextTick calls this once per pol
+// against one shared WaitGroup, so both pols' fills run fully in
+// parallel with each other too, not just within a pol.
+func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol string, noiseSeed uint64, dst [][]complex128, nSamples int, tLocalRelStart float64) {
 	if s.numWorkers <= 1 {
-		s.fillNoiseRange(pol, noiseSeed, out, nSamples, tLocalRelStart, 0, s.numChannels)
+		s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, 0, s.numChannels)
 		return
 	}
 	chunkSize := (s.numChannels + s.numWorkers - 1) / s.numWorkers
@@ -327,20 +312,25 @@ func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol stri
 		wg.Add(1)
 		go func(chStart, chEnd int) {
 			defer wg.Done()
-			s.fillNoiseRange(pol, noiseSeed, out, nSamples, tLocalRelStart, chStart, chEnd)
+			s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, chStart, chEnd)
 		}(chStart, chEnd)
 	}
 }
 
-// fillNoiseRange fills out[chStart*nSamples : chEnd*nSamples] -- one
-// worker's contiguous channel range (channel-major layout makes this a
-// single contiguous slice on both out and the noise bank, so no cross-
-// worker synchronization is needed beyond the caller's WaitGroup).
-func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, out []complex128, nSamples int, tLocalRelStart float64, chStart, chEnd int) {
-	outRange := out[chStart*nSamples : chEnd*nSamples]
+// fillNoiseRange fills dst[chStart:chEnd] -- one worker's channel range.
+// dst[ch] is its own separately-owned backing array (HeapAccumulator's
+// per-channel storage, not one contiguous multi-channel buffer as
+// before), so each channel gets its own copy call rather than one bulk
+// copy across the whole range -- same total bytes moved, no cross-worker
+// synchronization needed beyond the caller's WaitGroup either way, since
+// disjoint dst[ch] slices can never alias.
+func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex128, nSamples int, tLocalRelStart float64, chStart, chEnd int) {
 	if s.noiseCfg == nil {
-		for i := range outRange {
-			outRange[i] = 0
+		for ch := chStart; ch < chEnd; ch++ {
+			out := dst[ch]
+			for i := range out {
+				out[i] = 0
+			}
 		}
 		return
 	}
@@ -352,6 +342,8 @@ func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, o
 	}
 	tickIndex := int64(tLocalRelStart*s.channelOutputRate+0.5) / int64(n)
 	tileIdx := int(splitmix64Hash(noiseSeed, uint64(tickIndex)) % uint64(s.nTiles))
-	bankOffset := tileIdx*tileLen + chStart*nSamples
-	copy(outRange, bank[bankOffset:bankOffset+(chEnd-chStart)*nSamples])
+	for ch := chStart; ch < chEnd; ch++ {
+		bankOffset := tileIdx*tileLen + ch*nSamples
+		copy(dst[ch], bank[bankOffset:bankOffset+nSamples])
+	}
 }

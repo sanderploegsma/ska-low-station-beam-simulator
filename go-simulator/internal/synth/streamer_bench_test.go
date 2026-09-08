@@ -8,8 +8,8 @@ import (
 )
 
 // BenchmarkProducerTick reproduces one ScanRunner tick end-to-end
-// (GenerateNextTick -> HeapAccumulator.Add -> PopReadyHeaps) -- the
-// exact per-tick work whose real-time budget is common.BlockDurationS
+// (HeapAccumulator.PrepareWrite -> GenerateNextTick -> PopReadyHeaps) --
+// the exact per-tick work whose real-time budget is common.BlockDurationS
 // (~2.21ms), and whose overrun is what noise-stream's "producer falling
 // behind pacing" log line is reporting. Noise-only (matches
 // cmd/noise-stream, which sets no ToneSources), n_tiles left at
@@ -32,10 +32,11 @@ func BenchmarkProducerTick(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				t := 1_700_000_000.0 + float64(i)*common.BlockDurationS
-				rawResults := streamer.GenerateNextTick(t, nSamples)
-				for pol, chunk := range rawResults {
-					acc.Add(pol, chunk)
+				dst := map[string][][]complex128{
+					"V": acc.PrepareWrite("V", nSamples),
+					"H": acc.PrepareWrite("H", nSamples),
 				}
+				streamer.GenerateNextTick(t, nSamples, dst)
 				heaps := acc.PopReadyHeaps()
 				if len(heaps) != numChannels {
 					b.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))

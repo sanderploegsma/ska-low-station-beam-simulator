@@ -11,6 +11,36 @@ func testStation() *common.StationConfig {
 	return &common.StationConfig{StationID: 1, SubstationID: 0, SubarrayID: 1, BeamID: 1, ScanID: 1}
 }
 
+// newDst builds a fresh V/H destination map for GenerateNextTick -- one
+// nSamples-long slice per channel, per pol, matching what
+// HeapAccumulator.PrepareWrite hands the real ScanRunner every tick.
+func newDst(numChannels, nSamples int) map[string][][]complex128 {
+	dst := make(map[string][][]complex128, 2)
+	for _, pol := range [...]string{"V", "H"} {
+		chBufs := make([][]complex128, numChannels)
+		for ch := range chBufs {
+			chBufs[ch] = make([]complex128, nSamples)
+		}
+		dst[pol] = chBufs
+	}
+	return dst
+}
+
+// flatten concatenates dst[pol] (per-channel slices) into one flat,
+// channel-major slice -- a convenience for tests written against the
+// old flat-buffer return value.
+func flatten(chBufs [][]complex128) []complex128 {
+	if len(chBufs) == 0 {
+		return nil
+	}
+	nSamples := len(chBufs[0])
+	out := make([]complex128, 0, len(chBufs)*nSamples)
+	for _, chBuf := range chBufs {
+		out = append(out, chBuf...)
+	}
+	return out
+}
+
 func TestNewDirectSynthesisStreamer_RejectsInvalidNumChannels(t *testing.T) {
 	// 7: below MinNumChannels and not a multiple of 8. 100: a multiple of
 	// neither. 392: a multiple of 8 but over MaxNumChannels (384). Note
@@ -80,17 +110,18 @@ func TestDirectSynthesisStreamer_ToneLandsInConfiguredChannel(t *testing.T) {
 	}
 
 	n := s.TickNSamples()
-	result := s.GenerateNextTick(1000.0, n)
+	dst := newDst(numChannels, n)
+	s.GenerateNextTick(1000.0, n, dst)
 
 	for _, pol := range []string{"V", "H"} {
-		out := result[pol]
-		if len(out) != n*numChannels {
-			t.Fatalf("pol %s: len(out) = %d, want %d", pol, len(out), n*numChannels)
+		out := dst[pol]
+		if len(out) != numChannels {
+			t.Fatalf("pol %s: len(out) = %d, want %d", pol, len(out), numChannels)
 		}
 		// Energy should be concentrated in channelIdx, ~zero elsewhere.
 		for ch := 0; ch < numChannels; ch++ {
 			mag := 0.0
-			chSamples := out[ch*n : (ch+1)*n] // channel-major: this channel's samples are contiguous
+			chSamples := out[ch]
 			for i := 0; i < n; i++ {
 				v := chSamples[i]
 				mag += real(v)*real(v) + imag(v)*imag(v)
@@ -123,8 +154,9 @@ func TestDirectSynthesisStreamer_ToneOutsideRangeIsSkippedNotFatal(t *testing.T)
 		t.Fatalf("unexpected error: %v", err)
 	}
 	n := s.TickNSamples()
-	result := s.GenerateNextTick(0, n)
-	for _, v := range result["V"] {
+	dst := newDst(8, n)
+	s.GenerateNextTick(0, n, dst)
+	for _, v := range flatten(dst["V"]) {
 		if real(v) != 0 || imag(v) != 0 {
 			t.Fatalf("expected all-zero output for an out-of-range tone, got %v", v)
 		}
@@ -144,14 +176,13 @@ func TestDirectSynthesisStreamer_NoiseIsDeterministicAcrossRepeatedCalls(t *test
 	}
 	n := s.TickNSamples()
 
-	a := s.GenerateNextTick(5.0, n)
-	// GenerateNextTick reuses its output buffer, so copy before calling
-	// again -- otherwise both "results" would alias the same backing
-	// array and this test would trivially pass.
-	aV := append([]complex128(nil), a["V"]...)
+	dstA := newDst(8, n)
+	s.GenerateNextTick(5.0, n, dstA)
+	aV := flatten(dstA["V"])
 
-	b := s.GenerateNextTick(5.0, n)
-	bV := b["V"]
+	dstB := newDst(8, n)
+	s.GenerateNextTick(5.0, n, dstB)
+	bV := flatten(dstB["V"])
 
 	for i := range aV {
 		if aV[i] != bV[i] {
@@ -179,8 +210,9 @@ func TestDirectSynthesisStreamer_NoiseIndependentAcrossStationSeeds(t *testing.T
 		// (a fixed, much larger ICD-derived constant) -- a tile only
 		// has n*numChannels elements, and generation reads exactly one
 		// whole tile per call (see fillNoiseRange).
-		out := s.GenerateNextTick(0, n)["V"]
-		return append([]complex128(nil), out...)
+		dst := newDst(numChannels, n)
+		s.GenerateNextTick(0, n, dst)
+		return flatten(dst["V"])
 	}
 
 	stationA := buildBankOutput(1)
@@ -211,8 +243,10 @@ func TestDirectSynthesisStreamer_VAndHNoiseDiffer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	result := s.GenerateNextTick(0, s.TickNSamples())
-	v, h := result["V"], result["H"]
+	n := s.TickNSamples()
+	dst := newDst(8, n)
+	s.GenerateNextTick(0, n, dst)
+	v, h := flatten(dst["V"]), flatten(dst["H"])
 	identical := 0
 	for i := range v {
 		if v[i] == h[i] {
@@ -254,7 +288,10 @@ func TestDirectSynthesisStreamer_NoiseNeverDelayCorrected(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		return append([]complex128(nil), s.GenerateNextTick(0, s.TickNSamples())["V"]...)
+		n := s.TickNSamples()
+		dst := newDst(8, n)
+		s.GenerateNextTick(0, n, dst)
+		return flatten(dst["V"])
 	}
 
 	outA := build(feedA)

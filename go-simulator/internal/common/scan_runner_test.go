@@ -25,17 +25,21 @@ func (f *fakeStreamer) ChannelIDMap() []int {
 }
 func (f *fakeStreamer) NumChannels() int  { return f.numChannels }
 func (f *fakeStreamer) TickNSamples() int { return f.tickN }
-func (f *fakeStreamer) GenerateNextTick(t float64, n int) map[string][]complex128 {
+func (f *fakeStreamer) GenerateNextTick(t float64, n int, dst map[string][][]complex128) {
 	f.mu.Lock()
 	f.callCount++
 	f.mu.Unlock()
-	v := make([]complex128, n*f.numChannels)
-	h := make([]complex128, n*f.numChannels)
-	for i := range v {
-		v[i] = complex(t, 0)
-		h[i] = complex(t, 1)
+	for _, pol := range []string{"V", "H"} {
+		val := complex(t, 0)
+		if pol == "H" {
+			val = complex(t, 1)
+		}
+		for _, chBuf := range dst[pol] {
+			for i := range chBuf {
+				chBuf[i] = val
+			}
+		}
 	}
-	return map[string][]complex128{"V": v, "H": h}
 }
 
 // fakeSender records every heap it receives, never drops (large enough

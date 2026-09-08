@@ -115,6 +115,42 @@ func TestHeapAccumulator_SecondHeapAdvancesStartTime(t *testing.T) {
 	}
 }
 
+func TestHeapAccumulator_PrepareWriteDirectFill(t *testing.T) {
+	// Exercises the real ScanRunner path -- PrepareWrite then write
+	// directly into the returned per-channel targets -- rather than
+	// building a chunk and going through Add.
+	numChannels := 3
+	acc := NewHeapAccumulator(numChannels, 100.0, 2.0, nil)
+
+	vTargets := acc.PrepareWrite("V", HeapLen)
+	hTargets := acc.PrepareWrite("H", HeapLen)
+	if len(vTargets) != numChannels || len(hTargets) != numChannels {
+		t.Fatalf("PrepareWrite returned %d/%d targets, want %d", len(vTargets), len(hTargets), numChannels)
+	}
+	for ch := 0; ch < numChannels; ch++ {
+		if len(vTargets[ch]) != HeapLen || len(hTargets[ch]) != HeapLen {
+			t.Fatalf("channel %d: target length v=%d h=%d, want %d", ch, len(vTargets[ch]), len(hTargets[ch]), HeapLen)
+		}
+		for i := 0; i < HeapLen; i++ {
+			vTargets[ch][i] = complex(float64(i), float64(ch))
+			hTargets[ch][i] = complex(float64(ch), float64(i))
+		}
+	}
+
+	heaps := acc.PopReadyHeaps()
+	if len(heaps) != numChannels {
+		t.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
+	}
+	for _, h := range heaps {
+		if real(h.VSamples[5]) != 5 || imag(h.VSamples[5]) != float64(h.ChannelID) {
+			t.Fatalf("channel %d: VSamples[5] = %v, want (5+%di) -- direct-write target wasn't reflected in the popped heap", h.ChannelID, h.VSamples[5], h.ChannelID)
+		}
+		if real(h.HSamples[5]) != float64(h.ChannelID) || imag(h.HSamples[5]) != 5 {
+			t.Fatalf("channel %d: HSamples[5] = %v, want (%d+5i)", h.ChannelID, h.HSamples[5], h.ChannelID)
+		}
+	}
+}
+
 func TestHeapAccumulator_CustomChannelIDMap(t *testing.T) {
 	numChannels := 2
 	channelIDMap := []int{64, 72} // e.g. a station's first_channel_id offset

@@ -141,26 +141,50 @@ func forEachChannelRange(numWorkers, numChannels int, fn func(chStart, chEnd int
 	wg.Wait()
 }
 
-// Add appends one tick's chunk -- flat, CHANNEL-MAJOR (numChannels,
-// nSamples), index = channel*nSamples+sample, matching
-// Streamer.GenerateNextTick's output layout -- for the given
-// polarisation ("V" or "H"). Each channel's nSamples segment is a
-// contiguous run in chunk, so distributing it into bufV/bufH is
-// numChannels bulk appends, never a per-element copy -- and, since each
-// channel's append is independent of every other's, split across
+// PrepareWrite grows each channel's buffer for pol by nSamples and
+// returns, per channel, the newly-added nSamples-length slice as a
+// direct write target -- the caller (ScanRunner, via
+// synth.DirectSynthesisStreamer.GenerateNextTick) writes generated
+// samples straight into these instead of building a separate chunk that
+// then has to be copied in via Add.
+//
+// This exists because profiling a real end-to-end run (384 channels,
+// EPYC target hardware) found the OLD flow -- generate into a scratch
+// buffer, then Add() copies it into bufV/bufH -- moving every tick's
+// samples TWICE: once out of the noise tile bank into the scratch
+// buffer, once more out of the scratch buffer into here. Neither more
+// threads (see defaultParallelism's doc comment: raising the worker cap
+// left this exact copy volume unchanged, and pacing didn't improve) nor
+// the earlier PopReadyHeaps fix (which removed a THIRD copy, out of here
+// into a flat per-pop buffer) touched this one. Generating directly into
+// PrepareWrite's returned slices removes it -- one copy (bank tile ->
+// here) instead of two.
+//
+// Each channel's growth is independent (disjoint bufV[ch]/bufH[ch]
+// slices), so -- like Add and PopReadyHeaps -- this is split across
 // a.numWorkers goroutines by channel range.
-func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
-	if len(chunk) == 0 {
-		return
+func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 {
+	if nSamples <= 0 {
+		return nil
 	}
-	nSamples := len(chunk) / a.numChannels
 	bufs := a.bufV
 	if pol == "H" {
 		bufs = a.bufH
 	}
+	targets := make([][]complex128, a.numChannels)
 	forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
 		for ch := chStart; ch < chEnd; ch++ {
-			bufs[ch] = append(bufs[ch], chunk[ch*nSamples:(ch+1)*nSamples]...)
+			old := bufs[ch]
+			oldLen := len(old)
+			newLen := oldLen + nSamples
+			if cap(old) >= newLen {
+				bufs[ch] = old[:newLen]
+			} else {
+				grown := make([]complex128, newLen)
+				copy(grown, old) // no-op in the normal case: old is empty right after the previous PopReadyHeaps handoff
+				bufs[ch] = grown
+			}
+			targets[ch] = bufs[ch][oldLen:newLen]
 		}
 	})
 	switch pol {
@@ -169,6 +193,28 @@ func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
 	case "H":
 		a.rowsH += nSamples
 	}
+	return targets
+}
+
+// Add appends one tick's chunk -- flat, CHANNEL-MAJOR (numChannels,
+// nSamples), index = channel*nSamples+sample -- for the given
+// polarisation ("V" or "H"). A thin convenience wrapper around
+// PrepareWrite for callers that already have a fully-built chunk (tests,
+// BenchmarkHeapAccumulator_OneTickPerPop); ScanRunner's real per-tick
+// path calls PrepareWrite directly instead, so generation can write into
+// the target slices without ever building chunk in the first place (see
+// PrepareWrite's doc comment).
+func (a *HeapAccumulator) Add(pol string, chunk []complex128) {
+	if len(chunk) == 0 {
+		return
+	}
+	nSamples := len(chunk) / a.numChannels
+	targets := a.PrepareWrite(pol, nSamples)
+	forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
+		for ch := chStart; ch < chEnd; ch++ {
+			copy(targets[ch], chunk[ch*nSamples:(ch+1)*nSamples])
+		}
+	})
 }
 
 // PopReadyHeaps pops every fully-buffered heap (HeapLen samples available
