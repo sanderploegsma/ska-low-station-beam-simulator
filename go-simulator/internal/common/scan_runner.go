@@ -48,6 +48,39 @@ type Streamer interface {
 	GenerateNextTick(t float64, n int, dst map[string][][]complex64)
 }
 
+// ComplexPathChannelIDMapper is an OPTIONAL Streamer capability. If a
+// Streamer implements it, ScanRunner sizes its HeapAccumulator (and
+// therefore GenerateNextTick's dst) to exactly this channel subset,
+// instead of every channel in ChannelIDMap() -- for a Streamer that
+// produces SOME channels' heaps a different way (see
+// QuantizedHeapProducer) and only needs the complex64 dst-write path for
+// the rest. A Streamer that doesn't implement this gets the original
+// full-ChannelIDMap sizing, unchanged -- this is why it's a separate,
+// optional interface rather than a new required Streamer method: every
+// existing Streamer (including test fakes) keeps working with zero
+// changes.
+type ComplexPathChannelIDMapper interface {
+	ComplexPathChannelIDMap() []int
+}
+
+// QuantizedHeapProducer is an OPTIONAL Streamer capability: a Streamer
+// that can produce some channels' heaps WITHOUT the complex64 dst-write/
+// HeapAccumulator path (e.g. pre-quantized noise-only channels, see
+// synth.DirectSynthesisStreamer.GenerateQuantizedHeaps) implements this;
+// ScanRunner calls it once per tick, alongside (not instead of)
+// GenerateNextTick+PrepareWrite/PopReadyHeaps for whatever channels
+// aren't covered this way (see ComplexPathChannelIDMapper). A Streamer
+// that doesn't implement this is unaffected -- ScanRunner simply doesn't
+// call it, and every channel goes through the original complex64 path.
+type QuantizedHeapProducer interface {
+	// GenerateQuantizedHeaps returns complete, ready-to-send heaps for
+	// this tick (t: same absolute epoch time GenerateNextTick receives).
+	// Each returned heap is exactly one HeapLen-sample heap -- there is
+	// no cross-tick accumulation for this path, unlike HeapAccumulator's
+	// general (if, in practice, always-one-tick-per-heap) buffering.
+	GenerateQuantizedHeaps(t float64) []*ChannelHeap
+}
+
 // HeapSender is anything that can send a ChannelHeap onward (SPEAD/UDP in
 // production, a channel-backed queue here). Kept as an interface, not a
 // concrete queue type, so ScanRunner doesn't dictate how heaps reach the
@@ -80,8 +113,17 @@ type ScanRunner struct {
 // NewScanRunner constructs a ScanRunner. The per-channel output sample
 // rate is fixed by the ICD (ChannelOutputRateHz), not whichever backend
 // is in use.
+//
+// The HeapAccumulator (and therefore GenerateNextTick's dst) is sized to
+// streamer.ComplexPathChannelIDMap() if streamer implements
+// ComplexPathChannelIDMapper, otherwise to the full streamer.
+// ChannelIDMap() as before -- see that interface's doc comment.
 func NewScanRunner(streamer Streamer, sender HeapSender, obsTime, scanDurationS float64) *ScanRunner {
 	nSamplesPerTick := streamer.TickNSamples()
+	complexChannelIDMap := streamer.ChannelIDMap()
+	if m, ok := streamer.(ComplexPathChannelIDMapper); ok {
+		complexChannelIDMap = m.ComplexPathChannelIDMap()
+	}
 	return &ScanRunner{
 		streamer:          streamer,
 		sender:            sender,
@@ -90,7 +132,7 @@ func NewScanRunner(streamer Streamer, sender HeapSender, obsTime, scanDurationS 
 		channelOutputRate: ChannelOutputRateHz,
 		nSamplesPerTick:   nSamplesPerTick,
 		accumulator: NewHeapAccumulator(
-			streamer.NumChannels(), obsTime, ChannelOutputRateHz, streamer.ChannelIDMap(),
+			len(complexChannelIDMap), obsTime, ChannelOutputRateHz, complexChannelIDMap,
 		),
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
@@ -182,6 +224,18 @@ func (r *ScanRunner) run() {
 		for _, heap := range r.accumulator.PopReadyHeaps() {
 			if !r.sender.Send(heap) {
 				log.Printf("send queue full — dropping heap ch=%d t=%.4f", heap.ChannelID, heap.HeapStartTime)
+			}
+		}
+
+		// Channels this streamer produces WITHOUT the complex64 dst-write/
+		// HeapAccumulator path above (see QuantizedHeapProducer) -- most
+		// Streamer implementations don't support this, in which case this
+		// is simply a no-op and every channel came from PopReadyHeaps above.
+		if qp, ok := r.streamer.(QuantizedHeapProducer); ok {
+			for _, heap := range qp.GenerateQuantizedHeaps(simTime) {
+				if !r.sender.Send(heap) {
+					log.Printf("send queue full — dropping heap ch=%d t=%.4f", heap.ChannelID, heap.HeapStartTime)
+				}
 			}
 		}
 	}

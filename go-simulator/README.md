@@ -649,3 +649,108 @@ skip the complex64 round-trip for noise-only channels" pipeline change
 remains the next real lever, and after this result it looks like the
 one actually worth the bigger engineering investment, not an optional
 nice-to-have alongside smaller wins.
+
+### Pre-quantized noise tile bank -- implemented (2026-09-08 session)
+
+The lever flagged above IS now implemented: noise-only channels (no
+tone source targets them) skip the complex64 dst-write/HeapAccumulator
+path entirely and get complete, ready-to-send heaps built DIRECTLY from
+a noise tile bank that's pre-quantized to int8 ONCE at construction,
+not adaptively rescanned+rounded+clamped every tick. This is a real
+architectural change, not a tuning knob -- approved explicitly on the
+basis that "different implementation, same-enough output" doesn't need
+a stop-and-ask, only "would this change what comes out" does (see this
+session's own discussion of the fixed-scale tradeoff's science for the
+precedent).
+
+**Design**: a tone source's channel is FIXED for the whole scan (it
+depends only on the source's static configured FreqHz, never on
+per-tick delay) -- so which channels need full-precision samples
+(to combine with tone before quantizing) vs. which are noise-only is
+knowable ONCE, at `NewDirectSynthesisStreamer` construction, not
+per-tick:
+- `DirectSynthesisStreamer.ComplexPathChannelIDMap()` (new,
+  `common.ComplexPathChannelIDMapper`): the small, tone-affected
+  channel subset. `common.ScanRunner` sizes its `HeapAccumulator` (and
+  therefore `GenerateNextTick`'s `dst`) to just this subset now,
+  instead of every channel -- a genuinely OPTIONAL Streamer capability
+  (type-asserted, not a new required interface method), so any
+  Streamer that doesn't implement it keeps the original full-width
+  behavior unchanged.
+- `DirectSynthesisStreamer.GenerateQuantizedHeaps(t)` (new,
+  `common.QuantizedHeapProducer`, also optional/type-asserted): builds
+  complete heaps for every OTHER (noise-only) channel directly,
+  bypassing `HeapAccumulator`. `common.ScanRunner.run` calls this
+  alongside (not instead of) the original `PrepareWrite`/
+  `GenerateNextTick`/`PopReadyHeaps` sequence each tick.
+- `common.ChannelHeap` gained `VQuantized`/`HQuantized []byte` fields --
+  an ALTERNATIVE to `VSamples`/`HSamples`, not an addition, per pol.
+  `spead.EncodeChannelHeapInto` branches on which is set: pre-quantized
+  bytes get a straight, strided byte copy into the wire payload (no
+  scale, no rounding, no clamping -- `copyQuantizedIntoPayload`); the
+  original complex path is completely unchanged for tone-affected
+  channels.
+- `synth.fillQuantizedNoiseBank` (new) mirrors `fillNoiseBank`'s exact
+  tile layout and per-worker seeding, but quantizes each draw (via the
+  now-exported `spead.QuantizeComponent`) to an int8 pair on the way
+  into the bank -- 2 bytes/sample instead of complex64's 8 (a further
+  4x reduction on top of the earlier complex128->complex64 halving,
+  8x total from where this session started). The full-precision
+  complex64 bank is now skipped ENTIRELY when no tone is configured at
+  all (the common case for `cmd/noise-stream`'s defaults) -- nothing
+  would ever read it.
+
+**The science, restated for this specific change**: this does NOT
+introduce any NEW precision tradeoff beyond the fixed-scale one already
+approved and explained earlier in this file -- pre-quantizing at
+construction time instead of adaptively per heap only changes WHEN the
+already-decided fixed-scale quantization happens, never WHAT it
+computes.
+`TestGenerateQuantizedHeaps_MatchesComplexPathQuantizedWithSameFixedScale`
+proves this directly: `fillQuantizedNoiseBank` given the same seed as
+`fillNoiseBank` produces bytes that exactly equal
+`spead.QuantizeComponent` applied to `fillNoiseBank`'s own output at the
+same fixed scale, sample for sample.
+
+**Verified**: `go build`/`go vet`/`go test -race ./...` all clean.
+Existing tests that called `GenerateNextTick` directly against a
+noise-only (no-tone) streamer were rewritten to call
+`GenerateQuantizedHeaps` instead (that's the whole point -- noise-only
+channels no longer reach `GenerateNextTick` at all), same assertions
+(determinism, cross-station independence, V/H independence, delay-
+independence) preserved. `BenchmarkProducerTick` (mirrors
+`ScanRunner.run`'s real per-tick sequence) rewritten to size
+`HeapAccumulator` via `ComplexPathChannelIDMap()` and call
+`GenerateQuantizedHeaps` too, matching what production actually runs
+now (previously it would have silently emitted STALE/garbage heaps for
+noise-only channels once the sizing changed, without this fix).
+
+Also did a REAL end-to-end smoke test on this dev machine (not just unit
+tests): `noise-stream` against a local UDP listener, both with a tone
+configured and without. Decoding real captured packets confirmed: all
+96 configured channel_ids present (64..159, matching `ChannelStart`),
+no duplicates, the tone's channel (computed independently: `round((55MHz
+-50MHz)/781.25kHz)` internal index 6 -> external channel_id 70) showed
+a distinctly higher magnitude (~106) than its noise-only neighbors
+(~14-16) -- confirming the complex path and the new quantized path are
+both correctly wired to the right channels, not just "doesn't crash."
+Without any tone configured, noise-only magnitudes were correspondingly
+LARGER (~50-58, since `QuantizeScale()` no longer reserves headroom for
+a tone that isn't there) -- confirms `QuantizeScale()`'s per-scan
+(not per-channel) computation is doing the right thing.
+
+**Dev-machine (Apple M5, NOT the target box) benchmarks, directional
+only**:
+- `BenchmarkProducerTick` (the real per-tick sequence): 384 channels
+  212µs -> **89.8µs (-57.7%)**, 96 channels 64.7µs -> **21.3µs (-67.1%)**
+  -- both ALREADY reflected the complex64 halving from earlier this
+  session; this is the ADDITIONAL drop from pre-quantizing.
+- `BenchmarkEncodeChannelHeapInto`: adaptive 7865ns -> fixed_scale
+  4506ns -> **quantized 2344ns (-70.2% vs. adaptive, -48.0% vs.
+  fixed_scale)**.
+
+Not yet confirmed on target hardware -- next profile should show
+`runtime.memmove` (still #1 at 36.6% in the last real capture) drop
+sharply, since noise-only channels (the vast majority in any config
+without many tone sources) no longer touch the complex64 bank/dst path
+that memmove was measuring at all.

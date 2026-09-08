@@ -25,6 +25,16 @@ func evalDelayPolyNs(coeffs []float64, tRel float64) float64 {
 	return tauNs
 }
 
+// toneChannelIndex is the (freqHz, baseFreqHz, channelWidthHz) -> channel
+// index mapping, factored out of synthToneChannel so
+// NewDirectSynthesisStreamer can compute a tone source's channel ONCE at
+// construction (to build ComplexPathChannelIDMap's channel-position set)
+// using the EXACT same formula synthToneChannel itself uses per-tick --
+// a single source of truth, so the two can never silently drift apart.
+func toneChannelIndex(freqHz, baseFreqHz, channelWidthHz float64) int {
+	return int(math.Round((freqHz - baseFreqHz) / channelWidthHz))
+}
+
 // synthToneChannel synthesizes nSamples of a tone in whichever channel
 // freqHz maps to. Delay is applied as a CONTINUOUS PHASE TERM in the
 // exponent — no ring buffer, no coarse/fine integer-sample split. Exact
@@ -43,7 +53,7 @@ func synthToneChannel(
 	tLocalRelStart, sampleRatePerChannel float64,
 	nSamples int,
 ) (channelIdx int, samples []complex64) {
-	channelIdx = int(math.Round((freqHz - baseFreqHz) / channelWidthHz))
+	channelIdx = toneChannelIndex(freqHz, baseFreqHz, channelWidthHz)
 	channelCenter := baseFreqHz + float64(channelIdx)*channelWidthHz
 	residualFreq := freqHz - channelCenter
 

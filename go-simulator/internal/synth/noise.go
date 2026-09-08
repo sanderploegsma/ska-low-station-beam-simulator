@@ -4,6 +4,8 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"sync"
+
+	"github.com/skao/station-beam-simulator-go/internal/spead"
 )
 
 // golden is the splitmix64 golden-ratio constant — same algorithm and
@@ -123,4 +125,81 @@ func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels i
 // across nPols polarisations (complex64 = 8 bytes).
 func bankMemoryBytes(nTiles, tileNSamples, numChannels, nPols int) int64 {
 	return int64(nTiles) * int64(tileNSamples) * int64(numChannels) * 8 * int64(nPols)
+}
+
+// fillQuantizedNoiseBank is fillNoiseBank's PRE-QUANTIZED counterpart:
+// same tile layout, same per-worker seed derivation (so passing the
+// SAME seed/std/nTiles/tileNSamples/numChannels as fillNoiseBank
+// produces the identical underlying draws, just stored differently --
+// see TestFillQuantizedNoiseBank_MatchesFillNoiseBankScaled, which
+// checks exactly this), but each draw is quantized to an int8 (real,
+// imag) pair (scale: see DirectSynthesisStreamer.QuantizeScale) and
+// stored as 2 bytes instead of complex64's 8 -- a quarter the memory,
+// and (the actual point) a quarter the per-tick bytes GenerateQuantizedHeaps
+// has to copy out of it, on top of skipping the per-tick
+// round+clamp entirely (already done here, once).
+//
+// Bank layout: bank[(i*tileNSamples*numChannels+k)*2 : +2] is tile i's
+// k-th (real,imag) sample pair, k = ch*tileNSamples+sample -- same
+// (tile, channel, sample) -> flat-index mapping as fillNoiseBank, just
+// 2 bytes/sample instead of 8.
+func fillQuantizedNoiseBank(seed uint64, std, scale float64, nTiles, tileNSamples, numChannels int) []byte {
+	tileLen := tileNSamples * numChannels
+	bank := make([]byte, nTiles*tileLen*2)
+	if nTiles == 0 {
+		return bank
+	}
+
+	nWorkers := nTiles
+	if cpus := runtime.NumCPU(); nWorkers > cpus {
+		nWorkers = cpus
+	}
+	if nWorkers > 16 {
+		nWorkers = 16
+	}
+	if nWorkers < 1 {
+		nWorkers = 1
+	}
+
+	base := nTiles / nWorkers
+	remainder := nTiles % nWorkers
+
+	var wg sync.WaitGroup
+	start := 0
+	for w := 0; w < nWorkers; w++ {
+		chunk := base
+		if w < remainder {
+			chunk++
+		}
+		if chunk == 0 {
+			continue
+		}
+		workerSeed1 := splitmix64Hash(seed, uint64(2*w))
+		workerSeed2 := splitmix64Hash(seed, uint64(2*w+1))
+
+		wg.Add(1)
+		go func(start, chunk int, seed1, seed2 uint64) {
+			defer wg.Done()
+			rng := rand.New(rand.NewPCG(seed1, seed2))
+			for i := start; i < start+chunk; i++ {
+				tile := bank[i*tileLen*2 : (i+1)*tileLen*2]
+				for j := 0; j < tileLen; j++ {
+					re := rng.NormFloat64() * std
+					im := rng.NormFloat64() * std
+					tile[j*2] = byte(spead.QuantizeComponent(re * scale))
+					tile[j*2+1] = byte(spead.QuantizeComponent(im * scale))
+				}
+			}
+		}(start, chunk, workerSeed1, workerSeed2)
+		start += chunk
+	}
+	wg.Wait()
+	return bank
+}
+
+// quantizedBankMemoryBytes returns the total resident memory for a
+// quantized noise bank across nPols polarisations (2 bytes/sample --
+// a quarter of bankMemoryBytes' complex64 8 bytes/sample).
+func quantizedBankMemoryBytes(nTiles, tileNSamples, numChannels, nPols int) int64 {
+	return int64(nTiles) * int64(tileNSamples) * int64(numChannels) * 2 * int64(nPols)
 }

@@ -164,15 +164,37 @@ func getSampleBuffer() []complex64 {
 	return sampleBufferPool.Get().([]complex64)
 }
 
-// ReleaseSampleBuffers returns heap.VSamples/HSamples to
-// sampleBufferPool for reuse by a future PrepareWrite call, once heap
-// has been fully consumed (spead.BatchSendLoop calls this right after
-// SPEAD-encoding a heap, successfully or not -- either way nothing reads
-// heap.VSamples/HSamples again). Only buffers with cap == HeapLen are
-// pooled (exactly what PrepareWrite's fast path and PopReadyHeaps'
-// zero-copy handoff always produce) -- anything else (the rare
-// nSamples > HeapLen case PrepareWrite falls back to plain make() for)
-// is simply left for the garbage collector, no correctness impact
+// quantizedBufferPool holds reusable, HeapLen*2-capacity []byte buffers
+// (real,imag int8 pairs, interleaved) for ChannelHeap.VQuantized/
+// HQuantized -- the pre-quantized counterpart to sampleBufferPool, same
+// reuse discipline (GetQuantizedBuffer/ReleaseSampleBuffers), just a
+// quarter the size per sample (2 bytes vs. complex64's 8).
+var quantizedBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, HeapLen*2)
+	},
+}
+
+// GetQuantizedBuffer draws a HeapLen*2-length buffer from
+// quantizedBufferPool (allocating one if the pool is empty). Content is
+// UNDEFINED, same as getSampleBuffer -- safe only because every caller
+// (synth.DirectSynthesisStreamer.GenerateQuantizedHeaps) always writes
+// every byte before anything reads it.
+func GetQuantizedBuffer() []byte {
+	return quantizedBufferPool.Get().([]byte)
+}
+
+// ReleaseSampleBuffers returns heap.VSamples/HSamples (and/or
+// VQuantized/HQuantized, whichever this heap actually used -- see
+// ChannelHeap's doc comment) to their respective pools for reuse by a
+// future PrepareWrite/GetQuantizedBuffer call, once heap has been fully
+// consumed (spead.BatchSendLoop calls this right after SPEAD-encoding a
+// heap, successfully or not -- either way nothing reads heap's sample
+// data again). Only buffers with the pool's exact capacity are pooled
+// (exactly what PrepareWrite's fast path, PopReadyHeaps' zero-copy
+// handoff, and GetQuantizedBuffer always produce) -- anything else (the
+// rare nSamples > HeapLen case PrepareWrite falls back to plain make()
+// for) is simply left for the garbage collector, no correctness impact
 // either way, just a missed reuse. Safe to call with heap == nil or with
 // nil/short sample slices.
 func ReleaseSampleBuffers(heap *ChannelHeap) {
@@ -184,6 +206,12 @@ func ReleaseSampleBuffers(heap *ChannelHeap) {
 	}
 	if cap(heap.HSamples) == HeapLen {
 		sampleBufferPool.Put(heap.HSamples[:HeapLen])
+	}
+	if cap(heap.VQuantized) == HeapLen*2 {
+		quantizedBufferPool.Put(heap.VQuantized[:HeapLen*2])
+	}
+	if cap(heap.HQuantized) == HeapLen*2 {
+		quantizedBufferPool.Put(heap.HQuantized[:HeapLen*2])
 	}
 }
 

@@ -64,7 +64,7 @@ func packAntennaInfo(substationID, subarrayID uint8, stationID uint16) uint64 {
 	return (uint64(substationID) << 40) | (uint64(subarrayID) << 32) | (uint64(stationID) << 16)
 }
 
-// quantizeComponent rounds v to the nearest int8 (half away from zero,
+// QuantizeComponent rounds v to the nearest int8 (half away from zero,
 // matching math.Round's convention) and clamps to [-128, 127], in one
 // branch-light pass. Replaces a separate math.Round + clampToInt8 call
 // pair: profiling a real end-to-end run at 384 channels found math.Round
@@ -77,7 +77,7 @@ func packAntennaInfo(substationID, subarrayID uint8, stationID uint16) uint64 {
 // which truncates toward zero) gives the identical round-half-away-from-
 // zero result for every value in that range, without math.Round's
 // call/branch overhead.
-func quantizeComponent(v float64) int8 {
+func QuantizeComponent(v float64) int8 {
 	v += math.Copysign(0.5, v)
 	if v > 127 {
 		return 127
@@ -89,7 +89,7 @@ func quantizeComponent(v float64) int8 {
 }
 
 // clampToInt8 clamps an already-rounded value to [-128, 127]. Kept
-// separate from quantizeComponent for quantize8bit/tests, which want the
+// separate from QuantizeComponent for quantize8bit/tests, which want the
 // clamp alone against a value someone else already rounded.
 func clampToInt8(v float64) int8 {
 	if v > 127 {
@@ -134,8 +134,8 @@ func quantize8bit(samples []complex64) (outReal, outImag []int8) {
 	outReal = make([]int8, len(samples))
 	outImag = make([]int8, len(samples))
 	for i, s := range samples {
-		outReal[i] = quantizeComponent(float64(real(s)) * scale)
-		outImag[i] = quantizeComponent(float64(imag(s)) * scale)
+		outReal[i] = QuantizeComponent(float64(real(s)) * scale)
+		outImag[i] = QuantizeComponent(float64(imag(s)) * scale)
 	}
 	return outReal, outImag
 }
@@ -158,8 +158,24 @@ func quantize8bit(samples []complex64) (outReal, outImag []int8) {
 // payload, and EncodeChannelHeap's header/item-pointer writes below.
 func quantize8bitIntoPayload(samples []complex64, dst []byte, realOffset, stride int, scale float64) {
 	for i, s := range samples {
-		dst[i*stride+realOffset] = byte(quantizeComponent(float64(real(s)) * scale))
-		dst[i*stride+realOffset+1] = byte(quantizeComponent(float64(imag(s)) * scale))
+		dst[i*stride+realOffset] = byte(QuantizeComponent(float64(real(s)) * scale))
+		dst[i*stride+realOffset+1] = byte(QuantizeComponent(float64(imag(s)) * scale))
+	}
+}
+
+// copyQuantizedIntoPayload is quantize8bitIntoPayload's PRE-QUANTIZED
+// counterpart: quantized holds int8 (real,imag) pairs ALREADY computed
+// (quantized[i*2]/quantized[i*2+1] for sample i) -- typically once, at
+// noise-tile-bank construction time (see
+// synth.DirectSynthesisStreamer.GenerateQuantizedHeaps), not per heap.
+// No scale, no rounding, no clamping here -- just moving bytes that were
+// already computed, which is the entire point: this is what
+// ChannelHeap.VQuantized/HQuantized exist to let EncodeChannelHeapInto
+// skip.
+func copyQuantizedIntoPayload(quantized []byte, dst []byte, realOffset, stride int) {
+	for i := 0; i < len(quantized)/2; i++ {
+		dst[i*stride+realOffset] = quantized[i*2]
+		dst[i*stride+realOffset+1] = quantized[i*2+1]
 	}
 }
 
@@ -314,8 +330,20 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 	if len(dst) != heapWireSizeBytes {
 		return fmt.Errorf("dst must be exactly %d bytes, got %d", heapWireSizeBytes, len(dst))
 	}
-	if len(heap.VSamples) != PayloadLengthBytes/4 || len(heap.HSamples) != PayloadLengthBytes/4 {
-		return fmt.Errorf("heap ch=%d: VSamples/HSamples must have length %d, got v=%d h=%d", heap.ChannelID, PayloadLengthBytes/4, len(heap.VSamples), len(heap.HSamples))
+	// Each pol independently uses EITHER the complex path (VSamples/
+	// HSamples, quantized here) OR the pre-quantized path (VQuantized/
+	// HQuantized, already quantized -- see ChannelHeap's doc comment).
+	// vLen/hLen normalize both to a sample count for one length check
+	// covering either representation.
+	vLen, hLen := len(heap.VSamples), len(heap.HSamples)
+	if heap.VQuantized != nil {
+		vLen = len(heap.VQuantized) / 2
+	}
+	if heap.HQuantized != nil {
+		hLen = len(heap.HQuantized) / 2
+	}
+	if vLen != PayloadLengthBytes/4 || hLen != PayloadLengthBytes/4 {
+		return fmt.Errorf("heap ch=%d: V/H sample count must be %d, got v=%d h=%d", heap.ChannelID, PayloadLengthBytes/4, vLen, hLen)
 	}
 
 	// "packet count since SKA epoch" -- count of HeapLen-sample BLOCKS
@@ -353,8 +381,16 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 	}
 
 	payload := dst[heapPayloadOffset:]
-	quantize8bitIntoPayload(heap.VSamples, payload, 0, 4, p.resolveQuantizeScale(heap.VSamples)) // Vreal at +0, Vimag at +1 of each 4-byte sample
-	quantize8bitIntoPayload(heap.HSamples, payload, 2, 4, p.resolveQuantizeScale(heap.HSamples)) // Hreal at +2, Himag at +3
+	if heap.VQuantized != nil { // Vreal at +0, Vimag at +1 of each 4-byte sample
+		copyQuantizedIntoPayload(heap.VQuantized, payload, 0, 4)
+	} else {
+		quantize8bitIntoPayload(heap.VSamples, payload, 0, 4, p.resolveQuantizeScale(heap.VSamples))
+	}
+	if heap.HQuantized != nil { // Hreal at +2, Himag at +3
+		copyQuantizedIntoPayload(heap.HQuantized, payload, 2, 4)
+	} else {
+		quantize8bitIntoPayload(heap.HSamples, payload, 2, 4, p.resolveQuantizeScale(heap.HSamples))
+	}
 	return nil
 }
 

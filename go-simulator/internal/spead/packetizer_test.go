@@ -354,7 +354,7 @@ func TestQuantize8bit_AllZeroSamplesDoesNotPanic(t *testing.T) {
 // BenchmarkEncodeChannelHeapInto isolates the per-heap encode cost (scale
 // pass + quantize/round/clamp + header/item writes) from noise
 // generation/copying -- the real-hardware profile that motivated
-// quantizeComponent/quantize8bitScale's sqrt/round fixes measured this
+// QuantizeComponent/quantize8bitScale's sqrt/round fixes measured this
 // path (spead.BatchSendLoop's per-heap work) at ~46% of ALL CPU time on
 // the target EPYC box, dominated by a per-sample math.Sqrt and two
 // per-sample math.Round calls (see those functions' doc comments). Not a
@@ -388,6 +388,26 @@ func BenchmarkEncodeChannelHeapInto(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			if err := p.EncodeChannelHeapInto(dst, heap); err != nil {
+				b.Fatalf("EncodeChannelHeapInto: %v", err)
+			}
+		}
+	})
+	// Pre-quantized (ChannelHeap.VQuantized/HQuantized set, see
+	// synth.DirectSynthesisStreamer.GenerateQuantizedHeaps): no scale, no
+	// scan, no rounding/clamping at all -- just a byte copy. This is the
+	// path noise-only channels actually take in production; "adaptive"/
+	// "fixed_scale" above only apply to tone-affected channels now.
+	quantizedHeap := &common.ChannelHeap{
+		ChannelID:     0,
+		VQuantized:    make([]byte, common.HeapLen*2),
+		HQuantized:    make([]byte, common.HeapLen*2),
+		HeapStartTime: 1_700_000_000.0,
+	}
+	b.Run("quantized", func(b *testing.B) {
+		p := NewSpsPacketizer(station, nil)
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if err := p.EncodeChannelHeapInto(dst, quantizedHeap); err != nil {
 				b.Fatalf("EncodeChannelHeapInto: %v", err)
 			}
 		}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sort"
 	"sync"
 
 	"github.com/skao/station-beam-simulator-go/internal/common"
@@ -75,7 +76,22 @@ type DirectSynthesisStreamer struct {
 
 	nTiles       int
 	tileNSamples int
-	banks        map[string][]complex64 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels)
+	banks        map[string][]complex64 // "V"/"H" -> flat (nTiles, tileNSamples, numChannels), full-precision -- only ever built/read for toneChannelPositions' columns, see NewDirectSynthesisStreamer
+	quantBanks   map[string][]byte      // "V"/"H" -> flat quantized (nTiles, tileNSamples, numChannels) -- 2 bytes/sample, read for noiseOnlyChannelPositions (see GenerateQuantizedHeaps)
+
+	// toneChannelPositions: channel positions (0..numChannels-1) with at
+	// least one tone source targeting them -- FIXED for the whole scan
+	// (a tone's channel depends only on its configured, static FreqHz,
+	// never on per-tick delay), computed once at construction.
+	// noiseOnlyChannelPositions is the complement. posToSubsetIdx maps
+	// toneChannelPositions[j] -> j, for GenerateNextTick's tone-add loop
+	// to find its dst slot (dst is now sized to
+	// len(toneChannelPositions), not numChannels -- see
+	// ComplexPathChannelIDMap). See the go-simulator README's
+	// "pre-quantized noise tile bank" section for why this split exists.
+	toneChannelPositions      []int
+	noiseOnlyChannelPositions []int
+	posToSubsetIdx            map[int]int
 
 	numWorkers int
 }
@@ -109,6 +125,7 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 	}
 	channelOutputRate := channelWidthHz * common.OversamplingNumerator / common.OversamplingDenominator
 
+	toneChannelSet := make(map[int]bool, len(cfg.ToneSources))
 	for i, ts := range cfg.ToneSources {
 		if ts.DelayFeed == nil {
 			return nil, fmt.Errorf("tone source %d (freq_hz=%v) has no delay_feed -- every source must have its own delay path, there is no default/fallback delay", i, ts.FreqHz)
@@ -116,18 +133,48 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		if ts.Amplitude == 0 {
 			cfg.ToneSources[i].Amplitude = 1.0
 		}
+		if chIdx := toneChannelIndex(ts.FreqHz, baseFreqHz, channelWidthHz); chIdx >= 0 && chIdx < numChannels {
+			toneChannelSet[chIdx] = true
+		}
+		// An out-of-range tone is NOT added to toneChannelSet here --
+		// GenerateNextTick's own range check (unchanged) logs a warning
+		// and skips it every tick, exactly as before this change.
+	}
+
+	// toneChannelPositions: sorted so ComplexPathChannelIDMap (and
+	// therefore HeapAccumulator's channel ordering/dst indexing) is
+	// deterministic run to run, not map-iteration-order-dependent.
+	toneChannelPositions := make([]int, 0, len(toneChannelSet))
+	for ch := range toneChannelSet {
+		toneChannelPositions = append(toneChannelPositions, ch)
+	}
+	sort.Ints(toneChannelPositions)
+
+	posToSubsetIdx := make(map[int]int, len(toneChannelPositions))
+	noiseOnlyChannelPositions := make([]int, 0, numChannels-len(toneChannelPositions))
+	for j, ch := range toneChannelPositions {
+		posToSubsetIdx[ch] = j
+	}
+	for ch := 0; ch < numChannels; ch++ {
+		if !toneChannelSet[ch] {
+			noiseOnlyChannelPositions = append(noiseOnlyChannelPositions, ch)
+		}
 	}
 
 	s := &DirectSynthesisStreamer{
-		station:           cfg.Station,
-		numChannels:       numChannels,
-		baseFreqHz:        baseFreqHz,
-		channelWidthHz:    channelWidthHz,
-		channelOutputRate: channelOutputRate,
-		obsTimeRef:        cfg.ObsTimeRef,
-		toneCfgs:          cfg.ToneSources,
-		noiseCfg:          cfg.Noise,
-		banks:             make(map[string][]complex64),
+		station:                   cfg.Station,
+		numChannels:               numChannels,
+		baseFreqHz:                baseFreqHz,
+		channelWidthHz:            channelWidthHz,
+		channelOutputRate:         channelOutputRate,
+		obsTimeRef:                cfg.ObsTimeRef,
+		toneCfgs:                  cfg.ToneSources,
+		noiseCfg:                  cfg.Noise,
+		banks:                     make(map[string][]complex64),
+		quantBanks:                make(map[string][]byte),
+		toneChannelPositions:      toneChannelPositions,
+		noiseOnlyChannelPositions: noiseOnlyChannelPositions,
+		posToSubsetIdx:            posToSubsetIdx,
 	}
 
 	if cfg.Noise != nil {
@@ -146,8 +193,22 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 	}
 
 	if cfg.Noise != nil {
-		s.banks["V"] = fillNoiseBank(s.noiseSeedV, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
-		s.banks["H"] = fillNoiseBank(s.noiseSeedH, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
+		// Full-precision bank: only needed by channels that have to
+		// combine noise with tone before quantizing -- skip entirely if
+		// no tone is configured at all, since nothing would ever read it.
+		if len(toneChannelPositions) > 0 {
+			s.banks["V"] = fillNoiseBank(s.noiseSeedV, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
+			s.banks["H"] = fillNoiseBank(s.noiseSeedH, s.noiseStd, s.nTiles, s.tileNSamples, s.numChannels)
+		}
+		// Pre-quantized bank: only needed by noise-only channels -- skip
+		// if every channel has a tone (nothing left for it to serve).
+		// QuantizeScale() is safe to call here: toneCfgs/noiseStd are
+		// already set on s above.
+		if len(noiseOnlyChannelPositions) > 0 {
+			scale := s.QuantizeScale()
+			s.quantBanks["V"] = fillQuantizedNoiseBank(s.noiseSeedV, s.noiseStd, scale, s.nTiles, s.tileNSamples, s.numChannels)
+			s.quantBanks["H"] = fillQuantizedNoiseBank(s.noiseSeedH, s.noiseStd, scale, s.nTiles, s.tileNSamples, s.numChannels)
+		}
 	}
 
 	s.numWorkers = cfg.NumWorkers
@@ -188,13 +249,27 @@ func defaultParallelism(n int) int {
 
 // ChannelIDMap implements common.Streamer — identity, since this
 // streamer's output columns are always already in external
-// ascending-frequency channel_id order.
+// ascending-frequency channel_id order. Covers EVERY channel this
+// streamer produces, regardless of which path (complex or pre-quantized)
+// actually produces it -- see ComplexPathChannelIDMap for the subset
+// that uses the former.
 func (s *DirectSynthesisStreamer) ChannelIDMap() []int {
 	m := make([]int, s.numChannels)
 	for i := range m {
 		m[i] = i
 	}
 	return m
+}
+
+// ComplexPathChannelIDMap implements common.ComplexPathChannelIDMapper:
+// the channel positions with at least one tone source targeting them --
+// FIXED for the whole scan, see toneChannelPositions' doc comment on the
+// struct. common.ScanRunner uses this to size its HeapAccumulator (and
+// therefore GenerateNextTick's dst) to just this subset instead of every
+// channel; the complement (GenerateQuantizedHeaps' channels) never goes
+// through the complex64 dst-write path at all.
+func (s *DirectSynthesisStreamer) ComplexPathChannelIDMap() []int {
+	return s.toneChannelPositions
 }
 
 // NumChannels implements common.Streamer.
@@ -206,13 +281,18 @@ func (s *DirectSynthesisStreamer) TickNSamples() int {
 	return int(s.channelOutputRate*common.BlockDurationS + 0.5)
 }
 
-// BankMemoryBytes reports total noise-bank memory across both pols (0 if
-// noise is not configured).
+// BankMemoryBytes reports total noise-bank memory (both the
+// full-precision bank, if any channel needs it, and the pre-quantized
+// bank, if any channel needs it) across both pols.
 func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
-	if len(s.banks) == 0 {
-		return 0
+	var total int64
+	if len(s.banks) > 0 {
+		total += bankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.banks))
 	}
-	return bankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.banks))
+	if len(s.quantBanks) > 0 {
+		total += quantizedBankMemoryBytes(s.nTiles, s.tileNSamples, s.numChannels, len(s.quantBanks))
+	}
+	return total
 }
 
 // quantizeSigmaMargin: how many standard deviations of noise-amplitude
@@ -264,21 +344,26 @@ func (s *DirectSynthesisStreamer) QuantizeScale() float64 {
 // GenerateNextTick implements common.Streamer. t is the absolute epoch
 // time of this tick's first sample; nSamples is the per-channel sample
 // count for this tick (at channelOutputRate). Writes directly into
-// dst[pol][ch] for each configured pol — see common.Streamer's doc
-// comment for why (this replaced an earlier "return a buffer, caller
-// copies it into the accumulator" design once profiling on real target
-// hardware found that copy dominating CPU time even after being
-// parallelized across every available core).
+// dst[pol][j] for each configured pol, j indexing INTO
+// toneChannelPositions (NOT a raw channel index -- dst is sized to
+// ComplexPathChannelIDMap()'s subset, since noise-only channels never
+// reach this method at all any more; see GenerateQuantizedHeaps for
+// those). See common.Streamer's doc comment for why dst is written into
+// directly rather than returned (this replaced an earlier
+// "return a buffer, caller copies it into the accumulator" design once
+// profiling on real target hardware found that copy dominating CPU time
+// even after being parallelized across every available core) -- and see
+// the go-simulator README's "pre-quantized noise tile bank" section for
+// why dst no longer covers every channel.
 //
-// Since noise fill dominates this method's own cost (a bulk copy from
-// the tile bank, O(numChannels)) and every channel's copy is
-// independent, it's parallelized here across both pols AND channel
-// ranges at once -- V and H are already fully independent (separate
-// seeds/buffers, separate dst entries), so no worker ever touches
-// another's data. Tone injection is NOT parallelized: it's already
-// established elsewhere in this file as O(1) per tone, negligible next
-// to the noise fill, and splitting it would only complicate the
-// out-of-range-tone warning below for no real benefit.
+// Noise fill here is parallelized across both pols AND (what's usually a
+// small) channel-position range at once -- V and H are already fully
+// independent (separate seeds/buffers, separate dst entries), so no
+// worker ever touches another's data. Tone injection is NOT
+// parallelized: it's already established elsewhere in this file as O(1)
+// per tone, negligible next to the noise fill, and splitting it would
+// only complicate the out-of-range-tone warning below for no real
+// benefit.
 func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst map[string][][]complex64) {
 	tLocalRelStart := t - s.obsTimeRef
 
@@ -329,7 +414,17 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst 
 				log.Printf("tone freq_hz=%v maps to channel_idx=%d, outside the configured [0, %d) channel range — skipping", cfg.FreqHz, chIdx, s.numChannels)
 				continue
 			}
-			outCh := target[chIdx]
+			j, ok := s.posToSubsetIdx[chIdx]
+			if !ok {
+				// Shouldn't happen: toneChannelPositions was built from
+				// exactly these chIdx values at construction (see
+				// NewDirectSynthesisStreamer). Guard anyway rather than
+				// indexing target out of bounds if that invariant is
+				// ever broken by a future edit.
+				log.Printf("tone freq_hz=%v channel_idx=%d has no complex-path dst slot (subset invariant violated) — skipping", cfg.FreqHz, chIdx)
+				continue
+			}
+			outCh := target[j]
 			for i, sample := range samples {
 				outCh[i] += sample
 			}
@@ -337,43 +432,71 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst 
 	}
 }
 
-// fillNoiseParallel fills dst (per channel, each already nSamples long)
-// with this tick's noise-bank tile (or zeros, if noise isn't
-// configured), registering s.numWorkers goroutines' worth of work on wg
-// -- one goroutine per channel range, split via fillNoiseRange. Does NOT
-// call wg.Wait() itself: GenerateNextTick calls this once per pol
-// against one shared WaitGroup, so both pols' fills run fully in
-// parallel with each other too, not just within a pol.
+// currentTileIndex picks this tick's noise-bank tile for the given pol
+// seed -- shared by fillNoiseRange (full-precision bank, complex-path
+// channels) and GenerateQuantizedHeaps (pre-quantized bank, noise-only
+// channels) so both paths draw from the SAME tile on a given tick,
+// keeping noise temporally consistent across the whole channel range
+// regardless of which representation a given channel happens to use.
+func (s *DirectSynthesisStreamer) currentTileIndex(noiseSeed uint64, tLocalRelStart float64, nSamples int) int {
+	n := nSamples
+	if n < 1 {
+		n = 1
+	}
+	tickIndex := int64(tLocalRelStart*s.channelOutputRate+0.5) / int64(n)
+	return int(splitmix64Hash(noiseSeed, uint64(tickIndex)) % uint64(s.nTiles))
+}
+
+// fillNoiseParallel fills dst (per channel-position-subset index j, each
+// already nSamples long) with this tick's noise-bank tile (or zeros, if
+// noise isn't configured), registering s.numWorkers goroutines' worth of
+// work on wg -- one goroutine per subset range, split via fillNoiseRange.
+// Does NOT call wg.Wait() itself: GenerateNextTick calls this once per
+// pol against one shared WaitGroup, so both pols' fills run fully in
+// parallel with each other too, not just within a pol. In practice
+// len(toneChannelPositions) is usually small (0 to a handful of tone
+// sources), so this rarely spawns more than one goroutine regardless of
+// s.numWorkers -- kept structurally identical to the pre-split version
+// anyway, since the actual per-tick cost this codebase cares about now
+// lives in GenerateQuantizedHeaps, not here.
 func (s *DirectSynthesisStreamer) fillNoiseParallel(wg *sync.WaitGroup, pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64) {
-	if s.numWorkers <= 1 {
-		s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, 0, s.numChannels)
+	n := len(s.toneChannelPositions)
+	if n == 0 {
 		return
 	}
-	chunkSize := (s.numChannels + s.numWorkers - 1) / s.numWorkers
-	for chStart := 0; chStart < s.numChannels; chStart += chunkSize {
-		chEnd := chStart + chunkSize
-		if chEnd > s.numChannels {
-			chEnd = s.numChannels
+	if s.numWorkers <= 1 || n <= 1 {
+		s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, 0, n)
+		return
+	}
+	chunkSize := (n + s.numWorkers - 1) / s.numWorkers
+	for start := 0; start < n; start += chunkSize {
+		end := start + chunkSize
+		if end > n {
+			end = n
 		}
 		wg.Add(1)
-		go func(chStart, chEnd int) {
+		go func(start, end int) {
 			defer wg.Done()
-			s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, chStart, chEnd)
-		}(chStart, chEnd)
+			s.fillNoiseRange(pol, noiseSeed, dst, nSamples, tLocalRelStart, start, end)
+		}(start, end)
 	}
 }
 
-// fillNoiseRange fills dst[chStart:chEnd] -- one worker's channel range.
-// dst[ch] is its own separately-owned backing array (HeapAccumulator's
-// per-channel storage, not one contiguous multi-channel buffer as
-// before), so each channel gets its own copy call rather than one bulk
-// copy across the whole range -- same total bytes moved, no cross-worker
-// synchronization needed beyond the caller's WaitGroup either way, since
-// disjoint dst[ch] slices can never alias.
-func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64, chStart, chEnd int) {
+// fillNoiseRange fills dst[subsetStart:subsetEnd] -- one worker's
+// channel-position-subset range. dst[j] is its own separately-owned
+// backing array (HeapAccumulator's per-channel storage, sized to
+// ComplexPathChannelIDMap()'s subset -- not one contiguous
+// multi-channel buffer), so each channel gets its own copy call rather
+// than one bulk copy across the whole range -- same total bytes moved,
+// no cross-worker synchronization needed beyond the caller's WaitGroup
+// either way, since disjoint dst[j] slices can never alias.
+// toneChannelPositions[j] is the ACTUAL bank column to read (the bank
+// itself is still full-width, 0..numChannels-1 -- only dst is
+// subset-sized, see NewDirectSynthesisStreamer).
+func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, dst [][]complex64, nSamples int, tLocalRelStart float64, subsetStart, subsetEnd int) {
 	if s.noiseCfg == nil {
-		for ch := chStart; ch < chEnd; ch++ {
-			out := dst[ch]
+		for j := subsetStart; j < subsetEnd; j++ {
+			out := dst[j]
 			for i := range out {
 				out[i] = 0
 			}
@@ -382,14 +505,73 @@ func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, d
 	}
 	bank := s.banks[pol]
 	tileLen := s.tileNSamples * s.numChannels
-	n := nSamples
-	if n < 1 {
-		n = 1
-	}
-	tickIndex := int64(tLocalRelStart*s.channelOutputRate+0.5) / int64(n)
-	tileIdx := int(splitmix64Hash(noiseSeed, uint64(tickIndex)) % uint64(s.nTiles))
-	for ch := chStart; ch < chEnd; ch++ {
+	tileIdx := s.currentTileIndex(noiseSeed, tLocalRelStart, nSamples)
+	for j := subsetStart; j < subsetEnd; j++ {
+		ch := s.toneChannelPositions[j]
 		bankOffset := tileIdx*tileLen + ch*nSamples
-		copy(dst[ch], bank[bankOffset:bankOffset+nSamples])
+		copy(dst[j], bank[bankOffset:bankOffset+nSamples])
 	}
+}
+
+// GenerateQuantizedHeaps implements common.QuantizedHeapProducer: builds
+// complete, ready-to-send heaps DIRECTLY for every noise-only channel
+// (no tone source targets it -- see noiseOnlyChannelPositions), bypassing
+// GenerateNextTick's dst-write path and HeapAccumulator entirely. Each
+// channel's samples are copied PRE-QUANTIZED straight out of
+// quantBanks -- no per-tick float64 generation, no per-tick
+// scan-and-round-and-clamp, both already done ONCE at construction (see
+// fillQuantizedNoiseBank). This is the fix for runtime.memmove remaining
+// the dominant real-hardware cost even after halving the complex64
+// path's sample width -- see the go-simulator README's "pre-quantized
+// noise tile bank" section for the full profiling history and the
+// science behind why this doesn't change what noise IS, only how it's
+// digitized for the wire.
+//
+// Returns nil if every channel has a tone source (nothing left for this
+// path to produce).
+func (s *DirectSynthesisStreamer) GenerateQuantizedHeaps(t float64) []*common.ChannelHeap {
+	if len(s.noiseOnlyChannelPositions) == 0 {
+		return nil
+	}
+	n := s.TickNSamples() // == common.HeapLen by construction
+	heaps := make([]*common.ChannelHeap, len(s.noiseOnlyChannelPositions))
+
+	if s.noiseCfg == nil {
+		// No noise configured -- these channels still emit a real
+		// (all-zero) heap every tick, matching what the complex path's
+		// zero-fill branch (fillNoiseRange) would have produced for
+		// them: "no noise" is a real, silent signal CBF still expects
+		// data for, not "no heap." No bank to read from here, so an
+		// explicit zero-fill, not a copy.
+		for idx, ch := range s.noiseOnlyChannelPositions {
+			v := common.GetQuantizedBuffer()
+			h := common.GetQuantizedBuffer()
+			for i := range v {
+				v[i] = 0
+			}
+			for i := range h {
+				h[i] = 0
+			}
+			heaps[idx] = &common.ChannelHeap{ChannelID: ch, VQuantized: v, HQuantized: h, HeapStartTime: t}
+		}
+		return heaps
+	}
+
+	tLocalRelStart := t - s.obsTimeRef
+	tileIdxV := s.currentTileIndex(s.noiseSeedV, tLocalRelStart, n)
+	tileIdxH := s.currentTileIndex(s.noiseSeedH, tLocalRelStart, n)
+	quantTileLen := s.tileNSamples * s.numChannels * 2 // 2 bytes/sample
+	quantBankV := s.quantBanks["V"]
+	quantBankH := s.quantBanks["H"]
+
+	for idx, ch := range s.noiseOnlyChannelPositions {
+		v := common.GetQuantizedBuffer()
+		h := common.GetQuantizedBuffer()
+		vOffset := tileIdxV*quantTileLen + ch*n*2
+		hOffset := tileIdxH*quantTileLen + ch*n*2
+		copy(v, quantBankV[vOffset:vOffset+n*2])
+		copy(h, quantBankH[hOffset:hOffset+n*2])
+		heaps[idx] = &common.ChannelHeap{ChannelID: ch, VQuantized: v, HQuantized: h, HeapStartTime: t}
+	}
+	return heaps
 }
