@@ -1,0 +1,42 @@
+# Runs the Python (Tango device server) test suite -- see CLAUDE.md's
+# "Code layout". Scoped to the Python sources via the paths filter below
+# so changes to the Go simulator under cmd/, internal/, api/ don't
+# trigger this workflow.
+name: python tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "tango/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/python-tests.yml"
+  pull_request:
+    paths:
+      - "tango/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".python-version"
+      - ".github/workflows/python-tests.yml"
+  workflow_dispatch: {}
+
+# A ref (branch/tag) that pushes a new commit while an older run for the
+# same ref is still testing should cancel the stale run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+      - run: uv run pytest
