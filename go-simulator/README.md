@@ -83,15 +83,18 @@ with no explicit lock. Go has no GIL, so `internal/common/delay.go` uses
 "warned once" bookkeeping.
 
 There are two entrypoints (`cmd/simulator`, the gRPC-served one above,
-and `cmd/noise-stream`, a standalone noise-only CLI — see "Building and
-running" below), sharing the plumbing that has nothing gRPC-specific
-about it: `internal/common.HeapQueue` (a bounded, non-blocking
-`HeapSender`), `internal/spead.SendLoop` (drains a queue into an
-`SpsPacketizer`), and `internal/netutil.InterfaceIPv4Addr` (resolves a
-named interface's address for the `-spead-interface`/Multus flag both
-entrypoints support). `internal/server` depends on all three;
-`cmd/noise-stream` depends on `common`/`spead`/`netutil`/`synth`
-directly and never imports `internal/server` or any gRPC package at all.
+and `cmd/noise-stream`, a standalone noise (+ optional test-tone) CLI —
+see "Building and running" below), sharing the plumbing that has
+nothing gRPC-specific about it: `internal/common.HeapQueue` (a bounded,
+non-blocking `HeapSender`), `internal/spead.BatchSendLoop` (drains a
+queue into an `SpsPacketizer` via a pool of parallel sender goroutines —
+see `spead.NewSenderPool` and the profiling history below for why this
+is no longer the single-goroutine `SendLoop` it started as), and
+`internal/netutil.InterfaceIPv4Addr` (resolves a named interface's
+address for the `-spead-interface`/Multus flag both entrypoints
+support). `internal/server` depends on all three; `cmd/noise-stream`
+depends on `common`/`spead`/`netutil`/`synth` directly and never imports
+`internal/server` or any gRPC package at all.
 
 ## Building and running
 
@@ -125,7 +128,7 @@ varies per scan (`subarray_id`, `beam_id`, tone sources, noise config) is
 a `StartScan` gRPC request field instead, matching the Python
 `StartScan` JSON argument's shape.
 
-### `cmd/noise-stream`: a standalone noise-only CLI
+### `cmd/noise-stream`: a standalone noise (+ optional test-tone) CLI
 
 For quickly exercising the numeric core + SPEAD packetizer end-to-end
 (e.g. against a packet capture tool, or CBF's receive path) without
@@ -136,14 +139,15 @@ all:
 go run ./cmd/noise-stream -dest-ip 127.0.0.1 -dest-port 8000 -scan-duration 10
 ```
 
-No gRPC, no tone/delay sources — just the noise tile bank, driven by a
-`ScanRunner` exactly like a real scan. `-station-id`/`-substation-id`/
-`-subarray-id`/`-beam-id`/`-scan-id` all default to `1`, `-num-channels`
-defaults to `96`, `-obs-time` defaults to `"now"` (or pass a fixed Unix
-epoch seconds value for a reproducible run), `-scan-duration` defaults to
-`60` (seconds). `-noise-std` defaults to `0.05` and `-noise-seed`
-defaults to the same value as `-station-id` unless explicitly
-overridden — both match `simulator.py`'s own `StartScan` noise default
+No gRPC, no *real* delay sources — just the noise tile bank (and,
+optionally, one tone source), driven by a `ScanRunner` exactly like a
+real scan. `-station-id`/`-substation-id`/`-subarray-id`/`-beam-id`/
+`-scan-id` all default to `1`, `-num-channels` defaults to `96`,
+`-obs-time` defaults to `"now"` (or pass a fixed Unix epoch seconds
+value for a reproducible run), `-scan-duration` defaults to `60`
+(seconds). `-noise-std` defaults to `0.05` and `-noise-seed` defaults to
+the same value as `-station-id` unless explicitly overridden — both
+match `simulator.py`'s own `StartScan` noise default
 (`NoiseConfig(std=0.05, seed=self.station_id)`). `-spead-interface`
 works exactly as in `cmd/simulator`: pass a network interface name (e.g.
 `net1` for a Multus-attached secondary NIC) to bind the outbound
@@ -151,6 +155,26 @@ SPEAD/UDP socket to that interface's IPv4 address instead of letting the
 OS pick via its default route; leave unset to use the OS's default
 selection. Stops on its own after `-scan-duration`, or immediately on
 Ctrl-C/SIGTERM.
+
+`-tone-freq-hz` (0 by default, meaning no tone) adds a single tone
+source on top of the noise, at the given frequency in Hz, with
+`-tone-amplitude` (default `1.0`). This exists **only** to measure
+tone's computational cost on top of noise — see "Real-hardware
+profiling" below for why that question came up. It's backed by a
+STATIC delay feed (constructed once, updated once to a permanent
+zero-delay polynomial, never touched again), not a real subscription —
+every other source-config path in this codebase deliberately has no
+default/fallback delay (see the Python CLAUDE.md's "Per-source delay"
+section for why), and this flag doesn't change that principle for any
+*real* scan. Don't use `-tone-freq-hz` to reason about delay-tracking
+correctness, only about per-tick timing.
+
+`-sender-goroutines` defaults to `0`, meaning "auto": it scales with
+`-num-channels` via `spead.DefaultNumSendersForChannels` (16 sender
+goroutines at the full 384-channel band, proportionally fewer for a
+narrower configuration — see "Real-hardware profiling" below for the
+real-hardware measurement this is based on). Pass an explicit value to
+override.
 
 ## Container image
 
@@ -204,7 +228,186 @@ image (to catch a broken Dockerfile early) but never push it.
   Linux/macOS (looked up by interface flag, not a hardcoded name like
   `"lo"`/`"lo0"`).
 
-Not covered (left for real hardware/integration testing, same as the
-Python project's own stated gaps): actual throughput/timing benchmarks
-against `common.BlockDurationS` on target server hardware, and a live
-end-to-end SPEAD capture decoded by an external tool.
+Not covered: a live end-to-end SPEAD capture decoded by an external
+tool. Actual throughput/timing benchmarks against `common.BlockDurationS`
+on target server hardware — the one gap this section used to flag as
+entirely open — now has a substantial history; see "Real-hardware
+profiling & pacing investigation" below.
+
+## Real-hardware profiling & pacing investigation
+
+This section is a running log of real-hardware findings for future
+sessions to pick up from — matching the style (and, for the noise tile
+bank/allocation-overhead lessons, the actual root causes) already
+established in the parent Python simulator's own `CLAUDE.md`. Keep
+adding to it rather than replacing it; a wrong turn that was tried and
+measured is as valuable a record as a fix that worked, per that file's
+own "measure, don't assume" precedent.
+
+**Hardware**: an SR-IOV VF on a Mellanox ConnectX-6 (100G NIC), MTU
+9000, on a real (non-laptop) target-class Linux box — a 2-socket AMD
+EPYC per the parent `CLAUDE.md`'s own target-server description.
+`noise-stream -cpuprofile <file>` plus `go tool pprof -top`/`-list`/
+`-peek <file>` is the workflow that found every real cost below; a dev
+laptop (this session used a 10-core Apple M5) is useful for correctness
+and directional checks but is NOT representative of the target
+machine's core count or memory-bandwidth profile — every number in this
+section is from the real hardware unless explicitly marked otherwise.
+
+### Timeline
+
+1. **Outbound send-queue saturation.** Initial testing found the send
+   queue filling up and dropping packets, with receive-side throughput
+   around 15MiB/s despite the 100G link. Root cause: one UDP socket
+   sending one heap at a time. Fixed with batched sends
+   (`golang.org/x/net/ipv4.PacketConn.WriteBatch`, which uses
+   `sendmmsg(2)` on Linux — confirmed directly from `x/net`'s source,
+   not assumed) and N parallel sender sockets (`spead.SenderPool`, each
+   its own source port — spreads outbound traffic across the NIC's/
+   receiver's RSS flow hash instead of pinning everything to one queue),
+   plus `SO_SNDBUF` sizing (`-udp-send-buffer-bytes`, default 8MiB vs.
+   the OS's often-~208KB default). This resolved the send-side problem
+   completely and was never revisited.
+
+2. **Producer falling behind pacing.** With sending fixed, generation
+   itself couldn't keep up — worse at 384 channels than 96, drift
+   climbing without bound (e.g. 113s at tick 8499 in one early run). Six
+   real fixes were needed, each found by profiling the ACTUAL bottleneck
+   rather than assuming one, in this order:
+
+   a. **`HeapAccumulator` allocation/access-pattern bug**: a transpose
+      loop making 768 small allocations/tick at 384 channels, exceeding
+      the ENTIRE per-tick budget on its own. Fixed with a layout change
+      (see below) plus reusing a flat buffer instead of allocating per
+      element.
+   b. **Row-major → channel-major generation layout**: `Streamer.
+      GenerateNextTick`'s output changed from sample-major to
+      channel-major (one channel's samples contiguous), eliminating a
+      per-tick transpose in `HeapAccumulator` entirely instead of paying
+      for one every tick.
+   c. **SPEAD encoding allocation elimination**: `spead.BatchSendLoop`
+      now reuses a per-goroutine pool of pre-allocated wire-size buffers
+      (`EncodeChannelHeapInto` writes in place) instead of allocating a
+      fresh buffer per heap — safe because a UDP send copies the buffer
+      into the kernel synchronously before returning.
+   d. **Producer parallelization**: profiling found `ScanRunner`'s
+      single producer goroutine (generation + accumulation) running at
+      ~99% duty cycle on ONE core for the whole scan, unlike sending
+      (already parallelized). Both `DirectSynthesisStreamer.
+      GenerateNextTick`'s noise fill and `HeapAccumulator.Add`/
+      `PopReadyHeaps` were split across goroutines by channel range
+      (`common.forEachChannelRange`), with a `GOMAXPROCS`-based default
+      worker count.
+   e. **Negative result — raising the worker-count cap did NOT help**:
+      `defaultParallelism` originally capped workers at a flat 16,
+      copied from `fillNoiseBank`'s cap for its one-time construction
+      cost. A real profile's average concurrency landed at ~15.18 —
+      suspiciously exactly that cap — so it was removed. Re-profiling
+      showed average concurrency rise to ~19.79 (+30%), total `memmove`
+      CPU-seconds rise proportionally, and wall-clock drift stay
+      completely unchanged (12.016s → 12.3s at the same tick). More
+      threads were just doing more of the same redundant work in
+      parallel — a bulk memory copy is bandwidth-bound, not
+      thread-starved, exactly matching the Python `CLAUDE.md`'s own
+      noise-tile-bank finding ("regardless of core count, even 1 core is
+      enough"). Worth remembering before reaching for "add more
+      goroutines" as a fix for a copy-dominated hot path again.
+   f. **The real fix: eliminating redundant copies, not redistributing
+      them.** Three layers, each found by re-profiling after the
+      previous fix and confirming what actually changed:
+      - `HeapAccumulator.PopReadyHeaps` was copying every channel's
+        buffer into a second, freshly-allocated flat buffer before
+        handing it to the sender. Removed via a zero-copy reslice/
+        handoff of the buffer `Add` already built — safe because
+        `TickNSamples() == HeapLen` always (by construction), so the
+        "leftover tail" this handoff has to special-case is provably
+        empty in production.
+      - Generation still wrote into its own scratch buffer
+        (`DirectSynthesisStreamer`'s old `outBufs`), which
+        `HeapAccumulator.Add`'s `append` then copied AGAIN into its own
+        per-channel storage. Removed by changing `common.Streamer`'s
+        interface so `GenerateNextTick` writes directly into
+        `HeapAccumulator`-owned buffers (`HeapAccumulator.
+        PrepareWrite`), cutting the remaining copy in half again
+        (confirmed: `runtime.memmove`'s share of total CPU dropped from
+        ~57% to ~47%, then ~25% after the next fix below).
+      - Once that copy was gone, `runtime.memclrNoHeapPointers` —
+        `make()`'s mandatory zero-fill on every freshly-grown
+        per-channel buffer, every tick — became the next-largest cost
+        (~21% of ALL CPU time), even though that memory was about to be
+        fully overwritten by the noise fill a moment later. Fixed with a
+        `sync.Pool` of reusable per-channel buffers
+        (`common.ReleaseSampleBuffers`, called from `spead.
+        encodeHeapInto` once a heap's samples are read for the last
+        time) — the same reuse pattern this codebase already used for
+        SPEAD encode buffers, just applied one layer further upstream.
+   g. **Result**: 384 channels went from drift climbing without bound
+      (10+ seconds over a ~15s window) to only occasional, self-recovering
+      drift under 100ms.
+
+3. **`-sender-goroutines`' flat default (4) was outgrown twice** during
+   this investigation (4 → 8 → 16) as the producer stopped being the
+   bottleneck and the send side had to absorb much higher sustained
+   throughput. Replaced with `spead.DefaultNumSendersForChannels`,
+   scaling linearly from the confirmed real-hardware baseline (16 at the
+   full 384-channel band) down to fewer senders for a narrower
+   configuration — 96 channels lands on exactly 4, so existing
+   narrow-band usage is unaffected. Not wired into `cmd/simulator`'s
+   gRPC server: that `SenderPool` is created once at process `Start()`,
+   before any scan's `num_channels` is known, so it still needs an
+   explicit `-sender-goroutines` if a deployment needs something other
+   than the flat default there.
+
+### Current status and open items
+
+**Margin is thin, not comfortable, even after all of the above.** A
+rough estimate from the final 384-channel profile (total CPU-seconds ÷
+average concurrency) puts the AVERAGE per-tick cost at roughly
+100-101% of the 2.21184ms budget (`common.BlockDurationS`) — consistent
+with the observed "occasional, self-recovering drift under 100ms": that
+pattern is what running right at the edge looks like, not what a
+comfortable cushion looks like. (Caveat: this estimate assumes perfectly
+parallel work; the real pipeline overlaps generation and encoding across
+ticks, so the true margin could be somewhat better or worse — trust a
+direct measurement over this arithmetic if one becomes available.)
+
+The two dominant remaining costs are roughly evenly split, and BOTH
+scale with `numChannels × HeapLen`, not with source count:
+- **~45%**: the noise-tile-bank copy itself (`fillNoiseRange`) — an
+  inherent, now-irreducible per-tick memcpy, the same category of cost
+  the Python side already documented as "regardless of core count, even
+  1 core is enough."
+- **~46%**: SPEAD quantize + encode + send (`spead.BatchSendLoop`),
+  dominated by scalar `math.Round`/clamp work (the int8 quantization
+  path) plus network syscalls, not allocation or copying anymore.
+
+**Open: tone's real cost, not yet measured on real hardware.** Given how
+thin the margin above is, the natural next question was whether adding
+tone sources (not yet exercised in this profiling — `noise-stream` was
+noise-only until this session) would push 384 channels over budget.
+`-tone-freq-hz`/`-tone-amplitude` were added to `noise-stream` (see
+above) specifically to answer this with a real profile instead of
+argument. The analytical expectation, not yet confirmed: tone injection
+is O(`nSamples`) per source (`synthToneChannel` computes one channel's
+contribution in closed form, via the same NCO phase-accumulator trick
+the Python pulsar work established, then adds `nSamples`=2048 values
+into ONE channel) — roughly 0.26% of one polarization's per-tick element
+count per tone source, independent of `numChannels`. But tone injection
+currently runs SEQUENTIALLY (unlike noise-fill/quantize, which already
+use every available core), so its full cost lands on the critical path
+with no parallel speedup — and with ~0% existing margin, even a small
+absolute addition is expected to show up as measurably more/larger
+drift, not be absorbed invisibly the way it would be at a more
+comfortable baseline utilization. **Next session: profile
+`noise-stream -num-channels 384 -tone-freq-hz <freq>` on the real
+hardware and update this section with what actually happens** — if tone
+injection turns out to matter more than expected, parallelizing it
+(mirroring the noise-fill/`HeapAccumulator` channel-range-split pattern)
+is the natural next lever, not yet implemented.
+
+**Not yet tried**: whether `n_tiles`/`tile_n_samples` (the noise
+tile-bank's own size/fidelity knobs, unchanged from their Go-port
+defaults this whole session) trade meaningfully against the ~45% noise-
+copy cost above; real multi-pod co-scheduling on one physical node
+(every measurement above was one `noise-stream` process alone on the
+target box).
