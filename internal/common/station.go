@@ -18,24 +18,19 @@ type StationConfig struct {
 // component down to int8 in the end, so complex128's ~15-16 decimal
 // digits of precision is enormous overkill next to that ~2-digit
 // (1/127) final resolution -- complex64's ~7 digits still leaves several
-// orders of magnitude of headroom. Halving the sample width halves every
-// byte the real-time pipeline has to move: the noise-bank tile copy
-// (GenerateNextTick's dominant per-tick cost, profiled at ~45% of total
-// CPU on target hardware -- see the go-simulator README's "Real-hardware
-// profiling" section) and the SPEAD quantize passes that read this
-// buffer straight afterward. Precision-sensitive computation (phase
-// accumulation, delay-polynomial evaluation) still happens entirely in
-// float64 -- see synth/tone.go -- only the FINAL sample value narrows,
-// same principle as any other lossy-on-purpose step in this pipeline.
+// orders of magnitude of headroom, and halving the sample width halves
+// every byte the real-time pipeline has to move (the noise-bank tile
+// copy and the SPEAD quantize passes that read this buffer straight
+// afterward). Precision-sensitive computation (phase accumulation,
+// delay-polynomial evaluation) still happens entirely in float64 -- see
+// synth/tone.go -- only the FINAL sample value narrows, same principle
+// as any other lossy-on-purpose step in this pipeline.
 //
 // VQuantized/HQuantized are an ALTERNATIVE to VSamples/HSamples, not an
 // addition, per pol: a pol is either "complex path" (VSamples/HSamples
 // set, quantized at SPEAD-encode time -- adaptively or via a fixed
 // scale) or "pre-quantized path" (VQuantized/HQuantized set instead,
-// bytes already fully quantized at noise-tile-bank CONSTRUCTION time).
-// This exists because the noise-bank copy remained the single largest
-// real-hardware cost even after halving to complex64 -- see the
-// go-simulator README's "pre-quantized noise tile bank" section. A
+// bytes already fully quantized at noise-tile-bank CONSTRUCTION time). A
 // channel's path is decided once, for the whole scan (see
 // synth.DirectSynthesisStreamer.ComplexPathChannelIDMap): a channel with
 // no tone source targeting it never needs full-precision samples, since

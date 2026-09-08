@@ -28,12 +28,8 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 	}
 	// A pool of batchSize wire-size buffers, allocated ONCE for the life
 	// of this goroutine and reused batch after batch — see
-	// EncodeChannelHeapInto's doc comment for why this is safe:
-	// profiling a real run on the target Linux hardware found the
-	// per-heap `buf` allocation EncodeChannelHeap used to make was still
-	// a dominant cost even after every other per-heap allocation had
-	// been removed (~1.4GB/s of allocation traffic at 384 channels). A
-	// UDP send (sendmmsg included) copies each buffer into the kernel
+	// EncodeChannelHeapInto's doc comment for why this is safe: a UDP
+	// send (sendmmsg included) copies each buffer into the kernel
 	// synchronously before returning, so once sender.WriteBatch(bufs)
 	// below returns, every buffer in that batch is free to reuse for the
 	// next one.

@@ -61,8 +61,7 @@ func TestFillNoiseBank_CrossStationIndependence(t *testing.T) {
 	// Different seeds (e.g. two different stations' noise seeds) must
 	// produce statistically INDEPENDENT banks, never byte-identical ones
 	// -- sharing content across stations would silently break any test
-	// relying on receiver noise being uncorrelated between stations (see
-	// the Python CLAUDE.md's Noise section).
+	// relying on receiver noise being uncorrelated between stations.
 	bankA := fillNoiseBank(1, 1.0, 8, 16, 4)
 	bankB := fillNoiseBank(2, 1.0, 8, 16, 4)
 	identical := 0

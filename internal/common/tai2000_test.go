@@ -24,9 +24,9 @@ func TestUnixToTAI2000Seconds_PositiveForCurrentEraTimestamps(t *testing.T) {
 }
 
 func TestUnixToTAI2000Seconds_FitsIn40BitHeapCounterForCurrentEra(t *testing.T) {
-	// A real bug (Python CLAUDE.md bug #17) inflated heap_counter by
-	// HeapLen (2048x), overflowing the ICD's 40-bit field for any
-	// current-era timestamp. Guard the whole conversion + block-count
+	// An earlier version of this formula inflated heap_counter by
+	// HeapLen (2048x, see docs/history.md), overflowing the ICD's 40-bit
+	// field for any current-era timestamp. Guard the whole conversion + block-count
 	// pipeline against silently regressing that: heap_counter for
 	// "now-ish" must comfortably fit in 40 bits.
 	const fortyBitMax = (int64(1) << 40) - 1

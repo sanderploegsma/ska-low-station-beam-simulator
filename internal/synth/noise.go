@@ -61,9 +61,9 @@ func splitmix64Hash(seed, index uint64) uint64 {
 // implementation hit and fixed: an earlier version there returned one
 // freshly-allocated array per worker and concatenated them, peaking at
 // several times the bank's own footprint and OOM-killing the process —
-// see CLAUDE.md bug #16. Writing into disjoint slices of one
+// see docs/history.md. Writing into disjoint slices of one
 // preallocated slice, as here, avoids that class of bug entirely, by
-// construction, not by later measurement).
+// construction, not by later measurement.
 func fillNoiseBank(seed uint64, std float64, nTiles, tileNSamples, numChannels int) []complex64 {
 	tileLen := tileNSamples * numChannels
 	bank := make([]complex64, nTiles*tileLen)

@@ -254,9 +254,9 @@ func TestEncodeChannelHeap_RejectsHeapCounterOverflow(t *testing.T) {
 	p := NewSpsPacketizer(station, nil)
 
 	// A time far enough in the future to overflow the ICD's 40-bit
-	// heap_counter field (regression guard for the Python CLAUDE.md's bug
-	// #17 -- a wrong formula inflated heap_counter by HeapLen=2048x,
-	// which this test would also have caught).
+	// heap_counter field (regression guard for an earlier bug -- see
+	// docs/history.md -- where a wrong formula inflated heap_counter by
+	// HeapLen=2048x, which this test would also have caught).
 	heap := testHeap(0, 1e15)
 	if _, err := p.EncodeChannelHeap(heap); err == nil {
 		t.Fatal("expected an error for a heap_counter that overflows the 40-bit field, got none")

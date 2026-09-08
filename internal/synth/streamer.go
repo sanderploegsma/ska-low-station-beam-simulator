@@ -10,16 +10,15 @@ import (
 	"github.com/skao/station-beam-simulator-go/internal/common"
 )
 
-// DefaultNTiles matches the Python default (DEFAULT_N_TILES) — see the
-// Python CLAUDE.md's Noise section for the fidelity/resource tradeoff
-// this controls (birthday-paradox tile repeat vs. build time/memory).
+// DefaultNTiles matches the Python default (DEFAULT_N_TILES) — see
+// docs/history.md for the fidelity/resource tradeoff this controls
+// (birthday-paradox tile repeat vs. build time/memory).
 const DefaultNTiles = 256
 
 // ToneSourceConfig is a tone source — required DelayFeed, no
-// default/fallback delay (see the Python CLAUDE.md's "Per-source delay"
-// section for why: a source with no real delay path would silently
+// default/fallback delay: a source with no real delay path would silently
 // produce trivially "perfectly aligned" content, exactly the kind of
-// thing that could mask a real CBF delay-tracking bug).
+// thing that could mask a real CBF delay-tracking bug.
 type ToneSourceConfig struct {
 	DelayFeed *common.DelayFeed
 	FreqHz    float64
@@ -85,10 +84,10 @@ type DirectSynthesisStreamer struct {
 	// never on per-tick delay), computed once at construction.
 	// noiseOnlyChannelPositions is the complement. posToSubsetIdx maps
 	// toneChannelPositions[j] -> j, for GenerateNextTick's tone-add loop
-	// to find its dst slot (dst is now sized to
-	// len(toneChannelPositions), not numChannels -- see
-	// ComplexPathChannelIDMap). See the go-simulator README's
-	// "pre-quantized noise tile bank" section for why this split exists.
+	// to find its dst slot (dst is sized to len(toneChannelPositions),
+	// not numChannels -- see ComplexPathChannelIDMap). Splitting the two
+	// lets noise-only channels (usually most of them) go through a
+	// pre-quantized path instead of the full complex64 dst-write path.
 	toneChannelPositions      []int
 	noiseOnlyChannelPositions []int
 	posToSubsetIdx            map[int]int
@@ -99,7 +98,7 @@ type DirectSynthesisStreamer struct {
 // NewDirectSynthesisStreamer validates cfg and builds a streamer,
 // including filling the noise tile bank (if configured) — this is the
 // same one-time, non-per-tick construction cost the Python version pays
-// (see the Python CLAUDE.md's "One-time construction budget" section).
+// (see docs/history.md's "One-time construction budget" section).
 func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, error) {
 	numChannels := cfg.NumChannels
 	if numChannels == 0 {
@@ -137,8 +136,8 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 			toneChannelSet[chIdx] = true
 		}
 		// An out-of-range tone is NOT added to toneChannelSet here --
-		// GenerateNextTick's own range check (unchanged) logs a warning
-		// and skips it every tick, exactly as before this change.
+		// GenerateNextTick's own range check logs a warning and skips it
+		// every tick instead.
 	}
 
 	// toneChannelPositions: sorted so ComplexPathChannelIDMap (and
@@ -198,13 +197,11 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		// no tone is configured at all, since nothing would ever read it.
 		// Sized to len(toneChannelPositions), NOT numChannels: this
 		// subset is usually tiny (a handful of tone sources at most), so
-		// building it at full channel width would waste real
-		// construction time/memory on ~384 columns nothing ever reads,
-		// just because ONE channel needed the complex path (a real,
-		// previously-unflagged cost found reviewing a real-hardware
-		// profile of a mixed tone+noise config -- see the go-simulator
-		// README). fillNoiseRange reads this bank by SUBSET position
-		// directly (not the raw channel index) to match.
+		// building it at full channel width would waste construction
+		// time/memory on channels nothing ever reads from it, just
+		// because ONE channel needed the complex path. fillNoiseRange
+		// reads this bank by SUBSET position directly (not the raw
+		// channel index) to match.
 		if len(toneChannelPositions) > 0 {
 			s.banks["V"] = fillNoiseBank(s.noiseSeedV, s.noiseStd, s.nTiles, s.tileNSamples, len(toneChannelPositions))
 			s.banks["H"] = fillNoiseBank(s.noiseSeedH, s.noiseStd, s.nTiles, s.tileNSamples, len(toneChannelPositions))
@@ -232,19 +229,6 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 // this package: runtime.GOMAXPROCS(0) (which — unlike runtime.NumCPU()
 // — respects a Kubernetes pod's CPU request/limit), capped only to n (no
 // point spawning more workers than units of independent work).
-//
-// This used to also cap at a flat 16, matching fillNoiseBank's identical
-// cap for its one-time noise-bank *construction* cost -- wrong to share
-// here: GenerateNextTick's noise fill runs on EVERY tick under the fixed
-// per-tick budget, not once at startup, and the Python CLAUDE.md's own
-// EPYC benchmarking already established that this class of
-// per-channel-independent work keeps scaling well past 16 threads once
-// allocation overhead is out of the way (see its "Target server results"
-// section: throughput kept improving monotonically up to 96 threads). A
-// real profile on 2-socket EPYC target hardware showed average
-// concurrency pinned at ~15.18 -- suspiciously exactly this cap -- while
-// the machine had far more cores sitting idle and pacing was still
-// falling behind. Removed; GOMAXPROCS is now trusted on its own.
 func defaultParallelism(n int) int {
 	w := runtime.GOMAXPROCS(0)
 	if w > n {
@@ -314,13 +298,12 @@ func (s *DirectSynthesisStreamer) BankMemoryBytes() int64 {
 // at 384 channels × 2 pols × ~10^8 ticks (a deliberately absurd
 // multi-year-continuous-scanning upper bound -- real usage is nowhere
 // near this), the expected number of samples that would EVER exceed
-// this bound across that whole lifetime is under 0.001 -- see the
-// go-simulator README's quantization-scale section for the full
-// derivation. This margin does NOT change how noise is GENERATED (still
-// the same full-precision float64 Box-Muller draws, same statistics as
-// before) -- it only changes how conservatively the already-generated
-// value is digitized to fit int8 on the wire, i.e. it's a wire-format
-// precision choice, not a physics/statistics one.
+// this bound across that whole lifetime is under 0.001. This margin
+// does NOT change how noise is GENERATED (still the same full-precision
+// float64 Box-Muller draws, same statistics as before) -- it only
+// changes how conservatively the already-generated value is digitized
+// to fit int8 on the wire, i.e. it's a wire-format precision choice, not
+// a physics/statistics one.
 const quantizeSigmaMargin = 8.0
 
 // QuantizeScale returns the fixed per-sample quantization scale this
@@ -330,15 +313,14 @@ const quantizeSigmaMargin = 8.0
 // source, as if they all happened to land in the same channel and add
 // exactly in phase, the true worst case, not just the typical one --
 // plus quantizeSigmaMargin standard deviations of noise headroom. Using
-// this instead of the original per-heap adaptive scale
+// this instead of the alternative, per-heap adaptive scale
 // (quantize8bitScale re-scanning every heap's actual samples for their
 // own max magnitude, every tick) removes that scan from the per-tick hot
-// path entirely -- a real, if smaller, measured cost on real hardware
-// (see the go-simulator README's profiling history). Returns 0 if this
-// streamer has neither noise nor tone configured (an all-silent config,
-// where the scale value is moot: every sample is exactly zero either
-// way) -- SpsPacketizer.SetQuantizeScale treats 0 as "use the adaptive
-// scale," which is harmless here since 0*anything=0 regardless of scale.
+// path entirely. Returns 0 if this streamer has neither noise nor tone
+// configured (an all-silent config, where the scale value is moot: every
+// sample is exactly zero either way) -- SpsPacketizer.SetQuantizeScale
+// treats 0 as "use the adaptive scale," which is harmless here since
+// 0*anything=0 regardless of scale.
 func (s *DirectSynthesisStreamer) QuantizeScale() float64 {
 	bound := quantizeSigmaMargin * s.noiseStd
 	for _, ts := range s.toneCfgs {
@@ -356,14 +338,9 @@ func (s *DirectSynthesisStreamer) QuantizeScale() float64 {
 // dst[pol][j] for each configured pol, j indexing INTO
 // toneChannelPositions (NOT a raw channel index -- dst is sized to
 // ComplexPathChannelIDMap()'s subset, since noise-only channels never
-// reach this method at all any more; see GenerateQuantizedHeaps for
-// those). See common.Streamer's doc comment for why dst is written into
-// directly rather than returned (this replaced an earlier
-// "return a buffer, caller copies it into the accumulator" design once
-// profiling on real target hardware found that copy dominating CPU time
-// even after being parallelized across every available core) -- and see
-// the go-simulator README's "pre-quantized noise tile bank" section for
-// why dst no longer covers every channel.
+// reach this method at all; see GenerateQuantizedHeaps for those). See
+// common.Streamer's doc comment for why dst is written into directly
+// rather than returned.
 //
 // Noise fill here is parallelized across both pols AND (what's usually a
 // small) channel-position range at once -- V and H are already fully
@@ -529,12 +506,8 @@ func (s *DirectSynthesisStreamer) fillNoiseRange(pol string, noiseSeed uint64, d
 // channel's samples are copied PRE-QUANTIZED straight out of
 // quantBanks -- no per-tick float64 generation, no per-tick
 // scan-and-round-and-clamp, both already done ONCE at construction (see
-// fillQuantizedNoiseBank). This is the fix for runtime.memmove remaining
-// the dominant real-hardware cost even after halving the complex64
-// path's sample width -- see the go-simulator README's "pre-quantized
-// noise tile bank" section for the full profiling history and the
-// science behind why this doesn't change what noise IS, only how it's
-// digitized for the wire.
+// fillQuantizedNoiseBank). This doesn't change what noise IS, only how
+// it's digitized for the wire.
 //
 // Returns nil if every channel has a tone source (nothing left for this
 // path to produce).

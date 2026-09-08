@@ -7,10 +7,10 @@ func TestDefaultNumSendersForChannels_KnownPoints(t *testing.T) {
 		numChannels int
 		want        int
 	}{
-		{8, 1},    // MinNumChannels
-		{96, 4},   // this project's historical "current target" channel count -- matches the old flat DefaultNumSenders exactly
+		{8, 1}, // MinNumChannels
+		{96, 4},
 		{192, 8},  // half band
-		{384, 16}, // MaxNumChannels (full band) -- the confirmed real-hardware baseline itself
+		{384, 16}, // MaxNumChannels (full band)
 	}
 	for _, c := range cases {
 		if got := DefaultNumSendersForChannels(c.numChannels); got != c.want {

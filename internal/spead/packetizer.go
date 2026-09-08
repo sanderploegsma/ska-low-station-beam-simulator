@@ -66,17 +66,13 @@ func packAntennaInfo(substationID, subarrayID uint8, stationID uint16) uint64 {
 
 // QuantizeComponent rounds v to the nearest int8 (half away from zero,
 // matching math.Round's convention) and clamps to [-128, 127], in one
-// branch-light pass. Replaces a separate math.Round + clampToInt8 call
-// pair: profiling a real end-to-end run at 384 channels found math.Round
-// alone at ~8% of ALL CPU time on this hot path (quantize8bitIntoPayload
-// runs it twice per sample, ~1.57M samples/tick at 384 channels) --
-// disproportionate for what it does here, since math.Round's
-// implementation spends real work on NaN/Inf/magnitude-≥2^52 cases that
-// can never occur for a synthesized sample scaled into roughly [-127,
-// 127]. v+copysign(0.5, v) then truncating (via the int8 conversion,
-// which truncates toward zero) gives the identical round-half-away-from-
-// zero result for every value in that range, without math.Round's
-// call/branch overhead.
+// branch-light pass, instead of a separate math.Round + clampToInt8 call
+// pair: math.Round's implementation spends real work on NaN/Inf/
+// magnitude-≥2^52 cases that can never occur for a synthesized sample
+// scaled into roughly [-127, 127]. v+copysign(0.5, v) then truncating
+// (via the int8 conversion, which truncates toward zero) gives the
+// identical round-half-away-from-zero result for every value in that
+// range, without math.Round's call/branch overhead.
 func QuantizeComponent(v float64) int8 {
 	v += math.Copysign(0.5, v)
 	if v > 127 {
@@ -105,15 +101,12 @@ func clampToInt8(v float64) int8 {
 // across the loop and takes a single math.Sqrt at the end, not one per
 // sample: sqrt is monotonic for non-negative inputs, so
 // sqrt(re²+im²) > maxAbs is equivalent to re²+im² > maxAbs² without ever
-// computing the intermediate sqrt. Profiling found this loop's own
-// math.Sqrt call (one per sample, e.g. ~1.57M/tick at 384 channels) at
-// ~10% of ALL CPU time -- this eliminates all but one sqrt call per
-// channel/pol/tick (2047 of 2048 at HeapLen=2048), leaving the loop as a
-// plain multiply-add-compare. math.Sqrt, not cmplx.Abs (=math.Hypot):
-// Hypot's overflow/underflow-safe scaling is unneeded here (synthesized
-// sample magnitudes are always small and finite, nowhere near float64's
-// under/overflow range), so the plain, faster form is used for the final
-// sqrt too.
+// computing the intermediate sqrt, leaving the loop as a plain
+// multiply-add-compare with only one sqrt call per channel/pol/tick.
+// math.Sqrt, not cmplx.Abs (=math.Hypot): Hypot's overflow/underflow-safe
+// scaling is unneeded here (synthesized sample magnitudes are always
+// small and finite, nowhere near float64's under/overflow range), so the
+// plain, faster form is used for the final sqrt too.
 func quantize8bitScale(samples []complex64) float64 {
 	maxSq := 0.0
 	for _, s := range samples {
@@ -144,18 +137,10 @@ func quantize8bit(samples []complex64) (outReal, outImag []int8) {
 // dst[i*stride+realOffset] (real component) / dst[i*stride+realOffset+1]
 // (imag component) for each sample i -- no intermediate []int8
 // allocation at all, unlike quantize8bit. dst is the heap's own final
-// wire buffer (see EncodeChannelHeap): profiling a real end-to-end run
-// at 384 channels found EncodeChannelHeap consuming roughly a third of
-// all CPU time, dominated by per-heap allocation/zeroing overhead (~12
-// small allocations/heap previously: 4 quantize8bit slices, 1 payload
-// slice, 7 more from speadHeaderBytes/speadItemPointer each returning
-// their own []byte) at the required per-tick heap rate (e.g. ~174k
-// heaps/sec at 384 channels) -- competing for CPU with the producer
-// goroutine badly enough to explain "falling behind pacing" even though
-// the producer's OWN cost, measured in isolation, was well within
-// budget. Fixed by writing every piece of a heap directly into its
-// (exactly-once-allocated) wire buffer instead: this function for the
-// payload, and EncodeChannelHeap's header/item-pointer writes below.
+// wire buffer (see EncodeChannelHeap): every piece of a heap (header,
+// item pointers, and this payload) is written directly into its
+// exactly-once-allocated wire buffer, rather than building each piece as
+// its own separately-allocated slice first.
 func quantize8bitIntoPayload(samples []complex64, dst []byte, realOffset, stride int, scale float64) {
 	for i, s := range samples {
 		dst[i*stride+realOffset] = byte(QuantizeComponent(float64(real(s)) * scale))
@@ -178,12 +163,11 @@ func quantize8bitIntoPayload(samples []complex64, dst []byte, realOffset, stride
 // channel today -- see ChannelHeap's doc comment -- but ChannelHeap
 // allows it per-pol independently, so this stays correct for that case).
 // EncodeChannelHeapInto's common case is copyQuantizedVHIntoPayload
-// below: a real end-to-end profile on target hardware found THIS
-// function's strided two-bytes-out-of-four write pattern costing 36% of
-// ALL CPU time on its own once it became the hot path (each of V's and
-// H's passes only half-writes every 4-byte block in dst, needing its
-// own read-for-ownership of that cache line -- twice per block, once per
-// pol -- instead of one full write).
+// below instead, since this function's strided two-bytes-out-of-four
+// write pattern (each of V's and H's passes only half-writes every
+// 4-byte block in dst, needing its own read-for-ownership of that cache
+// line -- twice per block, once per pol -- instead of one full write) is
+// more expensive than writing both pols' bytes in one pass.
 func copyQuantizedIntoPayload(quantized []byte, dst []byte, realOffset, stride int) {
 	for i := 0; i < len(quantized)/2; i++ {
 		dst[i*stride+realOffset] = quantized[i*2]
@@ -197,13 +181,7 @@ func copyQuantizedIntoPayload(quantized []byte, dst []byte, realOffset, stride i
 // Himag), instead of copyQuantizedIntoPayload's two separate
 // half-writing passes. Halves how many times each of dst's cache lines
 // needs touching, and every 4-byte block gets fully populated by a
-// single sequential write instead of two interleaved partial ones --
-// confirmed faster on a same-machine before/after (BenchmarkCopyVariants
-// during development, not kept: -17% just from combining passes on this
-// dev machine; the real-hardware win is expected to be larger, since
-// this pattern is memory-bandwidth/cache-behavior-sensitive in a way a
-// warm-cache microbenchmark understates -- confirm on the next target
-// profile).
+// single sequential write instead of two interleaved partial ones.
 func copyQuantizedVHIntoPayload(vQuantized, hQuantized, dst []byte) {
 	n := len(vQuantized) / 2
 	for i := 0; i < n; i++ {
@@ -349,19 +327,13 @@ func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, err
 // quantized V/H payload) is written directly into dst at fixed offsets,
 // never through an intermediate slice.
 //
-// Profiling a real end-to-end run on the actual Linux/SR-IOV target (not
-// just this dev machine) showed EncodeChannelHeap still dominating total
-// CPU (~46-52%) even after removing the ~11 OTHER per-heap allocations
-// (see quantize8bitIntoPayload's doc comment) -- the one remaining
-// allocation (the returned buf itself) was still costing real
-// mallocgc/memclr time at the required heap rate (~1.4GB/s of allocation
-// traffic at 384 channels: ~174k heaps/sec * 8248 bytes/heap). Fixed by
-// letting BatchSendLoop supply a REUSED buffer from a small pool instead
-// -- safe because a UDP write (sendmmsg included) copies the buffer's
-// contents into the kernel synchronously before returning; once
-// BatchSender.WriteBatch returns, every buffer in that batch is free to
-// reuse for the next one, so an encode-into-a-pooled-buffer + send +
-// reuse cycle never races the actual wire send.
+// BatchSendLoop supplies a REUSED buffer from a small pool rather than
+// letting this allocate a fresh one per heap -- safe because a UDP write
+// (sendmmsg included) copies the buffer's contents into the kernel
+// synchronously before returning; once BatchSender.WriteBatch returns,
+// every buffer in that batch is free to reuse for the next one, so an
+// encode-into-a-pooled-buffer + send + reuse cycle never races the
+// actual wire send.
 func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHeap) error {
 	if len(dst) != heapWireSizeBytes {
 		return fmt.Errorf("dst must be exactly %d bytes, got %d", heapWireSizeBytes, len(dst))
@@ -384,10 +356,7 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 
 	// "packet count since SKA epoch" -- count of HeapLen-sample BLOCKS
 	// (BlockDurationS each) since epoch, NOT a count of individual
-	// samples. The Python codebase hit a real bug here once (multiplying
-	// by the sample rate instead of dividing by the block duration,
-	// inflating this by HeapLen) -- see CLAUDE.md bug #17. This divides,
-	// matching the fixed formula.
+	// samples.
 	heapCounterF := math.Round(common.UnixToTAI2000Seconds(heap.HeapStartTime) / common.BlockDurationS)
 	if heapCounterF < 0 || heapCounterF > float64(speadHeapCounterMask) {
 		return fmt.Errorf("heap_counter %v does not fit in the ICD's %d-bit field (top 8 bits of the 0x0001 item are reserved)", heapCounterF, speadHeapCounterBits)

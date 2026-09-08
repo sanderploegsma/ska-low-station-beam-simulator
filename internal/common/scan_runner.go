@@ -25,27 +25,15 @@ type Streamer interface {
 	// entries, each already sized to exactly n samples (allocated by
 	// HeapAccumulator.PrepareWrite) — implementations write generated
 	// samples straight into dst[pol][ch], never build their own separate
-	// output buffer to hand back.
+	// output buffer to hand back. This avoids a second full copy the
+	// accumulator would otherwise need to make to move samples out of a
+	// caller-returned buffer.
 	//
-	// This replaced an earlier "return a fresh/reused buffer, caller
-	// copies it into the accumulator" design: even after that buffer was
-	// made channel-major (see below) and reused across ticks (removing
-	// per-tick allocation), the accumulator's own Add still had to copy
-	// every sample out of it a second time. Profiling a real end-to-end
-	// run (384 channels, EPYC target hardware) found that second copy
-	// was the dominant remaining cost even after PARALLELIZING it across
-	// every available core — more threads don't help a fixed amount of
-	// memory traffic that a single copy doesn't need to move at all. See
-	// HeapAccumulator.PrepareWrite's doc comment for the full profiling
-	// trail.
-	//
-	// dst[pol][ch] being CHANNEL-MAJOR (one channel's samples contiguous,
+	// dst[pol][ch] is CHANNEL-MAJOR (one channel's samples contiguous,
 	// not interleaved sample-major as a per-sample synthesis loop would
-	// most naturally produce) is unchanged from before: it's also
-	// HeapAccumulator's own per-channel storage order, and every
-	// downstream consumer (per-channel heap encoding) wants one
-	// channel's samples contiguous — see HeapAccumulator's doc comment
-	// for the transpose-elimination history this layout choice predates.
+	// most naturally produce): this matches HeapAccumulator's own
+	// per-channel storage order, and every downstream consumer
+	// (per-channel heap encoding) wants one channel's samples contiguous.
 	GenerateNextTick(t float64, n int, dst map[string][][]complex64)
 }
 

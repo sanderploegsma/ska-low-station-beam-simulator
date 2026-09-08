@@ -1,9 +1,9 @@
 // Package common holds shared, backend-agnostic plumbing: ICD-fixed
 // constants, delay polynomial handling, station/heap data structures, and
 // the producer (ScanRunner) that drives a Streamer — ported from this
-// project's Python common.py. See the Python CLAUDE.md's "SPS-CBF ICD
-// channelization" section for how these constants were confirmed against
-// the real ICD text (not a screenshot, not an earlier guess).
+// project's Python common.py. Values match the real SPS-CBF ICD
+// channelization (see docs/history.md for the corrections earlier
+// assumptions needed along the way).
 package common
 
 // CHANNEL_WIDTH_HZ: per SPS-CBF ICD coarse channel spacing (channel

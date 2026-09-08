@@ -244,9 +244,9 @@ func TestDirectSynthesisStreamer_NoiseIndependentAcrossStationSeeds(t *testing.T
 }
 
 func TestDirectSynthesisStreamer_VAndHNoiseDiffer(t *testing.T) {
-	// bug #1 in the Python CLAUDE.md: reusing one noise source for both
-	// pols gave numerically identical "noise" for V and H. Guard against
-	// regressing that here.
+	// An earlier bug (see docs/history.md) reused one noise source for
+	// both pols, giving numerically identical "noise" for V and H. Guard
+	// against regressing that here.
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
 		Station:     testStation(),
 		ObsTimeRef:  0,
@@ -275,12 +275,12 @@ func TestDirectSynthesisStreamer_VAndHNoiseDiffer(t *testing.T) {
 
 func TestDirectSynthesisStreamer_NoiseNeverDelayCorrected(t *testing.T) {
 	// Receiver noise must be identical regardless of a source's delay
-	// polynomial -- it never enters a delay pipeline (see the Python
-	// CLAUDE.md's Noise section). Checked on BOTH paths: the tone's own
-	// channel (complex, GenerateNextTick) and every other, noise-only
-	// channel (pre-quantized, GenerateQuantizedHeaps -- which doesn't
-	// even look at toneCfgs/delay at all, a stronger structural guarantee
-	// than the complex path's "noise generation never reads a DelayFeed").
+	// polynomial -- it never enters a delay pipeline. Checked on both
+	// paths: the tone's own channel (complex, GenerateNextTick) and
+	// every other, noise-only channel (pre-quantized,
+	// GenerateQuantizedHeaps -- which doesn't even look at
+	// toneCfgs/delay at all, a stronger structural guarantee than the
+	// complex path's "noise generation never reads a DelayFeed").
 	feedA := common.NewDelayFeed("a")
 	feedA.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{0.0}})
 	feedB := common.NewDelayFeed("b")

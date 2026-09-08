@@ -8,9 +8,8 @@
 //
 // -tone-freq-hz uses a STATIC, always-zero-delay feed, never updated
 // again after construction — real scans always get their tone's delay
-// from a live Tango attribute subscription (see simulator.go's
-// StartScan and the Python CLAUDE.md's "Per-source delay" section for
-// why a real delay path is otherwise required, no exceptions). A static
+// from a live Tango attribute subscription (see simulator.py's StartScan;
+// a real delay path is otherwise required, no exceptions). A static
 // feed here is fine ONLY because this tool exists to isolate tone's
 // computational cost on top of noise, not to validate delay-tracking
 // correctness — don't read anything about delay behavior from a run of

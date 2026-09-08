@@ -1,9 +1,8 @@
 // Package synth is the numeric core — direct per-channel synthesis of
-// tone and per-pol station (receiver) noise, ported from the Python
-// project's direct_synthesis.py. Pulsar/pulsed sources are deliberately
-// OUT OF SCOPE for this prototype (see the go-simulator README): the
-// Python side already establishes tone/noise are feature-parity-critical
-// for replacing CNIC, while pulsar support is a later addition.
+// tone and per-pol station (receiver) noise. Pulsar/pulsed sources are
+// deliberately out of scope here (see README.md) -- tone/noise are
+// feature-parity-critical for replacing CNIC, while pulsar support is a
+// later addition.
 package synth
 
 import (
@@ -42,9 +41,8 @@ func toneChannelIndex(freqHz, baseFreqHz, channelWidthHz float64) int {
 // approximation), and O(1) per tone regardless of channel count.
 //
 // delayCoeffs, poly_t_rel_start and t_local_rel_start are all
-// small-magnitude relative times — see the module-level note above (and
-// the Python CLAUDE.md's extensive discussion of why raw epoch-scale time
-// collapses float64 precision here).
+// small-magnitude relative times — see the module-level note above (raw
+// epoch-scale time collapses float64 precision here, see docs/history.md).
 func synthToneChannel(
 	freqHz, amplitude, baseFreqHz, channelWidthHz float64,
 	delayCoeffs []float64,

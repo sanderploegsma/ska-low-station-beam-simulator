@@ -79,11 +79,8 @@ from ska_low_station_beam_simulator.simulatorpb import (
 def build_tone_source_request(spec: dict) -> simulator_pb2.ToneSourceConfig:
     """Turns one ``'tone'`` ``source_cfgs`` JSON entry into the
     ``ToneSourceConfig`` protobuf message ``StartScan`` sends to the Go
-    gRPC simulator — the JSON-boundary validation this codebase keeps
-    doing at the point untyped data enters the system (see CLAUDE.md's
-    "source_cfgs/noise_cfg are typed dataclasses, not dicts" section for
-    the same pattern applied to the since-replaced local-generation
-    path). Kept standalone, not inlined into ``StartScan``, so it's
+    gRPC simulator — validated at the point untyped data enters the
+    system. Kept standalone, not inlined into ``StartScan``, so it's
     unit-testable without a live Tango device or a live gRPC server.
 
     :param spec: one raw ``source_cfgs`` entry.

@@ -6,10 +6,8 @@ gRPC simulator.
 Kept as a standalone, Tango-free (and gRPC-free) function specifically
 so this JSON-shape validation (unsupported ``kind``, missing
 ``delay_attr_uri``) is unit-testable without standing up a live Tango
-device or a live gRPC server -- see
-``simulator.build_tone_source_request``'s own docstring and CLAUDE.md's
-Setup section (this codebase otherwise doesn't unit test the Tango
-device server layer at all).
+device or a live gRPC server (this codebase otherwise doesn't unit test
+the Tango device server layer at all).
 """
 
 import pytest

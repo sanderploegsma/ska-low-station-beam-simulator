@@ -26,10 +26,9 @@ func (p *DelayPolynomial) ValidUntil() float64 {
 // EvalDelaySeconds evaluates this polynomial at absolute epoch time t,
 // for polarisation "V" or "H" ("H" adds YPolOffsetNs). IMPORTANT:
 // evaluated relative to StartValiditySec, NOT raw absolute epoch time — a
-// high-order polynomial loses float64 precision otherwise (the same
-// precision-collapse bug documented throughout the Python codebase's
-// CLAUDE.md; every kernel in this port takes a small-magnitude relative
-// time for the same reason).
+// high-order polynomial loses float64 precision otherwise; every kernel
+// in this port takes a small-magnitude relative time for the same
+// reason (see docs/history.md for the bug this works around).
 func (p *DelayPolynomial) EvalDelaySeconds(t float64, pol string) float64 {
 	tRel := t - p.StartValiditySec
 	tauXNs := 0.0

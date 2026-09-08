@@ -14,8 +14,7 @@ package common
 // "better" path available here without vendoring a leap-second table
 // and pulling in a real IERS bulletin source. DO NOT deploy this as-is:
 // wire in a proper leap-second table (or a shared source of truth with
-// the Python side) before this matters for real timestamps, exactly the
-// same warning CLAUDE.md gives for the Python fallback.
+// the Python side) before this matters for real timestamps.
 func UnixToTAI2000Seconds(unixTime float64) float64 {
 	const taiUTCOffsetS = 37.0
 	const unixTimeAtTAI2000Epoch = 946684800.0 - 32.0

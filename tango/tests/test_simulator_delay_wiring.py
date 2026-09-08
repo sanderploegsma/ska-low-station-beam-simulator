@@ -2,18 +2,15 @@
 subscription wiring (``_make_delay_feed``/``_teardown_delay_subscriptions``).
 
 Doesn't stand up a real Tango device server (this codebase doesn't unit
-test that layer anywhere else either — see CLAUDE.md's Setup section:
-pytango degrades ``simulator.py`` to stub classes if unavailable, but
-``StationSimulatorDevice`` itself still isn't deployable without a live
-Tango context) or a real gRPC server. Instead, ``AttributeProxy``/
-``EventType`` are monkeypatched with fakes so the subscribe/unsubscribe
-pairing and event-handling can be exercised directly against a
-lightweight stand-in object, and ``dev._stub`` is a fake stub recording
-every ``PushDelayUpdate`` call it receives -- the observable effect
-``_make_delay_feed`` is now responsible for (it used to update a local
-``DelayFeed`` directly; that state now lives entirely in the Go gRPC
-process, so a pushed update is verified by what got forwarded to the
-stub instead of by reading a local feed).
+test that layer anywhere else either: pytango degrades ``simulator.py``
+to stub classes if unavailable, but ``StationSimulatorDevice`` itself
+still isn't deployable without a live Tango context) or a real gRPC
+server. Instead, ``AttributeProxy``/``EventType`` are monkeypatched with
+fakes so the subscribe/unsubscribe pairing and event-handling can be
+exercised directly against a lightweight stand-in object, and
+``dev._stub`` is a fake stub recording every ``PushDelayUpdate`` call it
+receives -- delay state lives entirely in the Go gRPC process, so a
+pushed update is verified by what got forwarded to the stub.
 """
 
 import types
@@ -146,8 +143,7 @@ def test_make_delay_feed_survives_unparseable_payload():
 def test_teardown_unsubscribes_all_and_clears_list():
     """StopScan/delete_device must actually unsubscribe every
     delay-attribute subscription a scan opened, not just some of them --
-    required so subscriptions never leak across scans (see CLAUDE.md's
-    simulator.py wiring notes)."""
+    required so subscriptions never leak across scans."""
     dev = _fake_device()
     sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
     sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction1")

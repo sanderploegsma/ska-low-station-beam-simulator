@@ -9,47 +9,24 @@ import (
 // available per channel, then emits one ChannelHeap per channel.
 //
 // Storage is PER-CHANNEL (bufV[ch]/bufH[ch], each its own growable,
-// contiguous []complex64), not one shared flat buffer — deliberately
-// matching Streamer.GenerateNextTick's channel-major (numChannels,
-// nSamples) output layout (see that interface's doc comment). This
-// replaced an earlier flat, sample-major design that had to TRANSPOSE
-// every tick's chunk into per-channel order via a scalar, cache-hostile
-// loop (768 small allocations/tick at 384 channels, plus the strided
-// copy itself) — see BenchmarkHeapAccumulator_OneTickPerPop and
-// BenchmarkProducerTick, which caught this as the dominant per-tick
-// cost, exceeding the ENTIRE per-tick budget at 384 channels on its own.
-// With generation already producing channel-major output, Add/pop reduce
-// to per-channel bulk memmoves (append/copy), never a per-element loop —
-// the same total bytes moved, but via the runtime's optimized memmove
-// instead of a scalar loop, and with far fewer, far larger allocations.
+// contiguous []complex64), matching Streamer.GenerateNextTick's
+// channel-major (numChannels, nSamples) output layout (see that
+// interface's doc comment) -- Add/PopReadyHeaps reduce to per-channel
+// bulk memmoves (append/copy), never a per-element loop.
 //
 // Add and PopReadyHeaps both split their per-channel work across
-// numWorkers goroutines (see forEachChannelRange): profiling a real
-// end-to-end run on the target hardware found ScanRunner's single
-// producer goroutine (this type plus DirectSynthesisStreamer.
-// GenerateNextTick) running at ~99% duty cycle on ONE core for the
-// whole scan, unable to keep pace even after removing every allocation
-// this method used to make -- unlike sending (already parallelized
-// across SenderPool's goroutines), the producer had never been split
-// across cores at all. Each channel's work here is already fully
-// independent (disjoint bufV[ch]/bufH[ch] slices), so this is a direct
-// channel-range split, the same approach GenerateNextTick uses for its
-// own dominant cost.
+// numWorkers goroutines (see forEachChannelRange): each channel's work
+// is fully independent (disjoint bufV[ch]/bufH[ch] slices), so this is
+// a direct channel-range split, the same approach GenerateNextTick uses
+// for its own dominant cost.
 //
 // PopReadyHeaps hands off each channel's bufV[ch]/bufH[ch] backing array
 // directly as the outgoing ChannelHeap's VSamples/HSamples -- it does
-// NOT copy into a separate flat buffer first. An earlier version did:
-// re-profiling a real end-to-end run AFTER the goroutine-parallelization
-// above (this section) found runtime.memmove alone at 56.9% of ALL CPU
-// time, with this method's flatV/flatH copy (plus the make()/zero-fill
-// that came with it) responsible for over 14 points of that on its own
-// -- parallelizing had spread the cost across cores without eliminating
-// the redundant work, which is exactly why CPU usage rose sharply for
-// only a marginal throughput gain rather than closing the pacing gap.
-// Since TickNSamples() == HeapLen by construction (see that method's doc
-// comment on DirectSynthesisStreamer), bufV[ch]/bufH[ch] holds EXACTLY
-// HeapLen samples at the moment PopReadyHeaps runs in the real pipeline
-// -- so handing off the array Add already built (one copy, in Add's own
+// NOT copy into a separate flat buffer first. Since TickNSamples() ==
+// HeapLen by construction (see that method's doc comment on
+// DirectSynthesisStreamer), bufV[ch]/bufH[ch] holds EXACTLY HeapLen
+// samples at the moment PopReadyHeaps runs in the real pipeline -- so
+// handing off the array Add already built (one copy, in Add's own
 // append) replaces a second full copy with a zero-copy reslice.
 type HeapAccumulator struct {
 	numChannels          int
@@ -59,8 +36,8 @@ type HeapAccumulator struct {
 	numWorkers           int
 
 	bufV, bufH      [][]complex64 // per-channel, len == numChannels; bufV[ch] grows as ticks are added
-	rowsV, rowsH    int            // samples buffered per channel so far (same for every channel: Add always delivers every channel's share together)
-	samplesConsumed int64          // total per-channel samples already popped, for timestamping
+	rowsV, rowsH    int           // samples buffered per channel so far (same for every channel: Add always delivers every channel's share together)
+	samplesConsumed int64         // total per-channel samples already popped, for timestamping
 }
 
 // NewHeapAccumulator creates an accumulator for numChannels channels.
@@ -91,20 +68,6 @@ func NewHeapAccumulator(numChannels int, obsTime, sampleRatePerChannel float64, 
 // common must not depend on synth): runtime.GOMAXPROCS(0) (which —
 // unlike runtime.NumCPU() — respects a Kubernetes pod's CPU
 // request/limit), capped only to n.
-//
-// This used to also cap at a flat 16, matching fillNoiseBank's identical
-// cap for its one-time noise-bank *construction* cost -- wrong to share
-// here, caught by real-hardware profiling: this method's work runs on
-// EVERY tick under the fixed per-tick budget, not once at startup, and
-// the Python CLAUDE.md's own EPYC benchmarking already established that
-// this class of per-channel-independent work keeps scaling well past 16
-// threads once allocation overhead is out of the way (see its "Target
-// server results" section: throughput kept improving monotonically up
-// to 96 threads). A real profile on 2-socket EPYC target hardware showed
-// average concurrency pinned at ~15.18 -- suspiciously exactly this cap
-// -- while the machine had far more cores sitting idle and pacing was
-// still falling behind. Removed; GOMAXPROCS is now trusted on its own,
-// same as it already is for NumWorkers callers who set it explicitly.
 func defaultParallelism(n int) int {
 	w := runtime.GOMAXPROCS(0)
 	if w > n {
@@ -226,18 +189,12 @@ func ReleaseSampleBuffers(heap *ChannelHeap) {
 // process-fresh for a one-shot CLI run, and just as importantly, EVERY
 // entry a pool held is dropped on each GC cycle even in a long-running
 // process (a Tango device server pod handling many scans over its
-// lifetime) -- so if a real gap between scans (multi-second-plus,
-// control-software overhead, per the parent Python CLAUDE.md's
-// documented deployment cadence) lets even one GC cycle land in between,
-// the NEXT scan starts with empty pools too, not just the very first
-// scan a process ever runs. Without this, the first several hundred
-// ticks of every scan pay make()'s cost on every Get() until enough
-// buffers have cycled through ReleaseSampleBuffers to fill the pool
-// "for free" -- a plausible contributor to the early-scan pacing drift
-// this project's real-hardware captures keep showing (see
-// go-simulator/README.md's profiling log), independent of and
-// additional to the CPU-clock-ramp/GC causes already investigated and
-// ruled out or mitigated there.
+// lifetime) -- so if a real gap between scans lets even one GC cycle
+// land in between, the NEXT scan starts with empty pools too, not just
+// the very first scan a process ever runs. Without this, the first
+// several hundred ticks of every scan would pay make()'s cost on every
+// Get() until enough buffers have cycled through ReleaseSampleBuffers to
+// fill the pool "for free".
 func WarmBufferPools(numChannels int) {
 	n := numChannels * 2
 	for i := 0; i < n; i++ {
@@ -253,29 +210,16 @@ func WarmBufferPools(numChannels int) {
 // samples straight into these instead of building a separate chunk that
 // then has to be copied in via Add.
 //
-// This exists because profiling a real end-to-end run (384 channels,
-// EPYC target hardware) found the OLD flow -- generate into a scratch
-// buffer, then Add() copies it into bufV/bufH -- moving every tick's
-// samples TWICE: once out of the noise tile bank into the scratch
-// buffer, once more out of the scratch buffer into here. Neither more
-// threads (see defaultParallelism's doc comment: raising the worker cap
-// left this exact copy volume unchanged, and pacing didn't improve) nor
-// the earlier PopReadyHeaps fix (which removed a THIRD copy, out of here
-// into a flat per-pop buffer) touched this one. Generating directly into
-// PrepareWrite's returned slices removed it -- one copy (bank tile ->
-// here) instead of two.
+// Generation writes directly into these slices (bank tile -> here, one
+// copy), rather than building a separate chunk that Add would then have
+// to copy in a second time.
 //
-// Removing that copy surfaced the NEXT cost: re-profiling found
-// runtime.memclrNoHeapPointers alone at 20.9% of all CPU time --
-// make()'s unconditional zero-fill on every channel's freshly-grown
-// buffer, every tick, even though GenerateNextTick's noise fill was
-// about to overwrite every cell of it anyway (runtime.makeslicecopy,
-// the make()+copy() fusion the old grow path compiled to, accounted for
-// essentially all of this method's own cost: 140.16s of its 140.77s).
-// Fixed by drawing from sampleBufferPool instead of make()-ing a fresh
-// buffer in the common case (growing from empty, size <= HeapLen) --
-// pooled buffers carry stale content by design (see getSampleBuffer),
-// so skipping the zero-fill is safe.
+// Draws from sampleBufferPool instead of make()-ing a fresh buffer in
+// the common case (growing from empty, size <= HeapLen): pooled buffers
+// carry stale content by design (see getSampleBuffer), which is safe
+// here since GenerateNextTick's noise fill overwrites every cell of a
+// freshly-grown buffer anyway, and it lets this skip make()'s
+// unconditional zero-fill.
 //
 // Each channel's growth is independent (disjoint bufV[ch]/bufH[ch]
 // slices), so -- like Add and PopReadyHeaps -- this is split across
@@ -351,21 +295,13 @@ func (a *HeapAccumulator) PopReadyHeaps() []*ChannelHeap {
 		iterHeaps := make([]*ChannelHeap, a.numChannels)
 
 		// HAND OFF each channel's existing backing array as VSamples/
-		// HSamples directly -- NO copy into a separate flat buffer.
-		// Profiling a real end-to-end run (384 channels, target
-		// hardware) after the goroutine-parallelization fix above found
-		// this exact copy dominating: 56.9% of ALL CPU time was
-		// runtime.memmove, and this method's flatV/flatH copy alone
-		// (plus the make()/zero-fill that came with it) was over 14% on
-		// its own -- parallelizing spread that cost across cores but
-		// never eliminated the redundant work, which is why CPU usage
-		// went up markedly for only a slight throughput gain rather than
-		// closing the pacing gap. In the normal case (TickNSamples() ==
-		// HeapLen, true by construction -- see that method's doc
-		// comment) each bufV[ch]/bufH[ch] holds EXACTLY HeapLen samples
-		// here, so takeHeapSlice below just reslices the array Add
-		// already built (one copy, in Add's append) instead of copying
-		// it a second time.
+		// HSamples directly -- NO copy into a separate flat buffer. In
+		// the normal case (TickNSamples() == HeapLen, true by
+		// construction -- see that method's doc comment) each
+		// bufV[ch]/bufH[ch] holds EXACTLY HeapLen samples here, so
+		// takeHeapSlice below just reslices the array Add already
+		// built (one copy, in Add's append) instead of copying it a
+		// second time.
 		takeHeapSlice := func(buf []complex64) (heapSlice, remainder []complex64) {
 			heapSlice = buf[:HeapLen:HeapLen] // 3-index: cap HeapLen so a future append by any holder can't alias into the leftover below
 			leftoverLen := len(buf) - HeapLen
