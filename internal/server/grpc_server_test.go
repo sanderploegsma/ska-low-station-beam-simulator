@@ -12,8 +12,8 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/test/bufconn"
 
-	pb "github.com/skao/station-beam-simulator-go/api/simulatorpb"
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	pb "github.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpb"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // newTestClient spins up a Server over an in-memory bufconn listener and

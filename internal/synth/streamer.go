@@ -7,7 +7,7 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // DefaultNTiles matches the Python default (DEFAULT_N_TILES) — see

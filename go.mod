@@ -1,4 +1,4 @@
-module github.com/skao/station-beam-simulator-go
+module github.com/sanderploegsma/ska-low-station-beam-simulator
 
 go 1.25.0
 

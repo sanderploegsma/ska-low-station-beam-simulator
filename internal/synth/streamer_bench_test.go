@@ -4,7 +4,7 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // BenchmarkProducerTick reproduces one ScanRunner tick end-to-end --

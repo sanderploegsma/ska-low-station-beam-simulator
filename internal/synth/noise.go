@@ -5,7 +5,7 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/skao/station-beam-simulator-go/internal/spead"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/spead"
 )
 
 // golden is the splitmix64 golden-ratio constant — same algorithm and

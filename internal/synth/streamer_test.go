@@ -5,8 +5,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
-	"github.com/skao/station-beam-simulator-go/internal/spead"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/spead"
 )
 
 func testStation() *common.StationConfig {

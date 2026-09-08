@@ -8,7 +8,7 @@ import (
 
 	"golang.org/x/net/ipv4"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // Sender-pool defaults. Chosen to give a comfortable margin over the

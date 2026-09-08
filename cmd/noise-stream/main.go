@@ -29,10 +29,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
-	"github.com/skao/station-beam-simulator-go/internal/netutil"
-	"github.com/skao/station-beam-simulator-go/internal/spead"
-	"github.com/skao/station-beam-simulator-go/internal/synth"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/netutil"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/spead"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/synth"
 )
 
 func main() {

@@ -719,7 +719,7 @@ const file_simulator_proto_rawDesc = "" +
 	"\tStartScan\x12\x1e.simulator.v1.StartScanRequest\x1a\x1f.simulator.v1.StartScanResponse\x12I\n" +
 	"\bStopScan\x12\x1d.simulator.v1.StopScanRequest\x1a\x1e.simulator.v1.StopScanResponse\x12^\n" +
 	"\x0fPushDelayUpdate\x12$.simulator.v1.PushDelayUpdateRequest\x1a%.simulator.v1.PushDelayUpdateResponse\x12I\n" +
-	"\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponseB;Z9github.com/skao/station-beam-simulator-go/api/simulatorpbb\x06proto3"
+	"\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponseBJZHgithub.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpbb\x06proto3"
 
 var (
 	file_simulator_proto_rawDescOnce sync.Once

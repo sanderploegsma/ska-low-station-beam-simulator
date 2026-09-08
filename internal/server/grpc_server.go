@@ -20,11 +20,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	pb "github.com/skao/station-beam-simulator-go/api/simulatorpb"
-	"github.com/skao/station-beam-simulator-go/internal/common"
-	"github.com/skao/station-beam-simulator-go/internal/netutil"
-	"github.com/skao/station-beam-simulator-go/internal/spead"
-	"github.com/skao/station-beam-simulator-go/internal/synth"
+	pb "github.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpb"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/netutil"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/spead"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/synth"
 )
 
 // Server implements pb.StationSimulatorServer.

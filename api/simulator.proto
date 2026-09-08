@@ -12,7 +12,7 @@ syntax = "proto3";
 
 package simulator.v1;
 
-option go_package = "github.com/skao/station-beam-simulator-go/api/simulatorpb";
+option go_package = "github.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpb";
 
 service StationSimulator {
   // Starts a scan. Fails if a scan is already running (call StopScan

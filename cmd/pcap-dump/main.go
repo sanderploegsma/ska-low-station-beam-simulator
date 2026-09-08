@@ -17,10 +17,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
-	"github.com/skao/station-beam-simulator-go/internal/pcap"
-	"github.com/skao/station-beam-simulator-go/internal/spead"
-	"github.com/skao/station-beam-simulator-go/internal/synth"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/pcap"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/spead"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/synth"
 )
 
 func main() {

@@ -3,7 +3,7 @@ package spead
 import (
 	"log"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // BatchSendLoop reads heaps from recv, encodes them, and writes them to

@@ -5,7 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/skao/station-beam-simulator-go/internal/common"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/common"
 )
 
 // decodedItem is one parsed SPEAD-64-48 item pointer.

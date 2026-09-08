@@ -13,8 +13,8 @@ import (
 
 	"google.golang.org/grpc"
 
-	pb "github.com/skao/station-beam-simulator-go/api/simulatorpb"
-	"github.com/skao/station-beam-simulator-go/internal/server"
+	pb "github.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpb"
+	"github.com/sanderploegsma/ska-low-station-beam-simulator/internal/server"
 )
 
 func main() {
