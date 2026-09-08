@@ -8,12 +8,20 @@ import (
 )
 
 // BenchmarkProducerTick reproduces one ScanRunner tick end-to-end
-// (HeapAccumulator.PrepareWrite -> GenerateNextTick -> PopReadyHeaps) --
-// the exact per-tick work whose real-time budget is common.BlockDurationS
-// (~2.21ms), and whose overrun is what noise-stream's "producer falling
-// behind pacing" log line is reporting. Noise-only (matches
-// cmd/noise-stream, which sets no ToneSources), n_tiles left at
-// DefaultNTiles.
+// (HeapAccumulator.PrepareWrite -> GenerateNextTick -> PopReadyHeaps ->
+// common.ReleaseSampleBuffers) -- the exact per-tick work whose
+// real-time budget is common.BlockDurationS (~2.21ms), and whose
+// overrun is what noise-stream's "producer falling behind pacing" log
+// line is reporting. Noise-only (matches cmd/noise-stream, which sets
+// no ToneSources), n_tiles left at DefaultNTiles.
+//
+// Releasing each popped heap's buffers immediately (standing in for
+// spead.encodeHeapInto, which does the same once a real SenderPool
+// finishes encoding a heap) matters for this benchmark's own validity,
+// not just realism: without it, PrepareWrite's buffer pool never gets
+// refilled, so every call falls back to a fresh make() regardless of
+// the pool existing at all -- silently measuring the pre-pool cost
+// again under a name that no longer describes it.
 func BenchmarkProducerTick(b *testing.B) {
 	for _, numChannels := range []int{96, 384} {
 		b.Run("channels="+strconv.Itoa(numChannels), func(b *testing.B) {
@@ -40,6 +48,9 @@ func BenchmarkProducerTick(b *testing.B) {
 				heaps := acc.PopReadyHeaps()
 				if len(heaps) != numChannels {
 					b.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
+				}
+				for _, heap := range heaps {
+					common.ReleaseSampleBuffers(heap)
 				}
 			}
 		})

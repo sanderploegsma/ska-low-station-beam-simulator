@@ -11,7 +11,10 @@ import (
 // real scan (see synth.DirectSynthesisStreamer.TickNSamples's doc
 // comment: "HeapLen by construction", so this is the only shape
 // PopReadyHeaps ever actually sees in production, not just one shape
-// among many).
+// among many). Releases each popped heap immediately, standing in for
+// spead.encodeHeapInto -- without it, PrepareWrite's buffer pool never
+// gets refilled and this would silently measure the pre-pool cost
+// instead (see BenchmarkProducerTick's doc comment for the same note).
 func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
 	for _, numChannels := range []int{96, 384} {
 		b.Run("channels="+strconv.Itoa(numChannels), func(b *testing.B) {
@@ -25,6 +28,9 @@ func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
 				heaps := acc.PopReadyHeaps()
 				if len(heaps) != numChannels {
 					b.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
+				}
+				for _, heap := range heaps {
+					ReleaseSampleBuffers(heap)
 				}
 			}
 		})
@@ -149,6 +155,58 @@ func TestHeapAccumulator_PrepareWriteDirectFill(t *testing.T) {
 			t.Fatalf("channel %d: HSamples[5] = %v, want (%d+5i)", h.ChannelID, h.HSamples[5], h.ChannelID)
 		}
 	}
+}
+
+func TestHeapAccumulator_ReleaseAndReusePreservesCorrectness(t *testing.T) {
+	numChannels := 2
+	acc := NewHeapAccumulator(numChannels, 0, 1.0, nil)
+
+	vTargets := acc.PrepareWrite("V", HeapLen)
+	hTargets := acc.PrepareWrite("H", HeapLen)
+	for ch := 0; ch < numChannels; ch++ {
+		for i := 0; i < HeapLen; i++ {
+			vTargets[ch][i] = complex(1.0, float64(ch))
+			hTargets[ch][i] = complex(2.0, float64(ch))
+		}
+	}
+	heaps := acc.PopReadyHeaps()
+	if len(heaps) != numChannels {
+		t.Fatalf("expected %d heaps, got %d", numChannels, len(heaps))
+	}
+	for _, h := range heaps {
+		ReleaseSampleBuffers(h)
+	}
+
+	// sync.Pool doesn't guarantee these released buffers come back on
+	// the next PrepareWrite (they might not, depending on GC timing) --
+	// but IF they do, they must come back fully overwritten, with no
+	// stale content from the first tick surviving.
+	vTargets = acc.PrepareWrite("V", HeapLen)
+	hTargets = acc.PrepareWrite("H", HeapLen)
+	for ch := 0; ch < numChannels; ch++ {
+		for i := 0; i < HeapLen; i++ {
+			vTargets[ch][i] = complex(3.0, float64(ch))
+			hTargets[ch][i] = complex(4.0, float64(ch))
+		}
+	}
+	heaps = acc.PopReadyHeaps()
+	for _, h := range heaps {
+		for i, v := range h.VSamples {
+			if v != complex(3.0, float64(h.ChannelID)) {
+				t.Fatalf("channel %d: VSamples[%d] = %v, want (3+%di) -- stale released data leaked through", h.ChannelID, i, v, h.ChannelID)
+			}
+		}
+		for i, v := range h.HSamples {
+			if v != complex(4.0, float64(h.ChannelID)) {
+				t.Fatalf("channel %d: HSamples[%d] = %v, want (4+%di)", h.ChannelID, i, v, h.ChannelID)
+			}
+		}
+	}
+}
+
+func TestReleaseSampleBuffers_NilSafe(t *testing.T) {
+	ReleaseSampleBuffers(nil)
+	ReleaseSampleBuffers(&ChannelHeap{})
 }
 
 func TestHeapAccumulator_CustomChannelIDMap(t *testing.T) {

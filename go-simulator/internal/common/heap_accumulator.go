@@ -141,6 +141,52 @@ func forEachChannelRange(numWorkers, numChannels int, fn func(chStart, chEnd int
 	wg.Wait()
 }
 
+// sampleBufferPool holds reusable, HeapLen-capacity []complex128 buffers
+// -- shared package-wide, not per-HeapAccumulator, since a buffer is
+// fungible once its previous contents have been fully consumed (see
+// ReleaseSampleBuffers): there is nothing accumulator-, channel-, or
+// pol-specific baked into the memory itself.
+var sampleBufferPool = sync.Pool{
+	New: func() any {
+		return make([]complex128, HeapLen)
+	},
+}
+
+// getSampleBuffer draws a HeapLen-length buffer from sampleBufferPool
+// (allocating one, via New above, if the pool is empty). Content is
+// UNDEFINED -- possibly stale from a previous tick's samples, never
+// zeroed -- which is safe here specifically because PrepareWrite's
+// caller (GenerateNextTick's noise fill, or its no-noise-configured
+// zero-fill branch) always WRITES every cell before anything ever reads
+// it; nothing in this codebase relies on a fresh buffer starting at
+// zero.
+func getSampleBuffer() []complex128 {
+	return sampleBufferPool.Get().([]complex128)
+}
+
+// ReleaseSampleBuffers returns heap.VSamples/HSamples to
+// sampleBufferPool for reuse by a future PrepareWrite call, once heap
+// has been fully consumed (spead.BatchSendLoop calls this right after
+// SPEAD-encoding a heap, successfully or not -- either way nothing reads
+// heap.VSamples/HSamples again). Only buffers with cap == HeapLen are
+// pooled (exactly what PrepareWrite's fast path and PopReadyHeaps'
+// zero-copy handoff always produce) -- anything else (the rare
+// nSamples > HeapLen case PrepareWrite falls back to plain make() for)
+// is simply left for the garbage collector, no correctness impact
+// either way, just a missed reuse. Safe to call with heap == nil or with
+// nil/short sample slices.
+func ReleaseSampleBuffers(heap *ChannelHeap) {
+	if heap == nil {
+		return
+	}
+	if cap(heap.VSamples) == HeapLen {
+		sampleBufferPool.Put(heap.VSamples[:HeapLen])
+	}
+	if cap(heap.HSamples) == HeapLen {
+		sampleBufferPool.Put(heap.HSamples[:HeapLen])
+	}
+}
+
 // PrepareWrite grows each channel's buffer for pol by nSamples and
 // returns, per channel, the newly-added nSamples-length slice as a
 // direct write target -- the caller (ScanRunner, via
@@ -157,8 +203,20 @@ func forEachChannelRange(numWorkers, numChannels int, fn func(chStart, chEnd int
 // left this exact copy volume unchanged, and pacing didn't improve) nor
 // the earlier PopReadyHeaps fix (which removed a THIRD copy, out of here
 // into a flat per-pop buffer) touched this one. Generating directly into
-// PrepareWrite's returned slices removes it -- one copy (bank tile ->
+// PrepareWrite's returned slices removed it -- one copy (bank tile ->
 // here) instead of two.
+//
+// Removing that copy surfaced the NEXT cost: re-profiling found
+// runtime.memclrNoHeapPointers alone at 20.9% of all CPU time --
+// make()'s unconditional zero-fill on every channel's freshly-grown
+// buffer, every tick, even though GenerateNextTick's noise fill was
+// about to overwrite every cell of it anyway (runtime.makeslicecopy,
+// the make()+copy() fusion the old grow path compiled to, accounted for
+// essentially all of this method's own cost: 140.16s of its 140.77s).
+// Fixed by drawing from sampleBufferPool instead of make()-ing a fresh
+// buffer in the common case (growing from empty, size <= HeapLen) --
+// pooled buffers carry stale content by design (see getSampleBuffer),
+// so skipping the zero-fill is safe.
 //
 // Each channel's growth is independent (disjoint bufV[ch]/bufH[ch]
 // slices), so -- like Add and PopReadyHeaps -- this is split across
@@ -177,11 +235,16 @@ func (a *HeapAccumulator) PrepareWrite(pol string, nSamples int) [][]complex128 
 			old := bufs[ch]
 			oldLen := len(old)
 			newLen := oldLen + nSamples
-			if cap(old) >= newLen {
+			switch {
+			case cap(old) >= newLen:
 				bufs[ch] = old[:newLen]
-			} else {
+			case newLen <= HeapLen:
+				pooled := getSampleBuffer()
+				copy(pooled, old) // no-op in the normal case: old is empty right after the previous PopReadyHeaps handoff
+				bufs[ch] = pooled[:newLen]
+			default:
 				grown := make([]complex128, newLen)
-				copy(grown, old) // no-op in the normal case: old is empty right after the previous PopReadyHeaps handoff
+				copy(grown, old)
 				bufs[ch] = grown
 			}
 			targets[ch] = bufs[ch][oldLen:newLen]

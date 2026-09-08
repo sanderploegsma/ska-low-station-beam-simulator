@@ -82,9 +82,19 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 // on a per-heap encode error — matching the old per-heap SendLoop's
 // failure granularity. A failed encode leaves that pool slot unclaimed,
 // so the next heap tried this batch reuses the same slot.
+//
+// Releases heap's sample buffers back to common.ReleaseSampleBuffers
+// either way (success or failure) — this is the last point anything
+// reads heap.VSamples/HSamples, so it's also the earliest safe point to
+// hand them back to HeapAccumulator.PrepareWrite's pool for a future
+// tick to reuse (see that method's doc comment for why this exists: it
+// avoids paying make()'s zero-fill on every fresh per-channel buffer,
+// every tick).
 func encodeHeapInto(bufs [][]byte, pool [][]byte, packetizer *SpsPacketizer, heap *common.ChannelHeap) [][]byte {
 	dst := pool[len(bufs)]
-	if err := packetizer.EncodeChannelHeapInto(dst, heap); err != nil {
+	err := packetizer.EncodeChannelHeapInto(dst, heap)
+	common.ReleaseSampleBuffers(heap)
+	if err != nil {
 		log.Printf("failed to encode heap ch=%d t=%.4f: %v", heap.ChannelID, heap.HeapStartTime, err)
 		return bufs
 	}
