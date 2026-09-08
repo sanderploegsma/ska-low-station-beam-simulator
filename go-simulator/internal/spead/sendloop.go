@@ -26,6 +26,22 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 	if batchSize < 1 {
 		batchSize = 1
 	}
+	// A pool of batchSize wire-size buffers, allocated ONCE for the life
+	// of this goroutine and reused batch after batch — see
+	// EncodeChannelHeapInto's doc comment for why this is safe:
+	// profiling a real run on the target Linux hardware found the
+	// per-heap `buf` allocation EncodeChannelHeap used to make was still
+	// a dominant cost even after every other per-heap allocation had
+	// been removed (~1.4GB/s of allocation traffic at 384 channels). A
+	// UDP send (sendmmsg included) copies each buffer into the kernel
+	// synchronously before returning, so once sender.WriteBatch(bufs)
+	// below returns, every buffer in that batch is free to reuse for the
+	// next one.
+	pool := make([][]byte, batchSize)
+	for i := range pool {
+		pool[i] = make([]byte, heapWireSizeBytes)
+	}
+
 	bufs := make([][]byte, 0, batchSize)
 	for {
 		bufs = bufs[:0]
@@ -36,7 +52,7 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 		case <-shutdown:
 			return
 		case heap := <-recv:
-			bufs = encodeHeapInto(bufs, packetizer, heap)
+			bufs = encodeHeapInto(bufs, pool, packetizer, heap)
 		}
 
 		// Then drain up to batchSize-1 more WITHOUT blocking, so a batch
@@ -45,7 +61,7 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 		for len(bufs) < batchSize {
 			select {
 			case heap := <-recv:
-				bufs = encodeHeapInto(bufs, packetizer, heap)
+				bufs = encodeHeapInto(bufs, pool, packetizer, heap)
 			default:
 				break drain
 			}
@@ -60,14 +76,17 @@ func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, s
 	}
 }
 
-// encodeHeapInto encodes heap and appends it to bufs, logging (not
-// failing the whole batch) on a per-heap encode error — matching the
-// old per-heap SendLoop's failure granularity.
-func encodeHeapInto(bufs [][]byte, packetizer *SpsPacketizer, heap *common.ChannelHeap) [][]byte {
-	encoded, err := packetizer.EncodeChannelHeap(heap)
-	if err != nil {
+// encodeHeapInto encodes heap into the next unused buffer in pool
+// (pool[len(bufs)] — always the first slot not yet claimed by this
+// batch) and appends it to bufs, logging (not failing the whole batch)
+// on a per-heap encode error — matching the old per-heap SendLoop's
+// failure granularity. A failed encode leaves that pool slot unclaimed,
+// so the next heap tried this batch reuses the same slot.
+func encodeHeapInto(bufs [][]byte, pool [][]byte, packetizer *SpsPacketizer, heap *common.ChannelHeap) [][]byte {
+	dst := pool[len(bufs)]
+	if err := packetizer.EncodeChannelHeapInto(dst, heap); err != nil {
 		log.Printf("failed to encode heap ch=%d t=%.4f: %v", heap.ChannelID, heap.HeapStartTime, err)
 		return bufs
 	}
-	return append(bufs, encoded)
+	return append(bufs, dst)
 }

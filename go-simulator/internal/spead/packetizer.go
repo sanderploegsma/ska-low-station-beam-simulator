@@ -196,17 +196,45 @@ func NewSpsPacketizer(station *common.StationConfig, sender Sender) *SpsPacketiz
 }
 
 // EncodeChannelHeap builds the raw SPEAD-64-48 heap bytes for one
-// channel — the full on-wire payload of one UDP packet. Allocates
-// EXACTLY ONCE per call (buf itself, sized to the ICD's fixed 6-item/
-// HeapLen-payload wire size) -- everything else (header, item pointers,
-// quantized V/H payload) is written directly into buf at fixed offsets,
-// never through an intermediate slice. See quantize8bitIntoPayload's doc
-// comment for why this matters: at the real per-tick heap rate, the
-// previous per-call allocations (~12 small slices/heap) were themselves
-// a dominant cost, not just quantize8bit's own math.
+// channel — the full on-wire payload of one UDP packet. Allocates a
+// fresh, exactly-once-per-call buffer; BatchSendLoop's hot path instead
+// calls EncodeChannelHeapInto against a reused buffer (see that
+// function's doc comment for why the extra allocation here matters at
+// the real per-tick heap rate) -- this wrapper exists for
+// SendChannelHeap and other one-off callers where reuse doesn't apply.
 func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, error) {
+	buf := make([]byte, heapWireSizeBytes)
+	if err := p.EncodeChannelHeapInto(buf, heap); err != nil {
+		return nil, err
+	}
+	return buf, nil
+}
+
+// EncodeChannelHeapInto builds the raw SPEAD-64-48 heap bytes for one
+// channel directly into dst (which must be exactly heapWireSizeBytes
+// long) — no allocation at all. Everything (header, item pointers,
+// quantized V/H payload) is written directly into dst at fixed offsets,
+// never through an intermediate slice.
+//
+// Profiling a real end-to-end run on the actual Linux/SR-IOV target (not
+// just this dev machine) showed EncodeChannelHeap still dominating total
+// CPU (~46-52%) even after removing the ~11 OTHER per-heap allocations
+// (see quantize8bitIntoPayload's doc comment) -- the one remaining
+// allocation (the returned buf itself) was still costing real
+// mallocgc/memclr time at the required heap rate (~1.4GB/s of allocation
+// traffic at 384 channels: ~174k heaps/sec * 8248 bytes/heap). Fixed by
+// letting BatchSendLoop supply a REUSED buffer from a small pool instead
+// -- safe because a UDP write (sendmmsg included) copies the buffer's
+// contents into the kernel synchronously before returning; once
+// BatchSender.WriteBatch returns, every buffer in that batch is free to
+// reuse for the next one, so an encode-into-a-pooled-buffer + send +
+// reuse cycle never races the actual wire send.
+func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHeap) error {
+	if len(dst) != heapWireSizeBytes {
+		return fmt.Errorf("dst must be exactly %d bytes, got %d", heapWireSizeBytes, len(dst))
+	}
 	if len(heap.VSamples) != PayloadLengthBytes/4 || len(heap.HSamples) != PayloadLengthBytes/4 {
-		return nil, fmt.Errorf("heap ch=%d: VSamples/HSamples must have length %d, got v=%d h=%d", heap.ChannelID, PayloadLengthBytes/4, len(heap.VSamples), len(heap.HSamples))
+		return fmt.Errorf("heap ch=%d: VSamples/HSamples must have length %d, got v=%d h=%d", heap.ChannelID, PayloadLengthBytes/4, len(heap.VSamples), len(heap.HSamples))
 	}
 
 	// "packet count since SKA epoch" -- count of HeapLen-sample BLOCKS
@@ -217,7 +245,7 @@ func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, err
 	// matching the fixed formula.
 	heapCounterF := math.Round(common.UnixToTAI2000Seconds(heap.HeapStartTime) / common.BlockDurationS)
 	if heapCounterF < 0 || heapCounterF > float64(speadHeapCounterMask) {
-		return nil, fmt.Errorf("heap_counter %v does not fit in the ICD's %d-bit field (top 8 bits of the 0x0001 item are reserved)", heapCounterF, speadHeapCounterBits)
+		return fmt.Errorf("heap_counter %v does not fit in the ICD's %d-bit field (top 8 bits of the 0x0001 item are reserved)", heapCounterF, speadHeapCounterBits)
 	}
 	heapCounter := uint64(heapCounterF)
 
@@ -234,20 +262,19 @@ func (p *SpsPacketizer) EncodeChannelHeap(heap *common.ChannelHeap) ([]byte, err
 		{0x3300, 0x0},
 	}
 
-	buf := make([]byte, heapWireSizeBytes)
-	writeSpeadHeader(buf[:speadHeaderSize], numHeapItems)
+	writeSpeadHeader(dst[:speadHeaderSize], numHeapItems)
 	offset := speadHeaderSize
 	for _, it := range items {
-		if err := writeSpeadItemPointer(buf[offset:offset+itemPointerBytes], it.id, it.value); err != nil {
-			return nil, err
+		if err := writeSpeadItemPointer(dst[offset:offset+itemPointerBytes], it.id, it.value); err != nil {
+			return err
 		}
 		offset += itemPointerBytes
 	}
 
-	payload := buf[heapPayloadOffset:]
+	payload := dst[heapPayloadOffset:]
 	quantize8bitIntoPayload(heap.VSamples, payload, 0, 4) // Vreal at +0, Vimag at +1 of each 4-byte sample
 	quantize8bitIntoPayload(heap.HSamples, payload, 2, 4) // Hreal at +2, Himag at +3
-	return buf, nil
+	return nil
 }
 
 // SendChannelHeap encodes heap and writes it to this packetizer's

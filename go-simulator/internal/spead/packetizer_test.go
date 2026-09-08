@@ -229,6 +229,37 @@ func TestSendChannelHeap_ErrorsWithoutSender(t *testing.T) {
 	}
 }
 
+// TestEncodeChannelHeapInto_MatchesEncodeChannelHeap guards
+// BatchSendLoop's zero-allocation hot path (EncodeChannelHeapInto,
+// writing into a reused buffer) against the allocating convenience
+// wrapper (EncodeChannelHeap) ever silently diverging.
+func TestEncodeChannelHeapInto_MatchesEncodeChannelHeap(t *testing.T) {
+	station := &common.StationConfig{StationID: 7, SubstationID: 2, SubarrayID: 3, BeamID: 5, ScanID: 99}
+	p := NewSpsPacketizer(station, nil)
+	heap := testHeap(12, 1_700_000_000.0)
+
+	want, err := p.EncodeChannelHeap(heap)
+	if err != nil {
+		t.Fatalf("EncodeChannelHeap: %v", err)
+	}
+
+	dst := make([]byte, heapWireSizeBytes)
+	if err := p.EncodeChannelHeapInto(dst, heap); err != nil {
+		t.Fatalf("EncodeChannelHeapInto: %v", err)
+	}
+	if !bytes.Equal(dst, want) {
+		t.Fatal("EncodeChannelHeapInto's output does not match EncodeChannelHeap's")
+	}
+}
+
+func TestEncodeChannelHeapInto_RejectsWrongDstLength(t *testing.T) {
+	p := NewSpsPacketizer(&common.StationConfig{StationID: 1}, nil)
+	heap := testHeap(0, 1_700_000_000.0)
+	if err := p.EncodeChannelHeapInto(make([]byte, heapWireSizeBytes-1), heap); err == nil {
+		t.Fatal("expected an error for a dst buffer of the wrong length")
+	}
+}
+
 func TestQuantize8bit_ScalesByComplexMagnitude(t *testing.T) {
 	// Both samples have magnitude 5 (3-4-5 triangle) -> scale = 127/5 =
 	// 25.4, applied per-component.
