@@ -35,6 +35,22 @@ import (
 // independent (disjoint bufV[ch]/bufH[ch] slices), so this is a direct
 // channel-range split, the same approach GenerateNextTick uses for its
 // own dominant cost.
+//
+// PopReadyHeaps hands off each channel's bufV[ch]/bufH[ch] backing array
+// directly as the outgoing ChannelHeap's VSamples/HSamples -- it does
+// NOT copy into a separate flat buffer first. An earlier version did:
+// re-profiling a real end-to-end run AFTER the goroutine-parallelization
+// above (this section) found runtime.memmove alone at 56.9% of ALL CPU
+// time, with this method's flatV/flatH copy (plus the make()/zero-fill
+// that came with it) responsible for over 14 points of that on its own
+// -- parallelizing had spread the cost across cores without eliminating
+// the redundant work, which is exactly why CPU usage rose sharply for
+// only a marginal throughput gain rather than closing the pacing gap.
+// Since TickNSamples() == HeapLen by construction (see that method's doc
+// comment on DirectSynthesisStreamer), bufV[ch]/bufH[ch] holds EXACTLY
+// HeapLen samples at the moment PopReadyHeaps runs in the real pipeline
+// -- so handing off the array Add already built (one copy, in Add's own
+// append) replaces a second full copy with a zero-copy reslice.
 type HeapAccumulator struct {
 	numChannels          int
 	obsTime              float64
@@ -153,36 +169,54 @@ func (a *HeapAccumulator) PopReadyHeaps() []*ChannelHeap {
 		heapStartTime := a.obsTime + float64(a.samplesConsumed)/a.sampleRatePerChannel
 		a.samplesConsumed += HeapLen
 
-		// One flat buffer per pol per pop iteration (2 allocations, not
-		// 2*numChannels) -- each ChannelHeap's VSamples/HSamples is a
-		// sub-slice into it, filled via a bulk copy per channel (not a
-		// per-element loop: each channel's HeapLen samples are already
-		// contiguous in bufV[ch]/bufH[ch]).
-		flatV := make([]complex128, a.numChannels*HeapLen)
-		flatH := make([]complex128, a.numChannels*HeapLen)
 		iterHeaps := make([]*ChannelHeap, a.numChannels)
+
+		// HAND OFF each channel's existing backing array as VSamples/
+		// HSamples directly -- NO copy into a separate flat buffer.
+		// Profiling a real end-to-end run (384 channels, target
+		// hardware) after the goroutine-parallelization fix above found
+		// this exact copy dominating: 56.9% of ALL CPU time was
+		// runtime.memmove, and this method's flatV/flatH copy alone
+		// (plus the make()/zero-fill that came with it) was over 14% on
+		// its own -- parallelizing spread that cost across cores but
+		// never eliminated the redundant work, which is why CPU usage
+		// went up markedly for only a slight throughput gain rather than
+		// closing the pacing gap. In the normal case (TickNSamples() ==
+		// HeapLen, true by construction -- see that method's doc
+		// comment) each bufV[ch]/bufH[ch] holds EXACTLY HeapLen samples
+		// here, so takeHeapSlice below just reslices the array Add
+		// already built (one copy, in Add's append) instead of copying
+		// it a second time.
+		takeHeapSlice := func(buf []complex128) (heapSlice, remainder []complex128) {
+			heapSlice = buf[:HeapLen:HeapLen] // 3-index: cap HeapLen so a future append by any holder can't alias into the leftover below
+			leftoverLen := len(buf) - HeapLen
+			if leftoverLen == 0 {
+				return heapSlice, nil
+			}
+			// Only reached if a caller ever delivers a tick whose
+			// nSamples doesn't evenly divide HeapLen -- not the case
+			// for DirectSynthesisStreamer today, but keep it correct
+			// rather than assuming. The old backing array is now owned
+			// by heapSlice, so the leftover must be copied OUT into a
+			// fresh array, not shifted in place.
+			remainder = make([]complex128, leftoverLen)
+			copy(remainder, buf[HeapLen:])
+			return heapSlice, remainder
+		}
 
 		forEachChannelRange(a.numWorkers, a.numChannels, func(chStart, chEnd int) {
 			for ch := chStart; ch < chEnd; ch++ {
-				copy(flatV[ch*HeapLen:(ch+1)*HeapLen], a.bufV[ch])
-				copy(flatH[ch*HeapLen:(ch+1)*HeapLen], a.bufH[ch])
+				vHeap, vRem := takeHeapSlice(a.bufV[ch])
+				hHeap, hRem := takeHeapSlice(a.bufH[ch])
+				a.bufV[ch] = vRem
+				a.bufH[ch] = hRem
 
 				iterHeaps[ch] = &ChannelHeap{
 					ChannelID:     a.channelIDMap[ch],
-					VSamples:      flatV[ch*HeapLen : (ch+1)*HeapLen],
-					HSamples:      flatH[ch*HeapLen : (ch+1)*HeapLen],
+					VSamples:      vHeap,
+					HSamples:      hHeap,
 					HeapStartTime: heapStartTime,
 				}
-
-				// Shift each channel's leftover tail down IN PLACE
-				// (reusing its backing array's capacity) rather than
-				// reallocating -- in the normal case (one HeapLen-sample
-				// tick per pop) the leftover is empty and this is a
-				// no-op.
-				remV := copy(a.bufV[ch], a.bufV[ch][HeapLen:])
-				a.bufV[ch] = a.bufV[ch][:remV]
-				remH := copy(a.bufH[ch], a.bufH[ch][HeapLen:])
-				a.bufH[ch] = a.bufH[ch][:remH]
 			}
 		})
 
