@@ -34,12 +34,21 @@ func splitmix64Hash(seed, index uint64) uint64 {
 	return z
 }
 
-// fillNoiseBank fills a (nTiles, tileNSamples, numChannels) complex128
-// bank (flat, row-major: tile i's data lives at
+// fillNoiseBank fills an nTiles-tile bank (flat: tile i's data lives at
 // bank[i*tileNSamples*numChannels : (i+1)*tileNSamples*numChannels]) of
 // independent complex Gaussian noise. NO delay applied — physically
 // correct for receiver noise, which originates locally at each station
 // after any signal-path delay would apply.
+//
+// Each tile's tileNSamples*numChannels elements are filled in plain
+// sequential order below, but GenerateNextTick later copies a whole tile
+// verbatim into its channel-major (numChannels, tileNSamples) per-tick
+// output buffer — that reinterpretation is safe with NO transpose
+// needed here, specifically because every element is an independent,
+// identically-distributed draw: which (channel, sample) position a given
+// value ends up landing on is statistically irrelevant, unlike tone's
+// per-channel structure, which does require producing (and adding into)
+// data in the right layout position by construction.
 //
 // Parallelized across goroutines, each with its own independently-seeded
 // PCG stream (derived from the base seed via splitmix64Hash, analogous to

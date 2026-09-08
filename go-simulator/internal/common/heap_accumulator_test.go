@@ -31,11 +31,14 @@ func BenchmarkHeapAccumulator_OneTickPerPop(b *testing.B) {
 	}
 }
 
+// makeChunk builds a flat, CHANNEL-MAJOR (numChannels, rows) chunk
+// (index = ch*rows+row), matching Streamer.GenerateNextTick's real
+// output layout -- see common.Streamer's doc comment.
 func makeChunk(numChannels, rows int, valueFor func(row, ch int) complex128) []complex128 {
 	chunk := make([]complex128, rows*numChannels)
-	for r := 0; r < rows; r++ {
-		for c := 0; c < numChannels; c++ {
-			chunk[r*numChannels+c] = valueFor(r, c)
+	for c := 0; c < numChannels; c++ {
+		for r := 0; r < rows; r++ {
+			chunk[c*rows+r] = valueFor(r, c)
 		}
 	}
 	return chunk

@@ -19,8 +19,18 @@ type Streamer interface {
 	// produces close to exactly one heap's worth of per-channel samples.
 	TickNSamples() int
 
-	// GenerateNextTick returns pol ("V"/"H") -> a flat, row-major
-	// (n, NumChannels()) complex128 slice (index = sample*NumChannels()+ch).
+	// GenerateNextTick returns pol ("V"/"H") -> a flat, CHANNEL-MAJOR
+	// (NumChannels(), n) complex128 slice (index = ch*n+sample) — each
+	// channel's n samples contiguous. Chosen deliberately over the more
+	// "natural" per-tick generation order (sample-major, matching a
+	// per-sample synthesis loop) because it's also HeapAccumulator's own
+	// storage order: every downstream consumer (per-channel heap
+	// encoding) wants one channel's samples contiguous, so producing
+	// that layout directly here avoids a transpose entirely instead of
+	// paying for one once per tick, once per pol, for the life of a scan
+	// (see HeapAccumulator's doc comment for the allocation/access-
+	// pattern bug this replaced, found via
+	// BenchmarkHeapAccumulator_OneTickPerPop and BenchmarkProducerTick).
 	GenerateNextTick(t float64, n int) map[string][]complex128
 }
 

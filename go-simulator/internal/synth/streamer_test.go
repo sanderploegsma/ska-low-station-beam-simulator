@@ -90,8 +90,9 @@ func TestDirectSynthesisStreamer_ToneLandsInConfiguredChannel(t *testing.T) {
 		// Energy should be concentrated in channelIdx, ~zero elsewhere.
 		for ch := 0; ch < numChannels; ch++ {
 			mag := 0.0
+			chSamples := out[ch*n : (ch+1)*n] // channel-major: this channel's samples are contiguous
 			for i := 0; i < n; i++ {
-				v := out[i*numChannels+ch]
+				v := chSamples[i]
 				mag += real(v)*real(v) + imag(v)*imag(v)
 			}
 			if ch == channelIdx {

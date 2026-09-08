@@ -186,8 +186,8 @@ func (s *DirectSynthesisStreamer) getOutputBuffer(pol string, nSamples int) []co
 // GenerateNextTick implements common.Streamer. t is the absolute epoch
 // time of this tick's first sample; nSamples is the per-channel sample
 // count for this tick (at channelOutputRate). Returns pol -> flat,
-// row-major (nSamples, numChannels) complex128 (index =
-// sample*numChannels+channel).
+// CHANNEL-MAJOR (numChannels, nSamples) complex128 (index =
+// channel*nSamples+sample) — see common.Streamer's doc comment for why.
 func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int) map[string][]complex128 {
 	tLocalRelStart := t - s.obsTimeRef
 
@@ -241,8 +241,11 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int) map[
 				log.Printf("tone freq_hz=%v maps to channel_idx=%d, outside the configured [0, %d) channel range — skipping", cfg.FreqHz, chIdx, s.numChannels)
 				continue
 			}
+			// Channel-major out: chIdx's samples are already contiguous,
+			// so this is a sequential add, not a strided one.
+			outCh := out[chIdx*nSamples : (chIdx+1)*nSamples]
 			for i, sample := range samples {
-				out[i*s.numChannels+chIdx] += sample
+				outCh[i] += sample
 			}
 		}
 
