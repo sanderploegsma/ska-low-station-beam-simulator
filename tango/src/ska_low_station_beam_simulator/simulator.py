@@ -61,13 +61,15 @@ delay-poly emulator is configured — confirm against it once available.
 from __future__ import annotations
 
 import json
+import time
 
 import grpc
-from tango import AttributeProxy, DevState, EventType
-from tango.server import Device, attribute, command, device_property, run
+import ska_tango_base.future as stb
+from ska_control_model import HealthState
+from tango import AttributeProxy, AttrQuality, EventType
+from tango.server import attribute, command, device_property, run
 
 from ska_low_station_beam_simulator.common import (
-    log,
     parse_delay_polynomial_from_attr_value,
 )
 from ska_low_station_beam_simulator.simulatorpb import (
@@ -118,25 +120,38 @@ def build_tone_source_request(spec: dict) -> simulator_pb2.ToneSourceConfig:
 # ============================================================
 
 
-class StationSimulatorDevice(Device):
-    station_id = device_property(dtype=int, default_value=1)
-    substation_id = device_property(dtype=int, default_value=0)
+class StationBeamSimulator(stb.BaseInterface):
+    station_id: int = device_property(default_value=1)  # type: ignore[assignment]
+    substation_id: int = device_property(default_value=0)  # type: ignore[assignment]
     # host:port of the Go gRPC simulator this device drives -- see
     # cmd/server's -listen flag (default matches here). Must already
     # be running with the SAME station_id/substation_id and the real CBF
     # dest_ip/dest_port (its own CLI flags now, not device properties on
     # this side -- see module docstring).
-    grpc_target = device_property(dtype=str, default_value="localhost:50051")
+    grpc_target: str = device_property(default_value="localhost:50051")  # type: ignore[assignment]
 
     def init_device(self):
         super().init_device()
         self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
-        # insecure_channel doesn't dial until the first RPC -- a
-        # misconfigured/unreachable grpc_target only surfaces once
-        # StartScan (or an attribute read) actually calls out, not here.
+
+        # insecure_channel doesn't dial until the first RPC, so we perform a
+        # GetStatus here to attempt the connection. ``_fetch_status()`` also
+        # sets the healthState attribute for us as a side-effect.
+        self.logger.info("Connecting to gRPC endpoint %s", self.grpc_target)
         self._channel = grpc.insecure_channel(self.grpc_target)
         self._stub = simulator_pb2_grpc.StationSimulatorStub(self._channel)
-        self.set_state(DevState.ON)
+        _ = self._fetch_status()
+
+        self.init_completed()
+
+    def delete_device(self):
+        try:
+            self._stub.StopScan(simulator_pb2.StopScanRequest())
+        except grpc.RpcError:
+            self.logger.exception("StopScan request failed during delete_device")
+        self._teardown_delay_subscriptions()
+        self._channel.close()
+        super().delete_device()
 
     def _make_delay_feed(self, attr_uri: str) -> None:
         """Subscribes to ``attr_uri``'s CHANGE_EVENTs and forwards every
@@ -155,7 +170,7 @@ class StationSimulatorDevice(Device):
 
         def _on_event(event):
             if event.err:
-                log.warning(
+                self.logger.warning(
                     "delay-poly attribute event error for %s: %s",
                     attr_uri,
                     event.errors,
@@ -165,8 +180,10 @@ class StationSimulatorDevice(Device):
                 poly = parse_delay_polynomial_from_attr_value(
                     event.attr_value.value, self.station_id
                 )
-            except Exception:  # noqa: BLE001
-                log.exception("failed to parse delay polynomial pushed by %s", attr_uri)
+            except Exception:
+                self.logger.exception(
+                    "failed to parse delay polynomial pushed by %s", attr_uri
+                )
                 return
             try:
                 self._stub.PushDelayUpdate(
@@ -182,20 +199,24 @@ class StationSimulatorDevice(Device):
                     )
                 )
             except grpc.RpcError:
-                log.exception(
+                self.logger.exception(
                     "failed to forward delay-poly update for %s to the gRPC simulator",
                     attr_uri,
                 )
 
+        self.logger.info("Subscribing to delay-poly attribute %s", proxy.name())
         event_id = proxy.subscribe_event(EventType.CHANGE_EVENT, _on_event)
         self._delay_subscriptions.append((proxy, event_id))
 
     def _teardown_delay_subscriptions(self):
         for proxy, event_id in self._delay_subscriptions:
+            self.logger.info("Unsubscribing from delay-poly attribute %s", proxy.name())
             try:
                 proxy.unsubscribe_event(event_id)
-            except Exception:  # noqa: BLE001
-                log.exception("failed to unsubscribe from a delay-poly attribute")
+            except Exception:
+                self.logger.exception(
+                    "failed to unsubscribe from delay-poly attribute %s", proxy.name()
+                )
         self._delay_subscriptions = []
 
     def _get_status(self) -> simulator_pb2.StatusResponse:
@@ -249,46 +270,79 @@ class StationSimulatorDevice(Device):
             tone_sources=tone_sources,
             noise=simulator_pb2.NoiseConfig(std=0.05, seed=self.station_id),
         )
+        self.logger.info(
+            "Starting scan %s with %d tone sources, obs_time=%s, duration=%s",
+            scan_request.scan_id,
+            len(scan_request.tone_sources),
+            scan_request.obs_time_epoch_s,
+            scan_request.scan_duration_s,
+        )
         try:
             response = self._stub.StartScan(scan_request)
         except grpc.RpcError as e:
             self._teardown_delay_subscriptions()
-            raise RuntimeError(f"gRPC StartScan failed: {e.details()}") from e
+            self.logger.exception("StartScan request failed")
+            raise RuntimeError(f"StartScan request failed: {e.details()}") from e
         if not response.ok:
             self._teardown_delay_subscriptions()
-            raise RuntimeError(f"gRPC StartScan rejected: {response.message}")
-        self.set_state(DevState.RUNNING)
+            msg = f"StartScan request rejected: {response.message}"
+            self.logger.warning(msg)
+            raise RuntimeError(msg)
 
     @command
     def StopScan(self):
+        self.logger.info("Stopping current scan")
         try:
             self._stub.StopScan(simulator_pb2.StopScanRequest())
         except grpc.RpcError:
-            log.exception("gRPC StopScan failed")
+            self.logger.exception("StopScan request failed")
         self._teardown_delay_subscriptions()
-        self.set_state(DevState.ON)
 
-    @attribute(dtype=int)
-    def queue_depth(self):
-        return self._get_status().queue_depth
+    @attribute
+    def scan_running(self) -> tuple[bool, float, AttrQuality]:
+        if status := self._fetch_status():
+            return status.scan_running, time.time(), AttrQuality.ATTR_VALID
 
-    @attribute(dtype=float)
-    def drift_seconds(self):
-        return self._get_status().drift_seconds
+        return False, time.time(), AttrQuality.ATTR_INVALID
 
-    @attribute(dtype=int)
-    def tick_number(self):
-        return self._get_status().tick_number
+    @attribute
+    def queue_depth(self) -> tuple[int, float, AttrQuality]:
+        if status := self._fetch_status():
+            return status.queue_depth, time.time(), AttrQuality.ATTR_VALID
 
-    def delete_device(self):
+        return 0, time.time(), AttrQuality.ATTR_INVALID
+
+    @attribute
+    def drift_seconds(self) -> tuple[float, float, AttrQuality]:
+        if status := self._fetch_status():
+            return status.drift_seconds, time.time(), AttrQuality.ATTR_VALID
+
+        return 0.0, time.time(), AttrQuality.ATTR_INVALID
+
+    @attribute
+    def tick_number(self) -> tuple[int, float, AttrQuality]:
+        if status := self._fetch_status():
+            return status.tick_number, time.time(), AttrQuality.ATTR_VALID
+
+        return 0, time.time(), AttrQuality.ATTR_INVALID
+
+    def _fetch_status(self) -> simulator_pb2.StatusResponse | None:
         try:
-            self._stub.StopScan(simulator_pb2.StopScanRequest())
-        except grpc.RpcError:
-            log.exception("gRPC StopScan failed during delete_device")
-        self._teardown_delay_subscriptions()
-        self._channel.close()
-        super().delete_device()
+            response = self._stub.GetStatus(simulator_pb2.GetStatusRequest())
+            if self.healthState != HealthState.OK:
+                self.report_health(
+                    HealthState.OK,
+                    [f"Successfully connected to {self.grpc_target}"],
+                )
+            return response
+        except grpc.RpcError as e:
+            self.logger.exception("GetStatus request failed")
+            if self.healthState != HealthState.FAILED:
+                self.report_health(
+                    HealthState.FAILED,
+                    [f"Unable to connect to {self.grpc_target}", str(e)],
+                )
 
 
 if __name__ == "__main__":
-    run((StationSimulatorDevice,))
+    run((StationBeamSimulator,))

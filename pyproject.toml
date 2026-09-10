@@ -38,6 +38,7 @@ testpaths = ["tango/tests"]
 # instead of hand-ordering imports around it in every affected file.
 [tool.ruff]
 src = ["tango/src"]
+extend-exclude = ["tango/src/ska_low_station_beam_simulator/simulatorpb"]
 
 [dependency-groups]
 dev = [

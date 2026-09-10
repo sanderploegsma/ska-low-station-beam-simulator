@@ -1,9 +1,9 @@
-"""Tests for ``StationSimulatorDevice``'s delay-poly attribute
+"""Tests for ``StationBeamSimulator``'s delay-poly attribute
 subscription wiring (``_make_delay_feed``/``_teardown_delay_subscriptions``).
 
 Doesn't stand up a real Tango device server (this codebase doesn't unit
 test that layer anywhere else either: pytango degrades ``simulator.py``
-to stub classes if unavailable, but ``StationSimulatorDevice`` itself
+to stub classes if unavailable, but ``StationBeamSimulator`` itself
 still isn't deployable without a live Tango context) or a real gRPC
 server. Instead, ``AttributeProxy``/``EventType`` are monkeypatched with
 fakes so the subscribe/unsubscribe pairing and event-handling can be
@@ -13,6 +13,7 @@ receives -- delay state lives entirely in the Go gRPC process, so a
 pushed update is verified by what got forwarded to the stub.
 """
 
+import logging
 import types
 
 import pytest
@@ -36,6 +37,9 @@ class _FakeAttributeProxy:
         self._next_id = 1
         self.unsubscribed = []
         _FakeAttributeProxy.instances.append(self)
+
+    def name(self):
+        return self.attr_uri
 
     def subscribe_event(self, event_type, callback):
         event_id = self._next_id
@@ -74,6 +78,7 @@ def _fake_device():
     ``_teardown_delay_subscriptions`` actually touch -- avoids needing a
     live Tango device server context or a live gRPC channel."""
     dev = types.SimpleNamespace()
+    dev.logger = logging.getLogger()
     dev.station_id = 1
     dev._delay_subscriptions = []
     dev._stub = _FakeStub()
@@ -94,7 +99,7 @@ def test_make_delay_feed_subscribes_and_forwards_pushed_value():
     attr_uri -- the mechanism StartScan relies on to get real delay
     polynomials into the Go simulator process."""
     dev = _fake_device()
-    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    sim.StationBeamSimulator._make_delay_feed(dev, "sys/delaypoly/1/direction0")
 
     assert len(dev._delay_subscriptions) == 1
     proxy, event_id = dev._delay_subscriptions[0]
@@ -114,7 +119,7 @@ def test_make_delay_feed_ignores_error_events(caplog):
     """A Tango event marked as an error (e.g. a connection blip) must not
     be forwarded as a delay-poly update at all."""
     dev = _fake_device()
-    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    sim.StationBeamSimulator._make_delay_feed(dev, "sys/delaypoly/1/direction0")
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(err=True, errors=["boom"]))
@@ -128,7 +133,7 @@ def test_make_delay_feed_survives_unparseable_payload():
     (which would silently kill all future updates too), and a later,
     well-formed push must still be forwarded normally afterward."""
     dev = _fake_device()
-    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    sim.StationBeamSimulator._make_delay_feed(dev, "sys/delaypoly/1/direction0")
     proxy, event_id = dev._delay_subscriptions[0]
 
     proxy.subscriptions[event_id](_FakeEvent(value="not valid json"))
@@ -145,12 +150,12 @@ def test_teardown_unsubscribes_all_and_clears_list():
     delay-attribute subscription a scan opened, not just some of them --
     required so subscriptions never leak across scans."""
     dev = _fake_device()
-    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction0")
-    sim.StationSimulatorDevice._make_delay_feed(dev, "sys/delaypoly/1/direction1")
+    sim.StationBeamSimulator._make_delay_feed(dev, "sys/delaypoly/1/direction0")
+    sim.StationBeamSimulator._make_delay_feed(dev, "sys/delaypoly/1/direction1")
     assert len(dev._delay_subscriptions) == 2
 
     proxies = [p for p, _ in dev._delay_subscriptions]
-    sim.StationSimulatorDevice._teardown_delay_subscriptions(dev)
+    sim.StationBeamSimulator._teardown_delay_subscriptions(dev)
 
     assert dev._delay_subscriptions == []
     for proxy in proxies:
@@ -173,5 +178,5 @@ def test_teardown_survives_unsubscribe_failure():
         (_FakeAttributeProxy("y"), 1),
     ]
     # must not raise even though the first proxy's unsubscribe fails
-    sim.StationSimulatorDevice._teardown_delay_subscriptions(dev)
+    sim.StationBeamSimulator._teardown_delay_subscriptions(dev)
     assert dev._delay_subscriptions == []
