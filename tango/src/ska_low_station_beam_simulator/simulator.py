@@ -62,12 +62,13 @@ from __future__ import annotations
 
 import json
 import threading
+from typing import cast
 
 import grpc
 import ska_tango_base.future as stb
 from ska_control_model import HealthState
 from tango import AttributeProxy, EnsureOmniThread, EventType
-from tango.server import command, device_property, run
+from tango.server import command, device_property
 
 from ska_low_station_beam_simulator.common import (
     parse_delay_polynomial_from_attr_value,
@@ -372,5 +373,20 @@ class StationBeamSimulator(stb.BaseInterface):
         self._teardown_delay_subscriptions()
 
 
+def main(*args: str, **kwargs: str) -> int:
+    """
+    Entry point for module.
+
+    :param args: positional arguments
+    :param kwargs: named arguments
+
+    :return: exit code
+    """
+    return cast(
+        "int",
+        StationBeamSimulator.run_server(args=args or None, **kwargs),
+    )
+
+
 if __name__ == "__main__":
-    run((StationBeamSimulator,))
+    main()
