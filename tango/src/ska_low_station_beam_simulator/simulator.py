@@ -61,13 +61,13 @@ delay-poly emulator is configured — confirm against it once available.
 from __future__ import annotations
 
 import json
-import time
+import threading
 
 import grpc
 import ska_tango_base.future as stb
 from ska_control_model import HealthState
-from tango import AttributeProxy, AttrQuality, EventType
-from tango.server import attribute, command, device_property, run
+from tango import AttributeProxy, EnsureOmniThread, EventType
+from tango.server import command, device_property, run
 
 from ska_low_station_beam_simulator.common import (
     parse_delay_polynomial_from_attr_value,
@@ -130,17 +130,38 @@ class StationBeamSimulator(stb.BaseInterface):
     # this side -- see module docstring).
     grpc_target: str = device_property(default_value="localhost:50051")  # type: ignore[assignment]
 
+    # How often WatchStatus pushes a status update, consumed by the
+    # background thread that feeds scan_running/queue_depth/
+    # drift_seconds/tick_number below. <=0 uses the Go server's own
+    # default (see WatchStatus's doc comment in api/simulator.proto).
+    status_update_interval_s: float = device_property(default_value=1.0)  # type: ignore[assignment]
+
+    scan_running_signal = stb.Signal[bool](stored=True)
+    queue_depth_signal = stb.CachingAttrSignal[int]()
+    drift_seconds_signal = stb.CachingAttrSignal[float]()
+    tick_number_signal = stb.CachingAttrSignal[int]()
+
     def init_device(self):
         super().init_device()
         self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
+        self._status_lock = threading.Lock()
+        self._last_status: simulator_pb2.StatusResponse | None = None
 
-        # insecure_channel doesn't dial until the first RPC, so we perform a
-        # GetStatus here to attempt the connection. ``_fetch_status()`` also
-        # sets the healthState attribute for us as a side-effect.
         self.logger.info("Connecting to gRPC endpoint %s", self.grpc_target)
         self._channel = grpc.insecure_channel(self.grpc_target)
         self._stub = simulator_pb2_grpc.StationSimulatorStub(self._channel)
-        _ = self._fetch_status()
+
+        # WatchStatus is a separate, long-lived RPC from the GetStatus
+        # call just above -- it lives for this device's whole lifetime
+        # (across StartScan/StopScan calls, not scoped to one scan), and
+        # gRPC multiplexes it on the same channel as ordinary unary
+        # calls, so it never blocks StartScan/StopScan/PushDelayUpdate.
+        self._watch_stop = threading.Event()
+        self._watch_thread = threading.Thread(
+            target=self._watch_status_loop,
+            name="WatchStatus",
+        )
+        self._watch_thread.start()
 
         self.init_completed()
 
@@ -150,8 +171,62 @@ class StationBeamSimulator(stb.BaseInterface):
         except grpc.RpcError:
             self.logger.exception("StopScan request failed during delete_device")
         self._teardown_delay_subscriptions()
-        self._channel.close()
+        # Signal the watcher first, then close the channel -- that's
+        # what actually unblocks WatchStatus's blocking stream iterator
+        # in _watch_status_loop, letting the thread notice _watch_stop
+        # and exit instead of retrying against a closed channel.
+        with self.allow_internal_threads():
+            self._watch_stop.set()
+            self._channel.close()
+            self._watch_thread.join(timeout=5.0)
         super().delete_device()
+
+    def _watch_status_loop(self) -> None:
+        """Background consumer of the WatchStatus stream -- kept
+        alongside on-demand GetStatus calls (``_fetch_status``), not a
+        replacement for the RPC itself: this is what lets a single
+        long-lived stream serve all four status attributes below
+        instead of each attribute read triggering its own independent
+        GetStatus round trip (see docs/history.md's note on that being
+        a deliberate-but-wasteful simplification).
+
+        Retries with a fixed backoff on any RPC error (e.g. the Go
+        process restarting) -- reporting HealthState.FAILED for the
+        duration, exactly as ``_fetch_status`` already does for GetStatus
+        failures -- rather than giving up permanently.
+        """
+        with EnsureOmniThread():
+            backoff_s = 2.0
+            while not self._watch_stop.is_set():
+                try:
+                    stream = self._stub.WatchStatus(
+                        simulator_pb2.WatchStatusRequest(
+                            update_interval_s=self.status_update_interval_s
+                        )
+                    )
+                    for response in stream:
+                        self._update_status(response)
+                        if self.healthState != HealthState.OK:
+                            self.report_health(HealthState.OK, [])
+                        if self._watch_stop.is_set():
+                            stream.cancel()
+                            break
+                except grpc.RpcError as e:
+                    if self._watch_stop.is_set():
+                        break
+                    self.logger.warning("WatchStatus stream failed, retrying: %s", e)
+                    if self.healthState != HealthState.FAILED:
+                        self.report_health(
+                            HealthState.FAILED,
+                            [f"Unable to connect to {self.grpc_target}", str(e)],
+                        )
+                    self._watch_stop.wait(backoff_s)
+
+    def _update_status(self, response: simulator_pb2.StatusResponse) -> None:
+        self.scan_running_signal = response.scan_running
+        self.queue_depth_signal = response.queue_depth
+        self.drift_seconds_signal = response.drift_seconds
+        self.tick_number_signal = response.tick_number
 
     def _make_delay_feed(self, attr_uri: str) -> None:
         """Subscribes to ``attr_uri``'s CHANGE_EVENTs and forwards every
@@ -219,8 +294,10 @@ class StationBeamSimulator(stb.BaseInterface):
                 )
         self._delay_subscriptions = []
 
-    def _get_status(self) -> simulator_pb2.StatusResponse:
-        return self._stub.GetStatus(simulator_pb2.GetStatusRequest())
+    scan_running = stb.attribute_from_signal(scan_running_signal)
+    queue_depth = stb.attribute_from_signal(queue_depth_signal)
+    drift_seconds = stb.attribute_from_signal(drift_seconds_signal)
+    tick_number = stb.attribute_from_signal(tick_number_signal)
 
     @command(
         dtype_in=str,
@@ -246,11 +323,7 @@ class StationBeamSimulator(stb.BaseInterface):
         # equally non-atomic) check-then-act race with a concurrent
         # StartScan call, which the Go server's own FailedPrecondition
         # check is the real backstop for.
-        try:
-            already_running = self._get_status().scan_running
-        except grpc.RpcError as e:
-            raise RuntimeError(f"gRPC GetStatus failed: {e.details()}") from e
-        if already_running:
+        if self.scan_running_signal:  # type: ignore
             raise RuntimeError("scan already running — call StopScan first")
 
         source_specs = args.get("source_cfgs", [])
@@ -297,51 +370,6 @@ class StationBeamSimulator(stb.BaseInterface):
         except grpc.RpcError:
             self.logger.exception("StopScan request failed")
         self._teardown_delay_subscriptions()
-
-    @attribute
-    def scan_running(self) -> tuple[bool, float, AttrQuality]:
-        if status := self._fetch_status():
-            return status.scan_running, time.time(), AttrQuality.ATTR_VALID
-
-        return False, time.time(), AttrQuality.ATTR_INVALID
-
-    @attribute
-    def queue_depth(self) -> tuple[int, float, AttrQuality]:
-        if status := self._fetch_status():
-            return status.queue_depth, time.time(), AttrQuality.ATTR_VALID
-
-        return 0, time.time(), AttrQuality.ATTR_INVALID
-
-    @attribute
-    def drift_seconds(self) -> tuple[float, float, AttrQuality]:
-        if status := self._fetch_status():
-            return status.drift_seconds, time.time(), AttrQuality.ATTR_VALID
-
-        return 0.0, time.time(), AttrQuality.ATTR_INVALID
-
-    @attribute
-    def tick_number(self) -> tuple[int, float, AttrQuality]:
-        if status := self._fetch_status():
-            return status.tick_number, time.time(), AttrQuality.ATTR_VALID
-
-        return 0, time.time(), AttrQuality.ATTR_INVALID
-
-    def _fetch_status(self) -> simulator_pb2.StatusResponse | None:
-        try:
-            response = self._stub.GetStatus(simulator_pb2.GetStatusRequest())
-            if self.healthState != HealthState.OK:
-                self.report_health(
-                    HealthState.OK,
-                    [f"Successfully connected to {self.grpc_target}"],
-                )
-            return response
-        except grpc.RpcError as e:
-            self.logger.exception("GetStatus request failed")
-            if self.healthState != HealthState.FAILED:
-                self.report_health(
-                    HealthState.FAILED,
-                    [f"Unable to connect to {self.grpc_target}", str(e)],
-                )
 
 
 if __name__ == "__main__":

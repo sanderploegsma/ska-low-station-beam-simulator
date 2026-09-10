@@ -589,6 +589,53 @@ func (*GetStatusRequest) Descriptor() ([]byte, []int) {
 	return file_simulator_proto_rawDescGZIP(), []int{9}
 }
 
+type WatchStatusRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// How often to push a StatusResponse. <= 0 means "use the server's
+	// default interval" -- callers that just want "some reasonable
+	// cadence" don't need to know that default's value.
+	UpdateIntervalS float64 `protobuf:"fixed64,1,opt,name=update_interval_s,json=updateIntervalS,proto3" json:"update_interval_s,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *WatchStatusRequest) Reset() {
+	*x = WatchStatusRequest{}
+	mi := &file_simulator_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchStatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchStatusRequest) ProtoMessage() {}
+
+func (x *WatchStatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_simulator_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchStatusRequest.ProtoReflect.Descriptor instead.
+func (*WatchStatusRequest) Descriptor() ([]byte, []int) {
+	return file_simulator_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *WatchStatusRequest) GetUpdateIntervalS() float64 {
+	if x != nil {
+		return x.UpdateIntervalS
+	}
+	return 0
+}
+
 type StatusResponse struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
 	ScanRunning bool                   `protobuf:"varint,1,opt,name=scan_running,json=scanRunning,proto3" json:"scan_running,omitempty"`
@@ -609,7 +656,7 @@ type StatusResponse struct {
 
 func (x *StatusResponse) Reset() {
 	*x = StatusResponse{}
-	mi := &file_simulator_proto_msgTypes[10]
+	mi := &file_simulator_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -621,7 +668,7 @@ func (x *StatusResponse) String() string {
 func (*StatusResponse) ProtoMessage() {}
 
 func (x *StatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_simulator_proto_msgTypes[10]
+	mi := &file_simulator_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -634,7 +681,7 @@ func (x *StatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
 func (*StatusResponse) Descriptor() ([]byte, []int) {
-	return file_simulator_proto_rawDescGZIP(), []int{10}
+	return file_simulator_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *StatusResponse) GetScanRunning() bool {
@@ -707,19 +754,22 @@ const file_simulator_proto_rawDesc = "" +
 	"polynomial\")\n" +
 	"\x17PushDelayUpdateResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\"\x12\n" +
-	"\x10GetStatusRequest\"\x9a\x01\n" +
+	"\x10GetStatusRequest\"@\n" +
+	"\x12WatchStatusRequest\x12*\n" +
+	"\x11update_interval_s\x18\x01 \x01(\x01R\x0fupdateIntervalS\"\x9a\x01\n" +
 	"\x0eStatusResponse\x12!\n" +
 	"\fscan_running\x18\x01 \x01(\bR\vscanRunning\x12\x1f\n" +
 	"\vqueue_depth\x18\x02 \x01(\x05R\n" +
 	"queueDepth\x12#\n" +
 	"\rdrift_seconds\x18\x03 \x01(\x01R\fdriftSeconds\x12\x1f\n" +
 	"\vtick_number\x18\x04 \x01(\x03R\n" +
-	"tickNumber2\xd6\x02\n" +
+	"tickNumber2\xa7\x03\n" +
 	"\x10StationSimulator\x12L\n" +
 	"\tStartScan\x12\x1e.simulator.v1.StartScanRequest\x1a\x1f.simulator.v1.StartScanResponse\x12I\n" +
 	"\bStopScan\x12\x1d.simulator.v1.StopScanRequest\x1a\x1e.simulator.v1.StopScanResponse\x12^\n" +
 	"\x0fPushDelayUpdate\x12$.simulator.v1.PushDelayUpdateRequest\x1a%.simulator.v1.PushDelayUpdateResponse\x12I\n" +
-	"\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponseBJZHgithub.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpbb\x06proto3"
+	"\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponse\x12O\n" +
+	"\vWatchStatus\x12 .simulator.v1.WatchStatusRequest\x1a\x1c.simulator.v1.StatusResponse0\x01BJZHgithub.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpbb\x06proto3"
 
 var (
 	file_simulator_proto_rawDescOnce sync.Once
@@ -733,7 +783,7 @@ func file_simulator_proto_rawDescGZIP() []byte {
 	return file_simulator_proto_rawDescData
 }
 
-var file_simulator_proto_msgTypes = make([]protoimpl.MessageInfo, 11)
+var file_simulator_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_simulator_proto_goTypes = []any{
 	(*DelayPolynomial)(nil),         // 0: simulator.v1.DelayPolynomial
 	(*ToneSourceConfig)(nil),        // 1: simulator.v1.ToneSourceConfig
@@ -745,7 +795,8 @@ var file_simulator_proto_goTypes = []any{
 	(*PushDelayUpdateRequest)(nil),  // 7: simulator.v1.PushDelayUpdateRequest
 	(*PushDelayUpdateResponse)(nil), // 8: simulator.v1.PushDelayUpdateResponse
 	(*GetStatusRequest)(nil),        // 9: simulator.v1.GetStatusRequest
-	(*StatusResponse)(nil),          // 10: simulator.v1.StatusResponse
+	(*WatchStatusRequest)(nil),      // 10: simulator.v1.WatchStatusRequest
+	(*StatusResponse)(nil),          // 11: simulator.v1.StatusResponse
 }
 var file_simulator_proto_depIdxs = []int32{
 	1,  // 0: simulator.v1.StartScanRequest.tone_sources:type_name -> simulator.v1.ToneSourceConfig
@@ -755,12 +806,14 @@ var file_simulator_proto_depIdxs = []int32{
 	5,  // 4: simulator.v1.StationSimulator.StopScan:input_type -> simulator.v1.StopScanRequest
 	7,  // 5: simulator.v1.StationSimulator.PushDelayUpdate:input_type -> simulator.v1.PushDelayUpdateRequest
 	9,  // 6: simulator.v1.StationSimulator.GetStatus:input_type -> simulator.v1.GetStatusRequest
-	4,  // 7: simulator.v1.StationSimulator.StartScan:output_type -> simulator.v1.StartScanResponse
-	6,  // 8: simulator.v1.StationSimulator.StopScan:output_type -> simulator.v1.StopScanResponse
-	8,  // 9: simulator.v1.StationSimulator.PushDelayUpdate:output_type -> simulator.v1.PushDelayUpdateResponse
-	10, // 10: simulator.v1.StationSimulator.GetStatus:output_type -> simulator.v1.StatusResponse
-	7,  // [7:11] is the sub-list for method output_type
-	3,  // [3:7] is the sub-list for method input_type
+	10, // 7: simulator.v1.StationSimulator.WatchStatus:input_type -> simulator.v1.WatchStatusRequest
+	4,  // 8: simulator.v1.StationSimulator.StartScan:output_type -> simulator.v1.StartScanResponse
+	6,  // 9: simulator.v1.StationSimulator.StopScan:output_type -> simulator.v1.StopScanResponse
+	8,  // 10: simulator.v1.StationSimulator.PushDelayUpdate:output_type -> simulator.v1.PushDelayUpdateResponse
+	11, // 11: simulator.v1.StationSimulator.GetStatus:output_type -> simulator.v1.StatusResponse
+	11, // 12: simulator.v1.StationSimulator.WatchStatus:output_type -> simulator.v1.StatusResponse
+	8,  // [8:13] is the sub-list for method output_type
+	3,  // [3:8] is the sub-list for method input_type
 	3,  // [3:3] is the sub-list for extension type_name
 	3,  // [3:3] is the sub-list for extension extendee
 	0,  // [0:3] is the sub-list for field type_name
@@ -777,7 +830,7 @@ func file_simulator_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_simulator_proto_rawDesc), len(file_simulator_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   11,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

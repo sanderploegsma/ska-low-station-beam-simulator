@@ -246,6 +246,14 @@ func (s *Server) PushDelayUpdate(ctx context.Context, req *pb.PushDelayUpdateReq
 
 // GetStatus implements pb.StationSimulatorServer.
 func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.StatusResponse, error) {
+	return s.snapshotStatus(), nil
+}
+
+// snapshotStatus builds one point-in-time StatusResponse, shared by
+// GetStatus and WatchStatus. Only ever holds s.mu long enough to
+// snapshot scanRunner -- never across a Send -- so a long-lived
+// WatchStatus stream never blocks StartScan/StopScan/PushDelayUpdate.
+func (s *Server) snapshotStatus() *pb.StatusResponse {
 	s.mu.Lock()
 	runner := s.scanRunner
 	running := runner != nil && runner.IsRunning()
@@ -266,5 +274,39 @@ func (s *Server) GetStatus(ctx context.Context, req *pb.GetStatusRequest) (*pb.S
 		QueueDepth:   int32(s.sendQueue.Len()),
 		DriftSeconds: drift,
 		TickNumber:   tickNumber,
-	}, nil
+	}
+}
+
+// DefaultWatchStatusInterval is used when a WatchStatusRequest doesn't
+// specify update_interval_s (or specifies a non-positive value).
+const DefaultWatchStatusInterval = time.Second
+
+// WatchStatus implements pb.StationSimulatorServer, pushing a
+// StatusResponse every update_interval_s until the caller
+// cancels/disconnects. Intended to live for as long as the caller wants
+// updates (e.g. the Tango device server's lifetime) -- independent of,
+// and never blocking, StartScan/StopScan/PushDelayUpdate, which gRPC
+// multiplexes on the same channel as ordinary concurrent unary calls.
+func (s *Server) WatchStatus(req *pb.WatchStatusRequest, stream pb.StationSimulator_WatchStatusServer) error {
+	interval := DefaultWatchStatusInterval
+	if req.UpdateIntervalS > 0 {
+		interval = time.Duration(req.UpdateIntervalS * float64(time.Second))
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	ctx := stream.Context()
+	for {
+		if err := stream.Send(s.snapshotStatus()); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.shutdown:
+			return nil
+		case <-ticker.C:
+		}
+	}
 }

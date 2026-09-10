@@ -34,6 +34,7 @@ const (
 	StationSimulator_StopScan_FullMethodName        = "/simulator.v1.StationSimulator/StopScan"
 	StationSimulator_PushDelayUpdate_FullMethodName = "/simulator.v1.StationSimulator/PushDelayUpdate"
 	StationSimulator_GetStatus_FullMethodName       = "/simulator.v1.StationSimulator/GetStatus"
+	StationSimulator_WatchStatus_FullMethodName     = "/simulator.v1.StationSimulator/WatchStatus"
 )
 
 // StationSimulatorClient is the client API for StationSimulator service.
@@ -54,6 +55,20 @@ type StationSimulatorClient interface {
 	PushDelayUpdate(ctx context.Context, in *PushDelayUpdateRequest, opts ...grpc.CallOption) (*PushDelayUpdateResponse, error)
 	// Point-in-time status — mirrors simulator.py's queue_depth attribute.
 	GetStatus(ctx context.Context, in *GetStatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
+	// Server-streaming status: pushes a StatusResponse every
+	// update_interval_s until the caller cancels/disconnects. Prototype
+	// alternative to polling GetStatus once per Tango attribute (see
+	// docs/history.md's "one independent GetStatus RPC per attribute"
+	// note) — kept alongside GetStatus rather than replacing it, since a
+	// plain unary call is still the simpler shape for one-off checks
+	// (e.g. StartScan's already-running check) and ad hoc tooling.
+	// Independent of StartScan/StopScan/PushDelayUpdate: gRPC multiplexes
+	// RPCs on one channel, so those calls are never blocked by an open
+	// WatchStatus stream, and the stream is expected to live for as long
+	// as the caller wants updates -- e.g. the Tango device server's
+	// lifetime -- surviving across StartScan/StopScan calls rather than
+	// being scoped to one scan.
+	WatchStatus(ctx context.Context, in *WatchStatusRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StatusResponse], error)
 }
 
 type stationSimulatorClient struct {
@@ -104,6 +119,25 @@ func (c *stationSimulatorClient) GetStatus(ctx context.Context, in *GetStatusReq
 	return out, nil
 }
 
+func (c *stationSimulatorClient) WatchStatus(ctx context.Context, in *WatchStatusRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StatusResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &StationSimulator_ServiceDesc.Streams[0], StationSimulator_WatchStatus_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchStatusRequest, StatusResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StationSimulator_WatchStatusClient = grpc.ServerStreamingClient[StatusResponse]
+
 // StationSimulatorServer is the server API for StationSimulator service.
 // All implementations must embed UnimplementedStationSimulatorServer
 // for forward compatibility.
@@ -122,6 +156,20 @@ type StationSimulatorServer interface {
 	PushDelayUpdate(context.Context, *PushDelayUpdateRequest) (*PushDelayUpdateResponse, error)
 	// Point-in-time status — mirrors simulator.py's queue_depth attribute.
 	GetStatus(context.Context, *GetStatusRequest) (*StatusResponse, error)
+	// Server-streaming status: pushes a StatusResponse every
+	// update_interval_s until the caller cancels/disconnects. Prototype
+	// alternative to polling GetStatus once per Tango attribute (see
+	// docs/history.md's "one independent GetStatus RPC per attribute"
+	// note) — kept alongside GetStatus rather than replacing it, since a
+	// plain unary call is still the simpler shape for one-off checks
+	// (e.g. StartScan's already-running check) and ad hoc tooling.
+	// Independent of StartScan/StopScan/PushDelayUpdate: gRPC multiplexes
+	// RPCs on one channel, so those calls are never blocked by an open
+	// WatchStatus stream, and the stream is expected to live for as long
+	// as the caller wants updates -- e.g. the Tango device server's
+	// lifetime -- surviving across StartScan/StopScan calls rather than
+	// being scoped to one scan.
+	WatchStatus(*WatchStatusRequest, grpc.ServerStreamingServer[StatusResponse]) error
 	mustEmbedUnimplementedStationSimulatorServer()
 }
 
@@ -143,6 +191,9 @@ func (UnimplementedStationSimulatorServer) PushDelayUpdate(context.Context, *Pus
 }
 func (UnimplementedStationSimulatorServer) GetStatus(context.Context, *GetStatusRequest) (*StatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetStatus not implemented")
+}
+func (UnimplementedStationSimulatorServer) WatchStatus(*WatchStatusRequest, grpc.ServerStreamingServer[StatusResponse]) error {
+	return status.Error(codes.Unimplemented, "method WatchStatus not implemented")
 }
 func (UnimplementedStationSimulatorServer) mustEmbedUnimplementedStationSimulatorServer() {}
 func (UnimplementedStationSimulatorServer) testEmbeddedByValue()                          {}
@@ -237,6 +288,17 @@ func _StationSimulator_GetStatus_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _StationSimulator_WatchStatus_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchStatusRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(StationSimulatorServer).WatchStatus(m, &grpc.GenericServerStream[WatchStatusRequest, StatusResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type StationSimulator_WatchStatusServer = grpc.ServerStreamingServer[StatusResponse]
+
 // StationSimulator_ServiceDesc is the grpc.ServiceDesc for StationSimulator service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -261,6 +323,12 @@ var StationSimulator_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _StationSimulator_GetStatus_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchStatus",
+			Handler:       _StationSimulator_WatchStatus_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "simulator.proto",
 }

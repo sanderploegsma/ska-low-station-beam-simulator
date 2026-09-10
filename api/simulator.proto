@@ -32,6 +32,21 @@ service StationSimulator {
 
   // Point-in-time status — mirrors simulator.py's queue_depth attribute.
   rpc GetStatus(GetStatusRequest) returns (StatusResponse);
+
+  // Server-streaming status: pushes a StatusResponse every
+  // update_interval_s until the caller cancels/disconnects. Prototype
+  // alternative to polling GetStatus once per Tango attribute (see
+  // docs/history.md's "one independent GetStatus RPC per attribute"
+  // note) — kept alongside GetStatus rather than replacing it, since a
+  // plain unary call is still the simpler shape for one-off checks
+  // (e.g. StartScan's already-running check) and ad hoc tooling.
+  // Independent of StartScan/StopScan/PushDelayUpdate: gRPC multiplexes
+  // RPCs on one channel, so those calls are never blocked by an open
+  // WatchStatus stream, and the stream is expected to live for as long
+  // as the caller wants updates -- e.g. the Tango device server's
+  // lifetime -- surviving across StartScan/StopScan calls rather than
+  // being scoped to one scan.
+  rpc WatchStatus(WatchStatusRequest) returns (stream StatusResponse);
 }
 
 // Per ska-low-csp-delaymodel/1.0 (ADR-88 in ska-telmodel) — see
@@ -90,6 +105,13 @@ message PushDelayUpdateResponse {
 }
 
 message GetStatusRequest {}
+
+message WatchStatusRequest {
+  // How often to push a StatusResponse. <= 0 means "use the server's
+  // default interval" -- callers that just want "some reasonable
+  // cadence" don't need to know that default's value.
+  double update_interval_s = 1;
+}
 
 message StatusResponse {
   bool scan_running = 1;
