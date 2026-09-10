@@ -89,9 +89,11 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}},prefix=go-simulator-v
-            type=sha
+            type=semver
+            type=sha,prefix=0.1.0-dev.c,format=short
             type=raw,value=latest,enable={{is_default_branch}}
+        env:
+          DOCKER_METADATA_SHORT_SHA_LENGTH: 8
 
       # Pull requests build (to catch a broken Dockerfile/build early)
       # but never push -- publishing only happens from main/tags.
