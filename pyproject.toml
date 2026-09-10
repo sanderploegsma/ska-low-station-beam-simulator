@@ -10,6 +10,9 @@ dependencies = [
     "ska-tango-base>=1.7.0",
 ]
 
+[project.scripts]
+station_beam_simulator_device_server = "ska_low_station_beam_simulator.simulator:main"
+
 [[tool.uv.index]]
 name = "skao"
 url = "https://artefact.skao.int/repository/pypi-internal/simple"
