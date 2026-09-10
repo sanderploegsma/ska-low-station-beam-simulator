@@ -109,6 +109,7 @@ func NewServer(stationID, substationID int32, destIP string, destPort int, sourc
 // goroutine (the equivalent of Python's sender_loop). Call once before
 // serving gRPC traffic.
 func (s *Server) Start() error {
+	log.Println("server starting")
 	var localAddr *net.UDPAddr
 	if s.sourceInterface != "" {
 		ip, err := netutil.InterfaceIPv4Addr(s.sourceInterface)
@@ -133,6 +134,7 @@ func (s *Server) Start() error {
 
 // Stop stops any running scan and the sender goroutines.
 func (s *Server) Stop() {
+	log.Println("server stopping")
 	s.mu.Lock()
 	if s.scanRunner != nil {
 		s.scanRunner.Stop(5 * time.Second)
@@ -204,6 +206,7 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 		s.senderPool.SetQuantizeScale(streamer.QuantizeScale())
 	}
 
+	log.Printf("starting scan %d with %d tone sources and %d channels (subarray=%d beam=%d)", req.ScanId, len(req.ToneSources), req.NumChannels, req.SubarrayId, req.BeamId)
 	s.delayFeeds = delayFeeds
 	s.scanRunner = common.NewScanRunner(streamer, s.sendQueue, req.ObsTimeEpochS, req.ScanDurationS)
 	s.scanRunner.Start()
@@ -217,6 +220,7 @@ func (s *Server) StopScan(ctx context.Context, req *pb.StopScanRequest) (*pb.Sto
 	runner := s.scanRunner
 	s.mu.Unlock()
 	if runner != nil {
+		log.Println("stopping current scan")
 		runner.Stop(5 * time.Second)
 	}
 	return &pb.StopScanResponse{Ok: true}, nil
@@ -234,6 +238,7 @@ func (s *Server) PushDelayUpdate(ctx context.Context, req *pb.PushDelayUpdateReq
 	if req.Polynomial == nil {
 		return nil, status.Error(codes.InvalidArgument, "polynomial is required")
 	}
+	log.Printf("received delay polynomial for source %q: start=%v validity=%v coeffs=%v offset=%v", req.SourceId, req.Polynomial.StartValiditySec, req.Polynomial.ValidityPeriodSec, req.Polynomial.XypolCoeffsNs, req.Polynomial.YpolOffsetNs)
 	feed.Update(&common.DelayPolynomial{
 		StationID:         req.Polynomial.StationId,
 		StartValiditySec:  req.Polynomial.StartValiditySec,

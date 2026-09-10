@@ -149,6 +149,7 @@ type SenderPool struct {
 // BatchSendLoop per socket pulling heaps off recv until shutdown is
 // closed.
 func NewSenderPool(station *common.StationConfig, recv <-chan *common.ChannelHeap, localAddr, destAddr *net.UDPAddr, n, sndBufBytes, batchSize int, shutdown <-chan struct{}) (*SenderPool, error) {
+	log.Printf("starting %d SPEAD/UDP sender goroutines to %s (local %s, SO_SNDBUF=%d, batch size %d)", n, destAddr, localAddr, sndBufBytes, batchSize)
 	conns, err := UDPSenderSockets(localAddr, destAddr, n, sndBufBytes)
 	if err != nil {
 		return nil, err
