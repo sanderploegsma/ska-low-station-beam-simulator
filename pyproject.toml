@@ -11,7 +11,7 @@ dependencies = [
 ]
 
 [project.scripts]
-station_beam_simulator_device_server = "ska_low_station_beam_simulator.simulator:main"
+stationbeamsimulator = "ska_low_station_beam_simulator.simulator:main"
 
 [[tool.uv.index]]
 name = "skao"
