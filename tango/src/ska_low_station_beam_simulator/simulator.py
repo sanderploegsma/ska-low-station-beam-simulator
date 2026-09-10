@@ -136,7 +136,7 @@ class StationBeamSimulator(stb.BaseInterface):
     # default (see WatchStatus's doc comment in api/simulator.proto).
     status_update_interval_s: float = device_property(default_value=1.0)  # type: ignore[assignment]
 
-    scan_running_signal = stb.Signal[bool](stored=True)
+    scan_running_signal = stb.Signal[bool](stored=True, initial_value=False)
     queue_depth_signal = stb.CachingAttrSignal[int]()
     drift_seconds_signal = stb.CachingAttrSignal[float]()
     tick_number_signal = stb.CachingAttrSignal[int]()
@@ -145,7 +145,6 @@ class StationBeamSimulator(stb.BaseInterface):
         super().init_device()
         self._delay_subscriptions: list[tuple[AttributeProxy, int]] = []
         self._status_lock = threading.Lock()
-        self._last_status: simulator_pb2.StatusResponse | None = None
 
         self.logger.info("Connecting to gRPC endpoint %s", self.grpc_target)
         self._channel = grpc.insecure_channel(self.grpc_target)
@@ -375,7 +374,7 @@ class StationBeamSimulator(stb.BaseInterface):
 def main(*args, **kwargs):
     return run(
         classes=(StationBeamSimulator,),
-        args=args,
+        args=args or None,
         **kwargs,
     )
 
