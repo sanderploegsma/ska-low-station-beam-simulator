@@ -1,0 +1,22 @@
+apiVersion: v2
+name: ska-low-station-beam-simulator-test-parent
+description: Test parent for the SKA Low station beam simulator backend and Tango device server.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: ska-low-station-beam-simulator
+    repository: "file://../ska-low-station-beam-simulator"
+    version: 0.1.0
+  - name: ska-low-station-beam-simulator-tango
+    repository: "file://../ska-low-station-beam-simulator-tango"
+    version: 0.1.0
+  - name: ska-tango-base
+    repository: https://artefact.skao.int/repository/helm-internal
+    version: 1.1.1
+  - name: ska-tango-tangogql-ariadne
+    repository: https://artefact.skao.int/repository/helm-internal
+    version: 1.0.10
+  - name: ska-tango-taranta
+    repository: https://artefact.skao.int/repository/helm-internal
+    version: 2.18.5

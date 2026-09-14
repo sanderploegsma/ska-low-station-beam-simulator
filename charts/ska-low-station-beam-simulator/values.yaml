@@ -17,7 +17,7 @@ image:
   # Defaults to "latest", published by .github/workflows/go-simulator-docker.yml
   # on every push to main. Pin to a go-simulator-vX.Y.Z tag for anything
   # beyond local/dev use.
-  tag: sha-7a7e981
+  tag: latest
 
 imagePullSecrets: []
 nameOverride: ""
@@ -28,10 +28,10 @@ fullnameOverride: ""
 # properties (see go-simulator/cmd/server's flags, which these values
 # are passed through as).
 simulator:
-  stationId: 1
+  stationIds: [1]
   substationId: 0
-  destIp: "192.168.200.2"
-  destPort: 1234
+  destIp: 127.0.0.1
+  destPort: 4660
   # gRPC control-plane port -- the container's -listen flag and the
   # Service's targetPort both derive from this.
   grpcPort: 50051
@@ -45,7 +45,7 @@ simulator:
   # Multus-attached NIC's address normally comes from an IPAM pool
   # assigned at pod start, not a fixed value. Leave empty to use the
   # OS's default outbound interface/address selection.
-  sourceInterface: net1
+  # sourceInterface: net1
 
 serviceAccount:
   # Whether a ServiceAccount should be created.
@@ -55,11 +55,7 @@ serviceAccount:
   # name is generated using the fullname template.
   name: ""
 
-podAnnotations:
-  # Attaches the secondary NIC (Multus), which appears inside the pod as
-  # net1 -- see simulator.sourceInterface above, which tells the
-  # container to bind its outbound SPEAD/UDP socket to it.
-  k8s.v1.cni.cncf.io/networks: kube-system/cbf-sdp-1
+podAnnotations: {}
 podLabels: {}
 
 podSecurityContext:

@@ -21,3 +21,6 @@ CLAUDE.local.md
 # `python -m ska_low_station_beam_simulator.generate_pulsar_catalog`, or
 # as an OCI image build step -- see CLAUDE.md's Pulsar catalog section.
 tango/src/ska_low_station_beam_simulator/pulsar_catalog_data/
+
+# Helm-generated
+charts/*/charts/

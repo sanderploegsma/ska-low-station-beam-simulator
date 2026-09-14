@@ -1,0 +1,84 @@
+display: ":0"
+xauthority: "~/.Xauthority"
+
+system: SW-infrastructure
+subsystem: ska-low-csp
+telescope: SKA-low
+
+labels:
+  app: ska-low-station-beam-simulator
+
+global:
+  minikube: true
+  tango_host: databaseds-tango-base-test:10000
+  cluster_domain: cluster.local
+  retry:
+    - "--tries=10"
+    - "--sleep=5"
+  DEBUG: 5678
+
+ska-tango-devices:
+  domain: low-csp
+  subsystem: testware
+  labels:
+    app: ska-low-station-beam-simulator
+
+  deviceServerTypes:
+    stationbeamsimulator:
+      metadata:
+        component: station-beam-simulator
+      image:
+        registry: ghcr.io/sanderploegsma/ska-low-station-beam-simulator
+        name: tango-device-server
+        pullPolicy: IfNotPresent
+      command: stationbeamsimulator
+      resources:
+        requests:
+          cpu: 500m
+          memory: 500Mi
+        limits:
+          cpu: 1
+          memory: 1Gi
+      livenessProbe:
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        timeoutSeconds: 3
+        successThreshold: 1
+        failureThreshold: 3
+      readinessProbe:
+        initialDelaySeconds: 0
+        periodSeconds: 10
+        timeoutSeconds: 3
+        successThreshold: 1
+        failureThreshold: 3
+
+  # deviceDefaults:
+  #   StationBeamSimulator:
+  #     substation_id: 0
+  #     status_update_interval_s: 1
+
+  # devices:
+  #   StationBeamSimulator:
+  #     testware/station-beam-simulator/345:
+  #       station_id: 345
+  #       grpc_target: station-beam-simulator-345:50051
+  #     testware/station-beam-simulator/412:
+  #       station_id: 412
+  #       grpc_target: station-beam-simulator-412:50051
+
+  # deviceServers:
+  #   stationbeamsimulator:
+  #     "345":
+  #       expose: true
+  #       annotations: {}
+  #       nodeSelector: {}
+  #       devices:
+  #         StationBeamSimulator:
+  #         - testware/station-beam-simulator/345
+  #     "412":
+  #       expose: true
+  #       annotations: {}
+  #       nodeSelector: {}
+  #       devices:
+  #         StationBeamSimulator:
+  #         - testware/station-beam-simulator/412

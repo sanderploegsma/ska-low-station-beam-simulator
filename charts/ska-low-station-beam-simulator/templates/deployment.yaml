@@ -1,0 +1,78 @@
+{{- range $_, $s := .Values.simulator.stationIds }}
+{{- $stationId := $s | int }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ska-low-station-beam-simulator.fullname" $ }}-{{ printf "%03d" $stationId }}
+  labels:
+    {{- include "ska-low-station-beam-simulator.labels" $ | nindent 4 }}
+    station-beam-simulator.skao.int/station-id: {{ $stationId | quote }}
+spec:
+  replicas: {{ $.Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ska-low-station-beam-simulator.selectorLabels" $ | nindent 6 }}
+      station-beam-simulator.skao.int/station-id: {{ $stationId | quote }}
+  template:
+    metadata:
+      {{- with $.Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "ska-low-station-beam-simulator.labels" $ | nindent 8 }}
+        station-beam-simulator.skao.int/station-id: {{ $stationId | quote }}
+        {{- with $.Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with $.Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "ska-low-station-beam-simulator.serviceAccountName" $ }}
+      securityContext:
+        {{- toYaml $.Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ $.Chart.Name }}
+          securityContext:
+            {{- toYaml $.Values.securityContext | nindent 12 }}
+          image: "{{ $.Values.image.repository }}:{{ $.Values.image.tag | default $.Chart.AppVersion }}"
+          imagePullPolicy: {{ $.Values.image.pullPolicy }}
+          args:
+            - -listen=:{{ $.Values.simulator.grpcPort }}
+            - -station-id={{ $stationId }}
+            - -substation-id={{ $.Values.simulator.substationId }}
+            - -dest-ip={{ $.Values.simulator.destIp }}
+            - -dest-port={{ $.Values.simulator.destPort }}
+            {{- if $.Values.simulator.sourceInterface }}
+            - -spead-interface={{ $.Values.simulator.sourceInterface }}
+            {{- end }}
+          ports:
+            - name: grpc
+              containerPort: {{ $.Values.simulator.grpcPort }}
+              protocol: TCP
+          {{- with $.Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $.Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml $.Values.resources | nindent 12 }}
+      {{- with $.Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $.Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

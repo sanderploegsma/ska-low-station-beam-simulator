@@ -1,0 +1,18 @@
+dependencies:
+- name: ska-low-station-beam-simulator
+  repository: file://../ska-low-station-beam-simulator
+  version: 0.1.0
+- name: ska-low-station-beam-simulator-tango
+  repository: file://../ska-low-station-beam-simulator-tango
+  version: 0.1.0
+- name: ska-tango-base
+  repository: https://artefact.skao.int/repository/helm-internal
+  version: 1.1.1
+- name: ska-tango-tangogql-ariadne
+  repository: https://artefact.skao.int/repository/helm-internal
+  version: 1.0.10
+- name: ska-tango-taranta
+  repository: https://artefact.skao.int/repository/helm-internal
+  version: 2.18.5
+digest: sha256:ed39a836fbdc763bd5504238f32efdfe606cc96d1ed297371162760f4cd9d44f
+generated: "2026-09-10T11:54:49.546592+02:00"

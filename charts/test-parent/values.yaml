@@ -1,0 +1,55 @@
+global:
+  tango_host: tangodb:10000
+  cluster_domain: cluster.internal.dspsi
+  exposeAllDS: true
+  operator: true
+  sub-system:
+    ska-tango-base:
+      enabled: false
+  minikube: false
+
+ska-low-station-beam-simulator:
+  image:
+    tag: 0.1.0-dev.ca815ddb2
+
+  simulator:
+    stationIds: [345, 346]
+    destIp: 192.168.200.2
+    sourceInterface: net1
+
+  podAnnotations:
+    k8s.v1.cni.cncf.io/networks: kube-system/cbf-sdp-1
+
+ska-low-station-beam-simulator-tango:
+  ska-tango-devices:
+    deviceServerTypes:
+      stationbeamsimulator:
+        image:
+          tag: 0.1.0-dev.ce7500290
+
+    devices:
+      StationBeamSimulator:
+        testware/station-beam-simulator/345:
+          station_id: 345
+          grpc_target: sbs-ska-low-station-beam-simulator-345:50051
+        testware/station-beam-simulator/346:
+          station_id: 346
+          grpc_target: sbs-ska-low-station-beam-simulator-346:50051
+
+    deviceServers:
+      stationbeamsimulator:
+        stn-345:
+          devices:
+            StationBeamSimulator:
+              - testware/station-beam-simulator/345
+        stn-346:
+          devices:
+            StationBeamSimulator:
+              - testware/station-beam-simulator/346
+
+ska-tango-base:
+  deviceServersEnabled: false
+
+ska-tango-tangogql-ariadne:
+  ska-tango-base:
+    enabled: false

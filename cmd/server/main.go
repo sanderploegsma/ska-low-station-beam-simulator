@@ -22,7 +22,7 @@ func main() {
 	stationID := flag.Int("station-id", 1, "this pod's station ID")
 	substationID := flag.Int("substation-id", 0, "this pod's substation ID")
 	destIP := flag.String("dest-ip", "127.0.0.1", "CBF SPEAD/UDP destination IP")
-	destPort := flag.Int("dest-port", 8000, "CBF SPEAD/UDP destination port")
+	destPort := flag.Int("dest-port", 4660, "CBF SPEAD/UDP destination port")
 	sourceInterface := flag.String("spead-interface", "", "network interface to bind the outbound SPEAD/UDP socket to (e.g. net1 for a Multus-attached secondary NIC); empty leaves this to the OS's default route selection")
 	numSenders := flag.Int("sender-goroutines", server.DefaultNumSenders, "number of parallel UDP sender sockets/goroutines for outbound SPEAD/UDP")
 	sendBatchSize := flag.Int("send-batch-size", server.DefaultSendBatchSize, "max heaps per batched UDP send (uses sendmmsg on Linux)")

@@ -1,0 +1,10 @@
+apiVersion: v2
+name: ska-low-station-beam-simulator-tango
+description: Tango device server for the SKA Low station beam simulator backend.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: ska-tango-devices
+    version: 0.16.2
+    repository: https://artefact.skao.int/repository/helm-internal
