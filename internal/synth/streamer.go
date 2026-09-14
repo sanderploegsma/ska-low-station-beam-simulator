@@ -379,6 +379,12 @@ func (s *DirectSynthesisStreamer) QuantizeScale() float64 {
 // benefit.
 func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst map[string][][]complex64) {
 	tLocalRelStart := t - s.obsTimeRef
+	// Delay polynomials arrive over the wire TAI2000-relative (per
+	// ska-low-csp-delaymodel/1.0, ADR-88), NOT Unix-epoch-relative like t
+	// -- see common.DelayFeed.Get's doc comment. Converted once here so
+	// polyTRelStart below isn't a ~9.4e8s Unix/TAI2000 offset dressed up
+	// as a small tick-relative time.
+	tTAI2000 := common.UnixToTAI2000Seconds(t)
 
 	pols := [...]struct {
 		pol       string
@@ -408,7 +414,7 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst 
 		}
 		for _, cfg := range s.toneCfgs {
 			poly := cfg.DelayFeed.Get(t)
-			polyTRelStart := t - poly.StartValiditySec
+			polyTRelStart := tTAI2000 - poly.StartValiditySec
 
 			chIdx, samples := synthToneChannel(
 				cfg.FreqHz,

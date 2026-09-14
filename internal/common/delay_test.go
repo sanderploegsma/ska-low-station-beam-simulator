@@ -2,14 +2,20 @@ package common
 
 import "testing"
 
+// unixNowForTest is an arbitrary Unix-epoch "current time" used to build
+// realistic wire-format polynomials in these tests: StartValiditySec is
+// TAI2000-relative, so it's derived via UnixToTAI2000Seconds rather than
+// reused directly as a Unix timestamp (see EvalDelaySeconds's doc comment).
+const unixNowForTest = 1_700_000_000.0
+
 func TestDelayPolynomial_EvalDelaySeconds_VPol(t *testing.T) {
 	p := &DelayPolynomial{
-		StartValiditySec: 1000.0,
+		StartValiditySec: UnixToTAI2000Seconds(unixNowForTest),
 		XYPolCoeffsNs:    []float64{10.0, 2.0}, // 10 + 2*t_rel (ns)
 		YPolOffsetNs:     5.0,
 	}
-	// t_rel = 1002 - 1000 = 2 -> tau_ns = 10 + 2*2 = 14
-	got := p.EvalDelaySeconds(1002.0, "V")
+	// t_rel = 2s after StartValiditySec -> tau_ns = 10 + 2*2 = 14
+	got := p.EvalDelaySeconds(unixNowForTest+2.0, "V")
 	want := 14.0 * 1e-9
 	if diff := got - want; diff > 1e-15 || diff < -1e-15 {
 		t.Fatalf("EvalDelaySeconds(V) = %v, want %v", got, want)
@@ -18,11 +24,11 @@ func TestDelayPolynomial_EvalDelaySeconds_VPol(t *testing.T) {
 
 func TestDelayPolynomial_EvalDelaySeconds_HPolAddsOffset(t *testing.T) {
 	p := &DelayPolynomial{
-		StartValiditySec: 1000.0,
+		StartValiditySec: UnixToTAI2000Seconds(unixNowForTest),
 		XYPolCoeffsNs:    []float64{10.0},
 		YPolOffsetNs:     5.0,
 	}
-	got := p.EvalDelaySeconds(1000.0, "H")
+	got := p.EvalDelaySeconds(unixNowForTest, "H")
 	want := 15.0 * 1e-9 // 10 (poly) + 5 (ypol offset)
 	if diff := got - want; diff > 1e-15 || diff < -1e-15 {
 		t.Fatalf("EvalDelaySeconds(H) = %v, want %v", got, want)
@@ -51,6 +57,30 @@ func TestDelayFeed_ExpiredWarningDoesNotChangeReturnedPolynomial(t *testing.T) {
 		if got != poly {
 			t.Fatalf("Get(%v) after expiry returned a different polynomial, want the same stale one", t2)
 		}
+	}
+}
+
+func TestDelayFeed_GetComparesExpiryAgainstTAI2000NotUnixEpoch(t *testing.T) {
+	feed := NewDelayFeed("src")
+	// A realistic wire-format polynomial: StartValiditySec/ValidityPeriodSec
+	// are TAI2000-relative (per ska-low-csp-delaymodel/1.0), so they sit
+	// ~9.4e8 below a same-instant Unix timestamp. Get is called with the
+	// Unix-epoch t the rest of this codebase uses everywhere else -- if Get
+	// compared it to ValidUntil() without converting, this poly would look
+	// expired (and warn) from the instant it's installed, ~9.4e8s "early".
+	const unixNow = 1_700_000_000.0
+	startValidityTAI2000 := UnixToTAI2000Seconds(unixNow)
+	poly := &DelayPolynomial{StartValiditySec: startValidityTAI2000, ValidityPeriodSec: 100.0, XYPolCoeffsNs: []float64{1.0}}
+	feed.Update(poly)
+
+	feed.Get(unixNow + 50.0) // still well within the 100s validity window
+	if feed.hasWarnedStaleValidity {
+		t.Fatalf("Get treated a not-yet-expired real (TAI2000-relative) polynomial as expired — expiry check is comparing mismatched epochs")
+	}
+
+	feed.Get(unixNow + 150.0) // now genuinely past the 100s validity window
+	if !feed.hasWarnedStaleValidity {
+		t.Fatalf("Get did not flag a genuinely expired polynomial as stale")
 	}
 }
 

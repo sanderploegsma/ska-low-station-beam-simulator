@@ -17,20 +17,28 @@ type DelayPolynomial struct {
 	YPolOffsetNs      float64
 }
 
-// ValidUntil is the absolute epoch time this polynomial stops being
-// current.
+// ValidUntil is the TAI2000-relative time this polynomial stops being
+// current, per the ska-low-csp-delaymodel/1.0 wire schema (ADR-88):
+// StartValiditySec/ValidityPeriodSec arrive from CBF's real delay-poly
+// device in TAI2000 seconds, not Unix epoch seconds — see
+// UnixToTAI2000Seconds, and DelayFeed.Get, which converts before
+// comparing against this.
 func (p *DelayPolynomial) ValidUntil() float64 {
 	return p.StartValiditySec + p.ValidityPeriodSec
 }
 
-// EvalDelaySeconds evaluates this polynomial at absolute epoch time t,
-// for polarisation "V" or "H" ("H" adds YPolOffsetNs). IMPORTANT:
-// evaluated relative to StartValiditySec, NOT raw absolute epoch time — a
-// high-order polynomial loses float64 precision otherwise; every kernel
-// in this port takes a small-magnitude relative time for the same
-// reason (see docs/history.md for the bug this works around).
+// EvalDelaySeconds evaluates this polynomial at absolute Unix epoch time
+// t, for polarisation "V" or "H" ("H" adds YPolOffsetNs). IMPORTANT:
+// evaluated relative to StartValiditySec, NOT raw t — a high-order
+// polynomial loses float64 precision otherwise; every kernel in this
+// port takes a small-magnitude relative time for the same reason (see
+// docs/history.md for the bug this works around). t is first converted
+// to TAI2000 since StartValiditySec arrives TAI2000-relative over the
+// wire (see ValidUntil's doc comment) — subtracting it from a raw Unix t
+// would reintroduce that same precision-collapse bug via a ~9.4e8s
+// epoch offset instead of a genuinely small relative time.
 func (p *DelayPolynomial) EvalDelaySeconds(t float64, pol string) float64 {
-	tRel := t - p.StartValiditySec
+	tRel := UnixToTAI2000Seconds(t) - p.StartValiditySec
 	tauXNs := 0.0
 	power := 1.0
 	for _, c := range p.XYPolCoeffsNs {
@@ -59,8 +67,9 @@ var zeroDelayCoeffsNs = []float64{0.0}
 //   - No polynomial received yet -> zero delay, warned ONCE (not every
 //     tick) — a reasonable default for "hasn't started publishing yet"
 //     rather than blocking scan start on an external device being up.
-//   - Polynomial expired (t >= ValidUntil()) with no replacement arrived
-//     -> keep applying it as-is, warned once per staleness episode.
+//   - Polynomial expired (t, converted to TAI2000, >= ValidUntil()) with
+//     no replacement arrived -> keep applying it as-is, warned once per
+//     staleness episode.
 //     Recovering from a stalled upstream publisher is explicitly NOT
 //     this simulator's job.
 type DelayFeed struct {
@@ -88,8 +97,15 @@ func (f *DelayFeed) Update(poly *DelayPolynomial) {
 	f.mu.Unlock()
 }
 
-// Get returns the polynomial currently in effect at time t.
+// Get returns the polynomial currently in effect at time t, an absolute
+// Unix epoch second. Expiry is judged against TAI2000, per ValidUntil's
+// doc comment, so t is converted once here rather than compared directly
+// against the TAI2000-relative StartValiditySec/ValidityPeriodSec that
+// arrived over the wire — comparing raw would silently and permanently
+// treat every real polynomial as expired (or not), off by the
+// Unix/TAI2000 epoch offset, not by actual staleness.
 func (f *DelayFeed) Get(t float64) *DelayPolynomial {
+	tTAI2000 := UnixToTAI2000Seconds(t)
 	p := f.poly.Load()
 	if p == nil {
 		f.mu.Lock()
@@ -100,16 +116,16 @@ func (f *DelayFeed) Get(t float64) *DelayPolynomial {
 		f.mu.Unlock()
 		return &DelayPolynomial{
 			StationID:         -1,
-			StartValiditySec:  t,
+			StartValiditySec:  tTAI2000,
 			ValidityPeriodSec: math.Inf(1),
 			XYPolCoeffsNs:     zeroDelayCoeffsNs,
 			YPolOffsetNs:      0.0,
 		}
 	}
-	if validUntil := p.ValidUntil(); t >= validUntil {
+	if validUntil := p.ValidUntil(); tTAI2000 >= validUntil {
 		f.mu.Lock()
 		if !f.hasWarnedStaleValidity || f.warnedStaleValidUntil != validUntil {
-			log.Printf("delay source %q polynomial expired at t=%.3f (valid_until=%.3f) with no replacement received yet — continuing to apply the expired coefficients", f.name, t, validUntil)
+			log.Printf("delay source %q polynomial expired at t=%.3f TAI2000 (valid_until=%.3f TAI2000) with no replacement received yet — continuing to apply the expired coefficients", f.name, tTAI2000, validUntil)
 			f.warnedStaleValidUntil = validUntil
 			f.hasWarnedStaleValidity = true
 		}
