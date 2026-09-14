@@ -356,12 +356,14 @@ class StationBeamSimulator(stb.BaseInterface):
             scan_id=int(args["scan_id"]),
             subarray_id=int(args["subarray_id"]),
             beam_id=int(args["beam_id"]),
+            num_channels=int(args.get("num_channels", 384)),
             tone_sources=tone_sources,
             noise=simulator_pb2.NoiseConfig(std=0.05, seed=self.station_id),
         )
         self.logger.info(
-            "Starting scan %s with %d tone sources, obs_time=%s, duration=%s",
+            "Starting scan %s with %d channels, %d tone sources, obs_time=%s, duration=%s",
             scan_request.scan_id,
+            scan_request.num_channels,
             len(scan_request.tone_sources),
             scan_request.obs_time_epoch_s,
             scan_request.scan_duration_s,
