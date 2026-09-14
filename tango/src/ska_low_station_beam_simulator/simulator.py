@@ -243,6 +243,9 @@ class StationBeamSimulator(stb.BaseInterface):
         proxy = AttributeProxy(attr_uri)
 
         def _on_event(event):
+            self.logger.debug(
+                "Received delay-poly attribute event for %s: %s", attr_uri, event
+            )
             if event.err:
                 self.logger.warning(
                     "delay-poly attribute event error for %s: %s",
@@ -250,16 +253,18 @@ class StationBeamSimulator(stb.BaseInterface):
                     event.errors,
                 )
                 return
-            try:
-                poly = parse_delay_polynomial_from_attr_value(
-                    event.attr_value.value, self.station_id
-                )
-            except Exception:
-                self.logger.exception(
-                    "failed to parse delay polynomial pushed by %s", attr_uri
-                )
+
+            poly = parse_delay_polynomial_from_attr_value(
+                event.attr_value.value, self.station_id
+            )
+            if poly is None:
                 return
             try:
+                self.logger.info(
+                    "Pushing delay-poly update with validity [%f, %f]",
+                    poly.start_validity_sec,
+                    poly.start_validity_sec + poly.validity_period_sec,
+                )
                 self._stub.PushDelayUpdate(
                     simulator_pb2.PushDelayUpdateRequest(
                         source_id=attr_uri,
@@ -294,9 +299,21 @@ class StationBeamSimulator(stb.BaseInterface):
         self._delay_subscriptions = []
 
     scan_running = stb.attribute_from_signal(scan_running_signal)
-    queue_depth = stb.attribute_from_signal(queue_depth_signal)
-    drift_seconds = stb.attribute_from_signal(drift_seconds_signal)
-    tick_number = stb.attribute_from_signal(tick_number_signal)
+    queue_depth = stb.attribute_from_signal(
+        queue_depth_signal,
+        abs_change=1,
+        archive_abs_change=1,
+    )
+    drift_seconds = stb.attribute_from_signal(
+        drift_seconds_signal,
+        abs_change=1e-3,
+        archive_abs_change=1e-3,
+    )
+    tick_number = stb.attribute_from_signal(
+        tick_number_signal,
+        abs_change=1,
+        archive_abs_change=1,
+    )
 
     @command(
         dtype_in=str,

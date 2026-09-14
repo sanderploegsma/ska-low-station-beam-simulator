@@ -45,9 +45,12 @@ extend-exclude = ["tango/src/ska_low_station_beam_simulator/simulatorpb"]
 
 [dependency-groups]
 dev = [
+    "assertpy>=1.1",
     "coverage>=7.16.0",
     "grpcio-tools>=1.83.1",
     "pytest>=9.1.1",
     "pytest-cov>=7.1.0",
+    "pytest-forked>=1.7.5",
     "ruff>=0.16.5",
+    "ska-tango-testing>=0.10.0",
 ]
