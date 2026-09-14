@@ -159,6 +159,7 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 	s.stationCfg.SubarrayID = req.SubarrayId
 	s.stationCfg.BeamID = req.BeamId
 	s.stationCfg.ScanID = req.ScanId
+	s.stationCfg.StartChannel = req.StartChannel
 
 	// Fresh delay feeds per scan -- a source_id from a previous scan
 	// must not silently keep receiving updates meant for a different
@@ -187,11 +188,12 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 	}
 
 	streamer, err := synth.NewDirectSynthesisStreamer(synth.StreamerConfig{
-		Station:     s.stationCfg,
-		ToneSources: toneCfgs,
-		ObsTimeRef:  req.ObsTimeEpochS,
-		Noise:       noiseCfg,
-		NumChannels: int(req.NumChannels),
+		Station:      s.stationCfg,
+		ToneSources:  toneCfgs,
+		ObsTimeRef:   req.ObsTimeEpochS,
+		Noise:        noiseCfg,
+		NumChannels:  int(req.NumChannels),
+		StartChannel: int(req.StartChannel),
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -206,7 +208,7 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 		s.senderPool.SetQuantizeScale(streamer.QuantizeScale())
 	}
 
-	log.Printf("starting scan %d with %d tone sources and %d channels (subarray=%d beam=%d)", req.ScanId, len(req.ToneSources), req.NumChannels, req.SubarrayId, req.BeamId)
+	log.Printf("starting scan %d with %d tone sources and %d channels starting at channel %d (subarray=%d beam=%d)", req.ScanId, len(req.ToneSources), streamer.NumChannels(), streamer.StartChannel(), req.SubarrayId, req.BeamId)
 	s.delayFeeds = delayFeeds
 	s.scanRunner = common.NewScanRunner(streamer, s.sendQueue, req.ObsTimeEpochS, req.ScanDurationS)
 	s.scanRunner.Start()

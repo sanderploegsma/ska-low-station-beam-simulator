@@ -63,6 +63,7 @@ func TestServer_StartScanThenGetStatusReportsRunning(t *testing.T) {
 		SubarrayId:    1,
 		BeamId:        1,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 		Noise:         &pb.NoiseConfig{Std: 0.05, Seed: 42},
 	})
 	if err != nil {
@@ -102,6 +103,7 @@ func TestServer_StartScanTwiceWithoutStopFails(t *testing.T) {
 		ObsTimeEpochS: 1_700_000_000.0,
 		ScanDurationS: 1000 * common.BlockDurationS,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 	}
 	if _, err := client.StartScan(ctx, req); err != nil {
 		t.Fatalf("first StartScan: %v", err)
@@ -130,6 +132,23 @@ func TestServer_StartScanRejectsInvalidNumChannels(t *testing.T) {
 	}
 }
 
+func TestServer_StartScanRejectsInvalidStartChannel(t *testing.T) {
+	client, _, cleanup := newTestClient(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := client.StartScan(ctx, &pb.StartScanRequest{
+		ObsTimeEpochS: 1_700_000_000.0,
+		ScanDurationS: common.BlockDurationS,
+		NumChannels:   8,
+		StartChannel:  common.ChannelStart + common.MaxNumChannels, // 448+8 > 64+MaxNumChannels
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("got err=%v, want InvalidArgument", err)
+	}
+}
+
 func TestServer_StartScanRejectsToneSourceWithoutSourceID(t *testing.T) {
 	client, _, cleanup := newTestClient(t)
 	defer cleanup()
@@ -140,6 +159,7 @@ func TestServer_StartScanRejectsToneSourceWithoutSourceID(t *testing.T) {
 		ObsTimeEpochS: 1_700_000_000.0,
 		ScanDurationS: common.BlockDurationS,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 		ToneSources:   []*pb.ToneSourceConfig{{FreqHz: 60e6, Amplitude: 1.0}}, // no SourceId
 	})
 	if status.Code(err) != codes.InvalidArgument {
@@ -157,6 +177,7 @@ func TestServer_PushDelayUpdateForUnknownSourceFails(t *testing.T) {
 		ObsTimeEpochS: 1_700_000_000.0,
 		ScanDurationS: 1000 * common.BlockDurationS,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 		ToneSources:   []*pb.ToneSourceConfig{{SourceId: "tone-a", FreqHz: 60e6, Amplitude: 1.0}},
 	}); err != nil {
 		t.Fatalf("StartScan: %v", err)
@@ -182,6 +203,7 @@ func TestServer_PushDelayUpdateForKnownSourceSucceeds(t *testing.T) {
 		ObsTimeEpochS: 1_700_000_000.0,
 		ScanDurationS: 1000 * common.BlockDurationS,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 		ToneSources:   []*pb.ToneSourceConfig{{SourceId: "tone-a", FreqHz: 60e6, Amplitude: 1.0}},
 	}); err != nil {
 		t.Fatalf("StartScan: %v", err)
@@ -259,6 +281,7 @@ func TestServer_WatchStatusDoesNotBlockOtherRPCs(t *testing.T) {
 		ObsTimeEpochS: 1_700_000_000.0,
 		ScanDurationS: 1000 * common.BlockDurationS,
 		NumChannels:   8,
+		StartChannel:  common.ChannelStart,
 		ToneSources:   []*pb.ToneSourceConfig{{SourceId: "tone-a", FreqHz: 60e6, Amplitude: 1.0}},
 	}); err != nil {
 		t.Fatalf("StartScan while WatchStatus stream open: %v", err)

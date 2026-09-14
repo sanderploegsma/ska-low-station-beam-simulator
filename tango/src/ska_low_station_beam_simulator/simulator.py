@@ -319,14 +319,21 @@ class StationBeamSimulator(stb.BaseInterface):
         dtype_in=str,
         doc_in=(
             "JSON object: {obs_time_epoch_s, scan_duration_s, scan_id, "
-            "subarray_id, beam_id, source_cfgs}. source_cfgs is a JSON "
-            "list -- EVERY entry MUST include 'delay_attr_uri' naming a "
-            "Tango attribute on CBF's delay-poly emulator to subscribe "
-            "for that source's own delay polynomial (there is no "
-            "default delay -- see module docstring), and MUST have "
-            "kind='tone' (the gRPC simulator backend doesn't support "
-            "'pulsed' sources yet). An empty list means no tone sources "
-            "at all for this scan (noise still plays)."
+            "subarray_id, beam_id, source_cfgs, start_channel, "
+            "num_channels}. source_cfgs is a JSON list -- EVERY entry "
+            "MUST include 'delay_attr_uri' naming a Tango attribute on "
+            "CBF's delay-poly emulator to subscribe for that source's own "
+            "delay polynomial (there is no default delay -- see module "
+            "docstring), and MUST have kind='tone' (the gRPC simulator "
+            "backend doesn't support 'pulsed' sources yet). An empty list "
+            "means no tone sources at all for this scan (noise still "
+            "plays). start_channel is REQUIRED: a GLOBAL coarse channel "
+            "ID -- the same channel numbering CBF/SPS use, where the "
+            "band's first channel is 64 (50MHz), not a 0-based offset. "
+            "num_channels defaults to 384 (the full band). Combined, "
+            "they select a sub-band: e.g. start_channel=64, "
+            "num_channels=384 covers the full band (channels 64-447 "
+            "inclusive); start_channel+num_channels must not exceed 448."
         ),
     )
     def StartScan(self, args_json):
@@ -357,13 +364,16 @@ class StationBeamSimulator(stb.BaseInterface):
             subarray_id=int(args["subarray_id"]),
             beam_id=int(args["beam_id"]),
             num_channels=int(args.get("num_channels", 384)),
+            start_channel=int(args["start_channel"]),
             tone_sources=tone_sources,
             noise=simulator_pb2.NoiseConfig(std=0.05, seed=self.station_id),
         )
         self.logger.info(
-            "Starting scan %s with %d channels, %d tone sources, obs_time=%s, duration=%s",
+            "Starting scan %s with %d channels starting at channel %d, "
+            "%d tone sources, obs_time=%s, duration=%s",
             scan_request.scan_id,
             scan_request.num_channels,
+            scan_request.start_channel,
             len(scan_request.tone_sources),
             scan_request.obs_time_epoch_s,
             scan_request.scan_duration_s,

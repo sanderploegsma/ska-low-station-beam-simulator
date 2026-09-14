@@ -82,6 +82,17 @@ message StartScanRequest {
   int32 num_channels = 6; // 0 means "use MaxNumChannels (384)"
   repeated ToneSourceConfig tone_sources = 7;
   NoiseConfig noise = 8; // omit entirely for no noise
+  // Global coarse channel ID of the first channel this scan generates --
+  // the SAME channel numbering CBF/SPS use, where the lowest channel in
+  // the band is channel 64 (50MHz centre frequency), not a 0-based
+  // offset. Combined with num_channels, selects which sub-band of the
+  // full band this scan generates: e.g. start_channel=64,
+  // num_channels=384 covers the full band, channels 64-447 inclusive.
+  // Required -- there is no default, and 0 is not a valid channel, so
+  // an unset/zero value fails validation. Must be >= 64, and
+  // start_channel+num_channels must be <= 448 (64+MaxNumChannels) --
+  // there is no wraparound.
+  int32 start_channel = 9;
 }
 
 message StartScanResponse {

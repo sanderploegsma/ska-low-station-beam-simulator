@@ -33,10 +33,11 @@ func BenchmarkProducerTick(b *testing.B) {
 	for _, numChannels := range []int{96, 384} {
 		b.Run("channels="+strconv.Itoa(numChannels), func(b *testing.B) {
 			streamer, err := NewDirectSynthesisStreamer(StreamerConfig{
-				Station:     testStation(),
-				ObsTimeRef:  1_700_000_000.0,
-				NumChannels: numChannels,
-				Noise:       &NoiseConfig{Std: 0.05, Seed: 1},
+				Station:      testStation(),
+				ObsTimeRef:   1_700_000_000.0,
+				NumChannels:  numChannels,
+				StartChannel: common.ChannelStart,
+				Noise:        &NoiseConfig{Std: 0.05, Seed: 1},
 			})
 			if err != nil {
 				b.Fatalf("NewDirectSynthesisStreamer: %v", err)

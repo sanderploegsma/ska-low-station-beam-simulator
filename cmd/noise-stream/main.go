@@ -95,6 +95,9 @@ func main() {
 		SubarrayID:   int32(*subarrayID),
 		BeamID:       int32(*beamID),
 		ScanID:       int64(*scanID),
+		// StartChannel: common.ChannelStart -- the band's first channel,
+		// matching this tool's fixed "no sub-band selection" scope.
+		StartChannel: common.ChannelStart,
 	}
 
 	var toneSources []synth.ToneSourceConfig
@@ -119,11 +122,12 @@ func main() {
 	}
 
 	streamer, err := synth.NewDirectSynthesisStreamer(synth.StreamerConfig{
-		Station:     stationCfg,
-		ObsTimeRef:  obsTime,
-		NumChannels: *numChannels,
-		Noise:       &synth.NoiseConfig{Std: *noiseStd, Seed: seed},
-		ToneSources: toneSources,
+		Station:      stationCfg,
+		ObsTimeRef:   obsTime,
+		NumChannels:  *numChannels,
+		StartChannel: int(stationCfg.StartChannel),
+		Noise:        &synth.NoiseConfig{Std: *noiseStd, Seed: seed},
+		ToneSources:  toneSources,
 	})
 	if err != nil {
 		log.Fatalf("constructing streamer: %v", err)

@@ -1,14 +1,25 @@
 package common
 
 // StationConfig identifies a station in every heap it emits. subarray_id,
-// beam_id and scan_id vary per scan; station_id/substation_id identify
-// the pod itself.
+// beam_id, scan_id and start_channel vary per scan; station_id/
+// substation_id identify the pod itself.
 type StationConfig struct {
 	StationID    int32
 	SubstationID int32
 	SubarrayID   int32
 	BeamID       int32
 	ScanID       int64
+
+	// StartChannel: this scan's global coarse channel ID for local
+	// channel 0 -- the same numbering CBF/SPS use (band's first channel
+	// is 64), not a 0-based offset. Added to ChannelHeap.ChannelID
+	// (which stays a scan-local, 0-based index) when a wire-level global
+	// channel/frequency ID is needed. See spead.SpsPacketizer. Callers
+	// are responsible for setting this to a value that has already
+	// passed synth.DirectSynthesisStreamer's StartChannel validation
+	// (>= common.ChannelStart) -- there is no default, and a 0/unset
+	// value produces a wrong, un-validated frequency_id on the wire.
+	StartChannel int32
 }
 
 // ChannelHeap is one channel's worth of generated samples, ready for

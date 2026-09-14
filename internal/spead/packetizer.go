@@ -385,7 +385,7 @@ func (p *SpsPacketizer) EncodeChannelHeapInto(dst []byte, heap *common.ChannelHe
 		{0x0001, heapCounter, true},
 		{0x0004, PayloadLengthBytes, true},
 		{0x3010, uint64(p.station.ScanID), true},
-		{0x3000, packChannelInfo(uint32(p.station.BeamID), uint32(common.ChannelStart+heap.ChannelID)), true},
+		{0x3000, packChannelInfo(uint32(p.station.BeamID), uint32(int(p.station.StartChannel)+heap.ChannelID)), true},
 		{0x3001, packAntennaInfo(uint8(p.station.SubstationID), uint8(p.station.SubarrayID), uint16(p.station.StationID)), true},
 		// ADDRESS mode, not immediate -- see this type's ITEM LAYOUT doc
 		// comment: this is the one item that addresses the payload rather

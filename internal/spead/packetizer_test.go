@@ -83,7 +83,7 @@ func testHeap(channelID int, heapStartTime float64) *common.ChannelHeap {
 }
 
 func TestEncodeChannelHeap_ItemLayoutMatchesICD(t *testing.T) {
-	station := &common.StationConfig{StationID: 7, SubstationID: 2, SubarrayID: 3, BeamID: 5, ScanID: 99}
+	station := &common.StationConfig{StationID: 7, SubstationID: 2, SubarrayID: 3, BeamID: 5, ScanID: 99, StartChannel: common.ChannelStart}
 	p := NewSpsPacketizer(station, nil)
 
 	heap := testHeap(12, 1_700_000_000.0)
@@ -157,6 +157,30 @@ func TestEncodeChannelHeap_ItemLayoutMatchesICD(t *testing.T) {
 	}
 	if _, ok := findItem(items, 0x0001); !ok {
 		t.Fatal("missing 0x0001 heap_counter item")
+	}
+}
+
+func TestEncodeChannelHeap_FrequencyIDUsesAbsoluteStartChannel(t *testing.T) {
+	station := &common.StationConfig{StationID: 7, SubstationID: 2, SubarrayID: 3, BeamID: 5, ScanID: 99, StartChannel: 200}
+	p := NewSpsPacketizer(station, nil)
+
+	heap := testHeap(12, 1_700_000_000.0)
+	raw, err := p.EncodeChannelHeap(heap)
+	if err != nil {
+		t.Fatalf("EncodeChannelHeap: %v", err)
+	}
+
+	items, _ := decodeHeap(t, raw)
+	channelInfo, ok := findItem(items, 0x3000)
+	if !ok {
+		t.Fatal("missing 0x3000 channel_info item")
+	}
+	gotFreqID := channelInfo & 0xFFFF
+	// StartChannel is an absolute global channel ID (the same numbering
+	// CBF/SPS use), not an offset from ChannelStart -- so frequency_id is
+	// StartChannel+ChannelID directly, with no separate ChannelStart add.
+	if wantFreqID := uint64(int(station.StartChannel) + heap.ChannelID); gotFreqID != wantFreqID {
+		t.Fatalf("channel_info frequency_id = %d, want %d (StartChannel+ChannelID)", gotFreqID, wantFreqID)
 	}
 }
 

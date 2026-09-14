@@ -63,12 +63,70 @@ func TestNewDirectSynthesisStreamer_RejectsInvalidNumChannels(t *testing.T) {
 }
 
 func TestNewDirectSynthesisStreamer_ZeroNumChannelsDefaultsToMax(t *testing.T) {
-	s, err := NewDirectSynthesisStreamer(StreamerConfig{Station: testStation(), ObsTimeRef: 0})
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{Station: testStation(), ObsTimeRef: 0, StartChannel: common.ChannelStart})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if s.NumChannels() != common.MaxNumChannels {
 		t.Fatalf("NumChannels() = %d, want default %d", s.NumChannels(), common.MaxNumChannels)
+	}
+}
+
+func TestNewDirectSynthesisStreamer_RejectsInvalidStartChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		startChannel int
+		numChannels  int
+	}{
+		{"start_channel below ChannelStart", common.ChannelStart - 1, 8},
+		{"start_channel+num_channels over ChannelStart+MaxNumChannels", common.ChannelStart + common.MaxNumChannels - 7, 8},
+	} {
+		_, err := NewDirectSynthesisStreamer(StreamerConfig{
+			Station:      testStation(),
+			ObsTimeRef:   0,
+			NumChannels:  tc.numChannels,
+			StartChannel: tc.startChannel,
+		})
+		if err == nil {
+			t.Errorf("%s: expected a validation error, got none", tc.name)
+		}
+	}
+}
+
+func TestDirectSynthesisStreamer_StartChannelShiftsToneChannelPosition(t *testing.T) {
+	numChannels := 8
+	startChannel := common.ChannelStart + 16 // absolute global channel ID, like CBF/SPS use
+	localChannelIdx := 3
+	// The tone's frequency is chosen relative to the shifted band start
+	// (BaseFreqHz + (startChannel-ChannelStart) channels), so it should
+	// land at localChannelIdx within this scan's num_channels-wide band,
+	// not at the same absolute channel index as if start_channel were
+	// ChannelStart.
+	freqHz := common.BaseFreqHz + float64(startChannel-common.ChannelStart+localChannelIdx)*common.ChannelWidthHz + 500.0
+
+	feed := common.NewDelayFeed("test-tone")
+	feed.Update(&common.DelayPolynomial{
+		StartValiditySec:  0,
+		ValidityPeriodSec: 1e9,
+		XYPolCoeffsNs:     []float64{0.0},
+	})
+
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{
+		Station:      testStation(),
+		ObsTimeRef:   1000.0,
+		NumChannels:  numChannels,
+		StartChannel: startChannel,
+		ToneSources: []ToneSourceConfig{
+			{DelayFeed: feed, FreqHz: freqHz, Amplitude: 1.0},
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	complexChannels := s.ComplexPathChannelIDMap()
+	if len(complexChannels) != 1 || complexChannels[0] != localChannelIdx {
+		t.Fatalf("ComplexPathChannelIDMap() = %v, want exactly [%d]", complexChannels, localChannelIdx)
 	}
 }
 
@@ -100,9 +158,10 @@ func TestDirectSynthesisStreamer_ToneLandsInConfiguredChannel(t *testing.T) {
 	})
 
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station:     testStation(),
-		ObsTimeRef:  1000.0,
-		NumChannels: numChannels,
+		Station:      testStation(),
+		ObsTimeRef:   1000.0,
+		NumChannels:  numChannels,
+		StartChannel: common.ChannelStart,
 		ToneSources: []ToneSourceConfig{
 			{DelayFeed: feed, FreqHz: freqHz, Amplitude: 1.0},
 		},
@@ -146,9 +205,10 @@ func TestDirectSynthesisStreamer_ToneOutsideRangeIsSkippedNotFatal(t *testing.T)
 	feed.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{0.0}})
 
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station:     testStation(),
-		ObsTimeRef:  0,
-		NumChannels: 8,
+		Station:      testStation(),
+		ObsTimeRef:   0,
+		NumChannels:  8,
+		StartChannel: common.ChannelStart,
 		ToneSources: []ToneSourceConfig{
 			// Frequency far outside the configured 8-channel band.
 			{DelayFeed: feed, FreqHz: common.BaseFreqHz + 1000*common.ChannelWidthHz, Amplitude: 1.0},
@@ -188,11 +248,12 @@ func TestDirectSynthesisStreamer_NoiseIsDeterministicAcrossRepeatedCalls(t *test
 	// GenerateQuantizedHeaps (see ComplexPathChannelIDMap's doc comment),
 	// not GenerateNextTick.
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station:     testStation(),
-		ObsTimeRef:  0,
-		NumChannels: 8,
-		Noise:       &NoiseConfig{Std: 0.1, Seed: 42},
-		NTiles:      4,
+		Station:      testStation(),
+		ObsTimeRef:   0,
+		NumChannels:  8,
+		StartChannel: common.ChannelStart,
+		Noise:        &NoiseConfig{Std: 0.1, Seed: 42},
+		NTiles:       4,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -213,11 +274,12 @@ func TestDirectSynthesisStreamer_NoiseIsDeterministicAcrossRepeatedCalls(t *test
 func TestDirectSynthesisStreamer_NoiseIndependentAcrossStationSeeds(t *testing.T) {
 	buildV := func(seed int64) []byte {
 		s, err := NewDirectSynthesisStreamer(StreamerConfig{
-			Station:     testStation(),
-			ObsTimeRef:  0,
-			NumChannels: 8,
-			Noise:       &NoiseConfig{Std: 1.0, Seed: seed},
-			NTiles:      4,
+			Station:      testStation(),
+			ObsTimeRef:   0,
+			NumChannels:  8,
+			StartChannel: common.ChannelStart,
+			Noise:        &NoiseConfig{Std: 1.0, Seed: seed},
+			NTiles:       4,
 		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -248,11 +310,12 @@ func TestDirectSynthesisStreamer_VAndHNoiseDiffer(t *testing.T) {
 	// both pols, giving numerically identical "noise" for V and H. Guard
 	// against regressing that here.
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station:     testStation(),
-		ObsTimeRef:  0,
-		NumChannels: 8,
-		Noise:       &NoiseConfig{Std: 1.0, Seed: 42},
-		NTiles:      4,
+		Station:      testStation(),
+		ObsTimeRef:   0,
+		NumChannels:  8,
+		StartChannel: common.ChannelStart,
+		Noise:        &NoiseConfig{Std: 1.0, Seed: 42},
+		NTiles:       4,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -288,11 +351,12 @@ func TestDirectSynthesisStreamer_NoiseNeverDelayCorrected(t *testing.T) {
 
 	build := func(feed *common.DelayFeed) (complexV []complex64, quantizedV []byte) {
 		s, err := NewDirectSynthesisStreamer(StreamerConfig{
-			Station:     testStation(),
-			ObsTimeRef:  0,
-			NumChannels: 8,
-			Noise:       &NoiseConfig{Std: 1.0, Seed: 42},
-			NTiles:      4,
+			Station:      testStation(),
+			ObsTimeRef:   0,
+			NumChannels:  8,
+			StartChannel: common.ChannelStart,
+			Noise:        &NoiseConfig{Std: 1.0, Seed: 42},
+			NTiles:       4,
 			// Amplitude 1e-300, not 0: a literal 0.0 is treated by
 			// NewDirectSynthesisStreamer as "unset" and defaults to
 			// 1.0 (see StreamerConfig's doc comment) -- 1e-300 is
@@ -359,7 +423,7 @@ func TestGenerateQuantizedHeaps_MatchesComplexPathQuantizedWithSameFixedScale(t 
 }
 
 func TestDirectSynthesisStreamer_QuantizeScale_NoSourcesIsZero(t *testing.T) {
-	s, err := NewDirectSynthesisStreamer(StreamerConfig{Station: testStation(), ObsTimeRef: 0, NumChannels: 8})
+	s, err := NewDirectSynthesisStreamer(StreamerConfig{Station: testStation(), ObsTimeRef: 0, NumChannels: 8, StartChannel: common.ChannelStart})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -371,7 +435,7 @@ func TestDirectSynthesisStreamer_QuantizeScale_NoSourcesIsZero(t *testing.T) {
 func TestDirectSynthesisStreamer_QuantizeScale_NoiseOnlyMatchesSigmaMargin(t *testing.T) {
 	const std = 0.05
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station: testStation(), ObsTimeRef: 0, NumChannels: 8,
+		Station: testStation(), ObsTimeRef: 0, NumChannels: 8, StartChannel: common.ChannelStart,
 		Noise: &NoiseConfig{Std: std, Seed: 1},
 	})
 	if err != nil {
@@ -390,7 +454,7 @@ func TestDirectSynthesisStreamer_QuantizeScale_SumsAllToneAmplitudes(t *testing.
 	feedB.Update(&common.DelayPolynomial{StartValiditySec: 0, ValidityPeriodSec: 1e9, XYPolCoeffsNs: []float64{0.0}})
 
 	s, err := NewDirectSynthesisStreamer(StreamerConfig{
-		Station: testStation(), ObsTimeRef: 0, NumChannels: 8,
+		Station: testStation(), ObsTimeRef: 0, NumChannels: 8, StartChannel: common.ChannelStart,
 		ToneSources: []ToneSourceConfig{
 			{DelayFeed: feedA, FreqHz: common.BaseFreqHz, Amplitude: 2.0},
 			{DelayFeed: feedB, FreqHz: common.BaseFreqHz + 8*common.ChannelWidthHz, Amplitude: 3.0},

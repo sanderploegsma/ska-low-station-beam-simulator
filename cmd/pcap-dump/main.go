@@ -34,17 +34,20 @@ func main() {
 	}
 
 	obsTime := float64(time.Now().UnixNano()) / 1e9
-	stationCfg := &common.StationConfig{StationID: 1, SubstationID: 1, SubarrayID: 1, BeamID: 1, ScanID: 1}
+	// StartChannel: common.ChannelStart -- the band's first channel,
+	// matching this tool's fixed "no sub-band selection" scope.
+	stationCfg := &common.StationConfig{StationID: 1, SubstationID: 1, SubarrayID: 1, BeamID: 1, ScanID: 1, StartChannel: common.ChannelStart}
 
 	// Noise only, no tone sources: every channel then comes out of
 	// GenerateQuantizedHeaps directly, with no HeapAccumulator/ScanRunner
 	// pacing loop needed at all -- this tool has no real-time deadline to
 	// meet, it just wants N ticks' worth of heaps as fast as possible.
 	streamer, err := synth.NewDirectSynthesisStreamer(synth.StreamerConfig{
-		Station:     stationCfg,
-		ObsTimeRef:  obsTime,
-		NumChannels: *numChannels,
-		Noise:       &synth.NoiseConfig{Std: 0.05, Seed: int64(stationCfg.StationID)},
+		Station:      stationCfg,
+		ObsTimeRef:   obsTime,
+		NumChannels:  *numChannels,
+		StartChannel: int(stationCfg.StartChannel),
+		Noise:        &synth.NoiseConfig{Std: 0.05, Seed: int64(stationCfg.StationID)},
 	})
 	if err != nil {
 		log.Fatalf("constructing streamer: %v", err)

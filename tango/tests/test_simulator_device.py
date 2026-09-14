@@ -121,6 +121,7 @@ def test_scan_running_attribute_reflects_simulator_state(
                 "scan_id": 1,
                 "subarray_id": 1,
                 "beam_id": 1,
+                "start_channel": 64,
             }
         )
     )
@@ -158,6 +159,7 @@ def test_status_attributes_update_while_scanning(
                 "scan_id": 1,
                 "subarray_id": 1,
                 "beam_id": 1,
+                "start_channel": 64,
             }
         )
     )
@@ -184,6 +186,7 @@ def test_start_scan_when_already_running(simulator_device: tango.DeviceProxy):
                 "scan_id": 1,
                 "subarray_id": 1,
                 "beam_id": 1,
+                "start_channel": 64,
             }
         )
     )
@@ -198,6 +201,7 @@ def test_start_scan_when_already_running(simulator_device: tango.DeviceProxy):
                     "scan_id": 2,
                     "subarray_id": 1,
                     "beam_id": 1,
+                    "start_channel": 64,
                 }
             )
         )

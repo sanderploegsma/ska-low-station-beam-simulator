@@ -41,7 +41,16 @@ type StreamerConfig struct {
 	ObsTimeRef  float64
 	Noise       *NoiseConfig // nil for no noise at all
 
-	NumChannels    int     // 0 -> common.MaxNumChannels
+	NumChannels int // 0 -> common.MaxNumChannels
+
+	// StartChannel: global coarse channel ID (the SAME numbering
+	// CBF/SPS use -- the band's first channel is common.ChannelStart
+	// (64), not 0) of local channel 0. Required -- no default, and 0 is
+	// not a valid band channel, so an unset StartChannel fails
+	// validation rather than silently falling back to ChannelStart. Must
+	// satisfy StartChannel+NumChannels <= common.ChannelStart+common.MaxNumChannels.
+	StartChannel int
+
 	BaseFreqHz     float64 // 0 -> common.BaseFreqHz
 	ChannelWidthHz float64 // 0 -> common.ChannelWidthHz
 	NTiles         int     // 0 -> DefaultNTiles
@@ -61,6 +70,7 @@ type StreamerConfig struct {
 type DirectSynthesisStreamer struct {
 	station           *common.StationConfig
 	numChannels       int
+	startChannel      int
 	baseFreqHz        float64
 	channelWidthHz    float64
 	channelOutputRate float64
@@ -114,14 +124,26 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		)
 	}
 
-	baseFreqHz := cfg.BaseFreqHz
-	if baseFreqHz == 0 {
-		baseFreqHz = common.BaseFreqHz
+	startChannel := cfg.StartChannel
+	maxStartChannel := common.ChannelStart + common.MaxNumChannels
+	if startChannel < common.ChannelStart || startChannel+numChannels > maxStartChannel {
+		return nil, fmt.Errorf(
+			"start_channel=%d is not valid for num_channels=%d -- per the ICD, start_channel "+
+				"must be >= %d (the band's first channel), and start_channel+num_channels must "+
+				"be <= %d (the band's last channel + 1)",
+			startChannel, numChannels, common.ChannelStart, maxStartChannel,
+		)
 	}
+
 	channelWidthHz := cfg.ChannelWidthHz
 	if channelWidthHz == 0 {
 		channelWidthHz = common.ChannelWidthHz
 	}
+	baseFreqHz := cfg.BaseFreqHz
+	if baseFreqHz == 0 {
+		baseFreqHz = common.BaseFreqHz
+	}
+	baseFreqHz += float64(startChannel-common.ChannelStart) * channelWidthHz
 	channelOutputRate := channelWidthHz * common.OversamplingNumerator / common.OversamplingDenominator
 
 	toneChannelSet := make(map[int]bool, len(cfg.ToneSources))
@@ -163,6 +185,7 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 	s := &DirectSynthesisStreamer{
 		station:                   cfg.Station,
 		numChannels:               numChannels,
+		startChannel:              startChannel,
 		baseFreqHz:                baseFreqHz,
 		channelWidthHz:            channelWidthHz,
 		channelOutputRate:         channelOutputRate,
@@ -267,6 +290,10 @@ func (s *DirectSynthesisStreamer) ComplexPathChannelIDMap() []int {
 
 // NumChannels implements common.Streamer.
 func (s *DirectSynthesisStreamer) NumChannels() int { return s.numChannels }
+
+// StartChannel returns this scan's global start channel ID
+// (StreamerConfig.StartChannel, already validated).
+func (s *DirectSynthesisStreamer) StartChannel() int { return s.startChannel }
 
 // TickNSamples implements common.Streamer — HeapLen by construction
 // (BlockDurationS is defined for exactly this).

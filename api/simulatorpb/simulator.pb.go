@@ -235,6 +235,14 @@ type StartScanRequest struct {
 	NumChannels   int32                  `protobuf:"varint,6,opt,name=num_channels,json=numChannels,proto3" json:"num_channels,omitempty"` // 0 means "use MaxNumChannels (384)"
 	ToneSources   []*ToneSourceConfig    `protobuf:"bytes,7,rep,name=tone_sources,json=toneSources,proto3" json:"tone_sources,omitempty"`
 	Noise         *NoiseConfig           `protobuf:"bytes,8,opt,name=noise,proto3" json:"noise,omitempty"` // omit entirely for no noise
+	// 0-based offset, in coarse channels, from the band's first channel
+	// (global channel 64 / 50MHz). Combined with num_channels, selects
+	// which sub-band of the 384-channel band this scan generates: channel
+	// 0 of this scan is global channel 64+start_channel. Must be >= 0, and
+	// start_channel+num_channels must be <= 384 (MaxNumChannels) -- there
+	// is no wraparound. 0 (the default) starts at the band's first
+	// channel, matching this field's pre-existing absence.
+	StartChannel  int32 `protobuf:"varint,9,opt,name=start_channel,json=startChannel,proto3" json:"start_channel,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -323,6 +331,13 @@ func (x *StartScanRequest) GetNoise() *NoiseConfig {
 		return x.Noise
 	}
 	return nil
+}
+
+func (x *StartScanRequest) GetStartChannel() int32 {
+	if x != nil {
+		return x.StartChannel
+	}
+	return 0
 }
 
 type StartScanResponse struct {
@@ -730,7 +745,7 @@ const file_simulator_proto_rawDesc = "" +
 	"\tamplitude\x18\x03 \x01(\x01R\tamplitude\"3\n" +
 	"\vNoiseConfig\x12\x10\n" +
 	"\x03std\x18\x01 \x01(\x01R\x03std\x12\x12\n" +
-	"\x04seed\x18\x02 \x01(\x03R\x04seed\"\xcd\x02\n" +
+	"\x04seed\x18\x02 \x01(\x03R\x04seed\"\xf2\x02\n" +
 	"\x10StartScanRequest\x12'\n" +
 	"\x10obs_time_epoch_s\x18\x01 \x01(\x01R\robsTimeEpochS\x12&\n" +
 	"\x0fscan_duration_s\x18\x02 \x01(\x01R\rscanDurationS\x12\x17\n" +
@@ -740,7 +755,8 @@ const file_simulator_proto_rawDesc = "" +
 	"\abeam_id\x18\x05 \x01(\x05R\x06beamId\x12!\n" +
 	"\fnum_channels\x18\x06 \x01(\x05R\vnumChannels\x12A\n" +
 	"\ftone_sources\x18\a \x03(\v2\x1e.simulator.v1.ToneSourceConfigR\vtoneSources\x12/\n" +
-	"\x05noise\x18\b \x01(\v2\x19.simulator.v1.NoiseConfigR\x05noise\"=\n" +
+	"\x05noise\x18\b \x01(\v2\x19.simulator.v1.NoiseConfigR\x05noise\x12#\n" +
+	"\rstart_channel\x18\t \x01(\x05R\fstartChannel\"=\n" +
 	"\x11StartScanResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x11\n" +
