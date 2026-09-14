@@ -1,5 +1,5 @@
 global:
-  tango_host: tangodb:10000
+  tango_host: ska-low-csp-databaseds:10000
   cluster_domain: cluster.internal.dspsi
   exposeAllDS: true
   operator: true
@@ -10,10 +10,11 @@ global:
 
 ska-low-station-beam-simulator:
   image:
-    tag: 0.1.0-dev.ca815ddb2
+    tag: 0.1.0-dev.cb9e5eaa5
 
   simulator:
-    stationIds: [345, 346]
+    stationIds: [345, 431]
+    substationId: 1
     destIp: 192.168.200.2
     sourceInterface: net1
 
@@ -25,16 +26,18 @@ ska-low-station-beam-simulator-tango:
     deviceServerTypes:
       stationbeamsimulator:
         image:
-          tag: 0.1.0-dev.ce7500290
+          tag: 0.1.0-dev.cd5b5fd8e
 
     devices:
       StationBeamSimulator:
         testware/station-beam-simulator/345:
           station_id: 345
+          substation_id: 1
           grpc_target: sbs-ska-low-station-beam-simulator-345:50051
-        testware/station-beam-simulator/346:
-          station_id: 346
-          grpc_target: sbs-ska-low-station-beam-simulator-346:50051
+        testware/station-beam-simulator/431:
+          station_id: 431
+          substation_id: 1
+          grpc_target: sbs-ska-low-station-beam-simulator-431:50051
 
     deviceServers:
       stationbeamsimulator:
@@ -42,14 +45,19 @@ ska-low-station-beam-simulator-tango:
           devices:
             StationBeamSimulator:
               - testware/station-beam-simulator/345
-        stn-346:
+        stn-431:
           devices:
             StationBeamSimulator:
-              - testware/station-beam-simulator/346
+              - testware/station-beam-simulator/431
 
 ska-tango-base:
+  enabled: false
   deviceServersEnabled: false
 
 ska-tango-tangogql-ariadne:
+  enabled: false
   ska-tango-base:
     enabled: false
+
+ska-tango-taranta:
+  enabled: false

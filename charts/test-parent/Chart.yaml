@@ -14,9 +14,12 @@ dependencies:
   - name: ska-tango-base
     repository: https://artefact.skao.int/repository/helm-internal
     version: 1.1.1
+    condition: ska-tango-base.enabled
   - name: ska-tango-tangogql-ariadne
     repository: https://artefact.skao.int/repository/helm-internal
     version: 1.0.10
+    condition: ska-tango-tangogql-ariadne.enabled
   - name: ska-tango-taranta
     repository: https://artefact.skao.int/repository/helm-internal
     version: 2.18.5
+    condition: ska-tango-taranta.enabled
