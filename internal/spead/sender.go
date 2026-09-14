@@ -136,19 +136,37 @@ func UDPSenderSockets(localAddr, destAddr *net.UDPAddr, n, sndBufBytes int) ([]*
 }
 
 // SenderPool owns n UDP sockets and one BatchSendLoop goroutine per
-// socket, all draining the same heap queue in parallel — the shared
-// setup/teardown both the gRPC-served simulator and the standalone
-// noise-only CLI need around UDPSenderSockets/BatchSendLoop.
+// socket, each goroutine EXCLUSIVELY draining its own shard of queue —
+// the shared setup/teardown both the gRPC-served simulator and the
+// standalone noise-only CLI need around UDPSenderSockets/BatchSendLoop.
+//
+// One goroutine per shard (rather than every goroutine racing to drain
+// one shared channel, the previous design) is deliberate: queue routes
+// every heap for a given ChannelID to the same shard every time (see
+// common.ShardedHeapQueue), so pairing each shard with exactly one
+// socket/goroutine means a given channel's heaps always go out via the
+// same socket, in the order they were sent -- preserving per-channel
+// send order across ticks. CBF's real ingest firmware flags any
+// non-consecutive heap_counter per virtual channel (one VC = one exact
+// station/substation/subarray/beam/frequency_id tuple) as "out of
+// order" with no reordering tolerance of its own, so letting different
+// sockets race for the same channel (as a single shared queue drained by
+// N goroutines allowed) could reorder that channel's packets on the wire
+// even though nothing was actually lost. Different channels landing on
+// different shards still spreads load/flow-hash across sockets exactly
+// as before sharding.
 type SenderPool struct {
 	conns      []*net.UDPConn
 	wg         sync.WaitGroup
 	packetizer *SpsPacketizer
 }
 
-// NewSenderPool dials n sockets (see UDPSenderSockets) and starts one
-// BatchSendLoop per socket pulling heaps off recv until shutdown is
-// closed.
-func NewSenderPool(station *common.StationConfig, recv <-chan *common.ChannelHeap, localAddr, destAddr *net.UDPAddr, n, sndBufBytes, batchSize int, shutdown <-chan struct{}) (*SenderPool, error) {
+// NewSenderPool dials queue.NumShards() sockets (see UDPSenderSockets)
+// and starts one BatchSendLoop per socket, each exclusively pulling
+// heaps off its own shard of queue until shutdown is closed (see
+// SenderPool's doc comment for why per-shard exclusivity matters).
+func NewSenderPool(station *common.StationConfig, queue *common.ShardedHeapQueue, localAddr, destAddr *net.UDPAddr, sndBufBytes, batchSize int, shutdown <-chan struct{}) (*SenderPool, error) {
+	n := queue.NumShards()
 	log.Printf("starting %d SPEAD/UDP sender goroutines to %s (local %s, SO_SNDBUF=%d, batch size %d)", n, destAddr, localAddr, sndBufBytes, batchSize)
 	conns, err := UDPSenderSockets(localAddr, destAddr, n, sndBufBytes)
 	if err != nil {
@@ -161,13 +179,13 @@ func NewSenderPool(station *common.StationConfig, recv <-chan *common.ChannelHea
 	packetizer := NewSpsPacketizer(station, nil)
 
 	pool := &SenderPool{conns: conns, packetizer: packetizer}
-	for _, conn := range conns {
+	for i, conn := range conns {
 		sender := NewUDPBatchSender(conn)
 		pool.wg.Add(1)
-		go func() {
+		go func(shard int) {
 			defer pool.wg.Done()
-			BatchSendLoop(recv, packetizer, sender, shutdown, batchSize)
-		}()
+			BatchSendLoop(queue.Recv(shard), packetizer, sender, shutdown, batchSize)
+		}(i)
 	}
 	return pool, nil
 }

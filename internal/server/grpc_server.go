@@ -44,7 +44,7 @@ type Server struct {
 	scanRunner *common.ScanRunner
 	delayFeeds map[string]*common.DelayFeed
 
-	sendQueue  *common.HeapQueue
+	sendQueue  *common.ShardedHeapQueue
 	senderPool *spead.SenderPool
 	shutdown   chan struct{}
 }
@@ -96,12 +96,18 @@ func NewServer(stationID, substationID int32, destIP string, destPort int, sourc
 		numSenders:         DefaultNumSenders,
 		sendBatchSize:      DefaultSendBatchSize,
 		udpSendBufferBytes: DefaultUDPSendBufferBytes,
-		sendQueue:          common.NewHeapQueue(common.QueueMaxSize),
 		shutdown:           make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Built after opts (not in the struct literal above) since
+	// WithNumSenders may have changed s.numSenders -- one shard per
+	// sender goroutine, so the shard count has to match the FINAL
+	// numSenders (see common.ShardedHeapQueue's doc comment for why
+	// per-channel shard affinity exists at all: it's what keeps a given
+	// channel's heaps going out via the same socket, in order).
+	s.sendQueue = common.NewShardedHeapQueue(s.numSenders, common.QueueMaxSize)
 	return s
 }
 
@@ -124,7 +130,7 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("resolving SPEAD destination %s:%d: %w", s.destIP, s.destPort, err)
 	}
-	pool, err := spead.NewSenderPool(s.stationCfg, s.sendQueue.Recv(), localAddr, destAddr, s.numSenders, s.udpSendBufferBytes, s.sendBatchSize, s.shutdown)
+	pool, err := spead.NewSenderPool(s.stationCfg, s.sendQueue, localAddr, destAddr, s.udpSendBufferBytes, s.sendBatchSize, s.shutdown)
 	if err != nil {
 		return fmt.Errorf("starting SPEAD/UDP sender pool: %w", err)
 	}

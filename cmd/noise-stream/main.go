@@ -147,9 +147,9 @@ func main() {
 		log.Fatalf("resolving destination %s:%d: %v", *destIP, *destPort, err)
 	}
 
-	queue := common.NewHeapQueue(common.QueueMaxSize)
+	queue := common.NewShardedHeapQueue(*numSenders, common.QueueMaxSize)
 	shutdown := make(chan struct{})
-	pool, err := spead.NewSenderPool(stationCfg, queue.Recv(), localAddr, destAddr, *numSenders, *udpSendBufferBytes, *sendBatchSize, shutdown)
+	pool, err := spead.NewSenderPool(stationCfg, queue, localAddr, destAddr, *udpSendBufferBytes, *sendBatchSize, shutdown)
 	if err != nil {
 		log.Fatalf("starting SPEAD/UDP sender pool: %v", err)
 	}

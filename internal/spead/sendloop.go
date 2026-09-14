@@ -11,17 +11,21 @@ import (
 // call — one sendmmsg(2) syscall per batch on Linux, instead of one
 // sendto(2)-equivalent syscall per heap) until shutdown is closed.
 //
-// Any number of BatchSendLoop calls may run concurrently against the
-// SAME recv channel with no extra coordination — Go fans a channel's
-// receives out across goroutines for free — as long as each call is
-// given its OWN sender/socket (see SenderPool/UDPSenderSockets: sharing
-// one socket across goroutines would just move the bottleneck from
-// "one goroutine" to "one socket", and using separate sockets also
-// spreads outbound traffic across separate source ports, avoiding a
-// single flow-hash/RSS queue on the wire). UDP heaps carry no ordering
-// requirement CBF depends on — each heap self-identifies via its own
-// SPEAD header (scan_id/frequency_id/heap_counter) — so heaps completing
-// out of order across parallel senders is harmless.
+// recv is meant to be exclusive to this call — see SenderPool, which
+// pairs each BatchSendLoop goroutine with its own common.ShardedHeapQueue
+// shard and its own socket. That pairing matters: CBF's real ingest
+// firmware tracks, per virtual channel (one VC = one exact station/
+// substation/subarray/beam/frequency_id tuple), the last heap_counter it
+// saw and flags anything that isn't exactly +1 as "out of order," with
+// no reordering tolerance of its own. Two BatchSendLoop calls racing
+// against the SAME recv channel (an earlier version of this design) let
+// consecutive heaps for one channel go out via different sockets with no
+// ordering guarantee between them, which was enough jitter to reorder
+// that channel's packets on the wire even though nothing was lost —
+// exactly what the firmware's counter flags. Routing by channel (one
+// shard, one socket, per channel) avoids that; using several
+// shards/sockets across DIFFERENT channels for throughput is still fine
+// and is the reason SenderPool uses more than one in the first place.
 func BatchSendLoop(recv <-chan *common.ChannelHeap, packetizer *SpsPacketizer, sender BatchSender, shutdown <-chan struct{}, batchSize int) {
 	if batchSize < 1 {
 		batchSize = 1
