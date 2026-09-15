@@ -357,6 +357,7 @@ class StationBeamSimulator(stb.BaseInterface):
             self._make_delay_feed(request.source_id)
             tone_sources.append(request)
 
+        noise_std = float(args.get("noise_std", 0.05))
         scan_request = simulator_pb2.StartScanRequest(
             obs_time_epoch_s=args["obs_time_epoch_s"],
             scan_duration_s=args["scan_duration_s"],
@@ -366,17 +367,18 @@ class StationBeamSimulator(stb.BaseInterface):
             num_channels=int(args.get("num_channels", 384)),
             start_channel=int(args["start_channel"]),
             tone_sources=tone_sources,
-            noise=simulator_pb2.NoiseConfig(std=0.05, seed=self.station_id),
+            noise=simulator_pb2.NoiseConfig(std=noise_std, seed=self.station_id),
         )
         self.logger.info(
             "Starting scan %s with %d channels starting at channel %d, "
-            "%d tone sources, obs_time=%s, duration=%s",
+            "%d tone sources, obs_time=%s, duration=%s, noise_std=%s",
             scan_request.scan_id,
             scan_request.num_channels,
             scan_request.start_channel,
             len(scan_request.tone_sources),
             scan_request.obs_time_epoch_s,
             scan_request.scan_duration_s,
+            noise_std,
         )
         try:
             response = self._stub.StartScan(scan_request)
