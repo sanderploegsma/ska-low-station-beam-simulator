@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fsimulator.proto\x12\x0csimulator.v1\"\x8f\x01\n\x0f\x44\x65layPolynomial\x12\x12\n\nstation_id\x18\x01 \x01(\x05\x12\x1a\n\x12start_validity_sec\x18\x02 \x01(\x01\x12\x1b\n\x13validity_period_sec\x18\x03 \x01(\x01\x12\x17\n\x0fxypol_coeffs_ns\x18\x04 \x03(\x01\x12\x16\n\x0eypol_offset_ns\x18\x05 \x01(\x01\"I\n\x10ToneSourceConfig\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x0f\n\x07\x66req_hz\x18\x02 \x01(\x01\x12\x11\n\tamplitude\x18\x03 \x01(\x01\"(\n\x0bNoiseConfig\x12\x0b\n\x03std\x18\x01 \x01(\x01\x12\x0c\n\x04seed\x18\x02 \x01(\x03\"\x89\x02\n\x10StartScanRequest\x12\x18\n\x10obs_time_epoch_s\x18\x01 \x01(\x01\x12\x17\n\x0fscan_duration_s\x18\x02 \x01(\x01\x12\x0f\n\x07scan_id\x18\x03 \x01(\x03\x12\x13\n\x0bsubarray_id\x18\x04 \x01(\x05\x12\x0f\n\x07\x62\x65\x61m_id\x18\x05 \x01(\x05\x12\x14\n\x0cnum_channels\x18\x06 \x01(\x05\x12\x34\n\x0ctone_sources\x18\x07 \x03(\x0b\x32\x1e.simulator.v1.ToneSourceConfig\x12(\n\x05noise\x18\x08 \x01(\x0b\x32\x19.simulator.v1.NoiseConfig\x12\x15\n\rstart_channel\x18\t \x01(\x05\"0\n\x11StartScanResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x11\n\x0fStopScanRequest\"\x1e\n\x10StopScanResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\"^\n\x16PushDelayUpdateRequest\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x31\n\npolynomial\x18\x02 \x01(\x0b\x32\x1d.simulator.v1.DelayPolynomial\"%\n\x17PushDelayUpdateResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\"\x12\n\x10GetStatusRequest\"/\n\x12WatchStatusRequest\x12\x19\n\x11update_interval_s\x18\x01 \x01(\x01\"g\n\x0eStatusResponse\x12\x14\n\x0cscan_running\x18\x01 \x01(\x08\x12\x13\n\x0bqueue_depth\x18\x02 \x01(\x05\x12\x15\n\rdrift_seconds\x18\x03 \x01(\x01\x12\x13\n\x0btick_number\x18\x04 \x01(\x03\x32\xa7\x03\n\x10StationSimulator\x12L\n\tStartScan\x12\x1e.simulator.v1.StartScanRequest\x1a\x1f.simulator.v1.StartScanResponse\x12I\n\x08StopScan\x12\x1d.simulator.v1.StopScanRequest\x1a\x1e.simulator.v1.StopScanResponse\x12^\n\x0fPushDelayUpdate\x12$.simulator.v1.PushDelayUpdateRequest\x1a%.simulator.v1.PushDelayUpdateResponse\x12I\n\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponse\x12O\n\x0bWatchStatus\x12 .simulator.v1.WatchStatusRequest\x1a\x1c.simulator.v1.StatusResponse0\x01\x42JZHgithub.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0fsimulator.proto\x12\x0csimulator.v1\"\x8f\x01\n\x0f\x44\x65layPolynomial\x12\x12\n\nstation_id\x18\x01 \x01(\x05\x12\x1a\n\x12start_validity_sec\x18\x02 \x01(\x01\x12\x1b\n\x13validity_period_sec\x18\x03 \x01(\x01\x12\x17\n\x0fxypol_coeffs_ns\x18\x04 \x03(\x01\x12\x16\n\x0eypol_offset_ns\x18\x05 \x01(\x01\"I\n\x10ToneSourceConfig\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x0f\n\x07\x66req_hz\x18\x02 \x01(\x01\x12\x11\n\tamplitude\x18\x03 \x01(\x01\"(\n\x0bNoiseConfig\x12\x0b\n\x03std\x18\x01 \x01(\x01\x12\x0c\n\x04seed\x18\x02 \x01(\x03\"\x9f\x02\n\x10StartScanRequest\x12\x18\n\x10obs_time_epoch_s\x18\x01 \x01(\x01\x12\x17\n\x0fscan_duration_s\x18\x02 \x01(\x01\x12\x0f\n\x07scan_id\x18\x03 \x01(\x03\x12\x13\n\x0bsubarray_id\x18\x04 \x01(\x05\x12\x0f\n\x07\x62\x65\x61m_id\x18\x05 \x01(\x05\x12\x14\n\x0cnum_channels\x18\x06 \x01(\x05\x12\x34\n\x0ctone_sources\x18\x07 \x03(\x0b\x32\x1e.simulator.v1.ToneSourceConfig\x12(\n\x05noise\x18\x08 \x01(\x0b\x32\x19.simulator.v1.NoiseConfig\x12\x15\n\rstart_channel\x18\t \x01(\x05\x12\x14\n\x0cnegate_delay\x18\n \x01(\x08\"0\n\x11StartScanResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"\x11\n\x0fStopScanRequest\"\x1e\n\x10StopScanResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\"^\n\x16PushDelayUpdateRequest\x12\x11\n\tsource_id\x18\x01 \x01(\t\x12\x31\n\npolynomial\x18\x02 \x01(\x0b\x32\x1d.simulator.v1.DelayPolynomial\"%\n\x17PushDelayUpdateResponse\x12\n\n\x02ok\x18\x01 \x01(\x08\"\x12\n\x10GetStatusRequest\"/\n\x12WatchStatusRequest\x12\x19\n\x11update_interval_s\x18\x01 \x01(\x01\"g\n\x0eStatusResponse\x12\x14\n\x0cscan_running\x18\x01 \x01(\x08\x12\x13\n\x0bqueue_depth\x18\x02 \x01(\x05\x12\x15\n\rdrift_seconds\x18\x03 \x01(\x01\x12\x13\n\x0btick_number\x18\x04 \x01(\x03\x32\xa7\x03\n\x10StationSimulator\x12L\n\tStartScan\x12\x1e.simulator.v1.StartScanRequest\x1a\x1f.simulator.v1.StartScanResponse\x12I\n\x08StopScan\x12\x1d.simulator.v1.StopScanRequest\x1a\x1e.simulator.v1.StopScanResponse\x12^\n\x0fPushDelayUpdate\x12$.simulator.v1.PushDelayUpdateRequest\x1a%.simulator.v1.PushDelayUpdateResponse\x12I\n\tGetStatus\x12\x1e.simulator.v1.GetStatusRequest\x1a\x1c.simulator.v1.StatusResponse\x12O\n\x0bWatchStatus\x12 .simulator.v1.WatchStatusRequest\x1a\x1c.simulator.v1.StatusResponse0\x01\x42JZHgithub.com/sanderploegsma/ska-low-station-beam-simulator/api/simulatorpbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -39,23 +39,23 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_NOISECONFIG']._serialized_start=254
   _globals['_NOISECONFIG']._serialized_end=294
   _globals['_STARTSCANREQUEST']._serialized_start=297
-  _globals['_STARTSCANREQUEST']._serialized_end=562
-  _globals['_STARTSCANRESPONSE']._serialized_start=564
-  _globals['_STARTSCANRESPONSE']._serialized_end=612
-  _globals['_STOPSCANREQUEST']._serialized_start=614
-  _globals['_STOPSCANREQUEST']._serialized_end=631
-  _globals['_STOPSCANRESPONSE']._serialized_start=633
-  _globals['_STOPSCANRESPONSE']._serialized_end=663
-  _globals['_PUSHDELAYUPDATEREQUEST']._serialized_start=665
-  _globals['_PUSHDELAYUPDATEREQUEST']._serialized_end=759
-  _globals['_PUSHDELAYUPDATERESPONSE']._serialized_start=761
-  _globals['_PUSHDELAYUPDATERESPONSE']._serialized_end=798
-  _globals['_GETSTATUSREQUEST']._serialized_start=800
-  _globals['_GETSTATUSREQUEST']._serialized_end=818
-  _globals['_WATCHSTATUSREQUEST']._serialized_start=820
-  _globals['_WATCHSTATUSREQUEST']._serialized_end=867
-  _globals['_STATUSRESPONSE']._serialized_start=869
-  _globals['_STATUSRESPONSE']._serialized_end=972
-  _globals['_STATIONSIMULATOR']._serialized_start=975
-  _globals['_STATIONSIMULATOR']._serialized_end=1398
+  _globals['_STARTSCANREQUEST']._serialized_end=584
+  _globals['_STARTSCANRESPONSE']._serialized_start=586
+  _globals['_STARTSCANRESPONSE']._serialized_end=634
+  _globals['_STOPSCANREQUEST']._serialized_start=636
+  _globals['_STOPSCANREQUEST']._serialized_end=653
+  _globals['_STOPSCANRESPONSE']._serialized_start=655
+  _globals['_STOPSCANRESPONSE']._serialized_end=685
+  _globals['_PUSHDELAYUPDATEREQUEST']._serialized_start=687
+  _globals['_PUSHDELAYUPDATEREQUEST']._serialized_end=781
+  _globals['_PUSHDELAYUPDATERESPONSE']._serialized_start=783
+  _globals['_PUSHDELAYUPDATERESPONSE']._serialized_end=820
+  _globals['_GETSTATUSREQUEST']._serialized_start=822
+  _globals['_GETSTATUSREQUEST']._serialized_end=840
+  _globals['_WATCHSTATUSREQUEST']._serialized_start=842
+  _globals['_WATCHSTATUSREQUEST']._serialized_end=889
+  _globals['_STATUSRESPONSE']._serialized_start=891
+  _globals['_STATUSRESPONSE']._serialized_end=994
+  _globals['_STATIONSIMULATOR']._serialized_start=997
+  _globals['_STATIONSIMULATOR']._serialized_end=1420
 # @@protoc_insertion_point(module_scope)

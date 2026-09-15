@@ -200,6 +200,7 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 		Noise:        noiseCfg,
 		NumChannels:  int(req.NumChannels),
 		StartChannel: int(req.StartChannel),
+		NegateDelay:  req.NegateDelay,
 	})
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -214,7 +215,7 @@ func (s *Server) StartScan(ctx context.Context, req *pb.StartScanRequest) (*pb.S
 		s.senderPool.SetQuantizeScale(streamer.QuantizeScale())
 	}
 
-	log.Printf("starting scan %d with %d tone sources and %d channels starting at channel %d (subarray=%d beam=%d)", req.ScanId, len(req.ToneSources), streamer.NumChannels(), streamer.StartChannel(), req.SubarrayId, req.BeamId)
+	log.Printf("starting scan %d with %d tone sources and %d channels starting at channel %d (subarray=%d beam=%d negate_delay=%v)", req.ScanId, len(req.ToneSources), streamer.NumChannels(), streamer.StartChannel(), req.SubarrayId, req.BeamId, req.NegateDelay)
 	s.delayFeeds = delayFeeds
 	s.scanRunner = common.NewScanRunner(streamer, s.sendQueue, req.ObsTimeEpochS, req.ScanDurationS)
 	s.scanRunner.Start()

@@ -320,7 +320,8 @@ class StationBeamSimulator(stb.BaseInterface):
         doc_in=(
             "JSON object: {obs_time_epoch_s, scan_duration_s, scan_id, "
             "subarray_id, beam_id, source_cfgs, start_channel, "
-            "num_channels}. source_cfgs is a JSON list -- EVERY entry "
+            "num_channels, noise_std, negate_delay}. source_cfgs is a "
+            "JSON list -- EVERY entry "
             "MUST include 'delay_attr_uri' naming a Tango attribute on "
             "CBF's delay-poly emulator to subscribe for that source's own "
             "delay polynomial (there is no default delay -- see module "
@@ -333,7 +334,12 @@ class StationBeamSimulator(stb.BaseInterface):
             "num_channels defaults to 384 (the full band). Combined, "
             "they select a sub-band: e.g. start_channel=64, "
             "num_channels=384 covers the full band (channels 64-447 "
-            "inclusive); start_channel+num_channels must not exceed 448."
+            "inclusive); start_channel+num_channels must not exceed 448. "
+            "noise_std defaults to 0.05. negate_delay defaults to false "
+            "and negates every tone source's delay polynomial "
+            "coefficients before evaluating delay, mirroring CBF's own "
+            "ska-low-cbf-proc Processor device STN_DELAY_SIGN setting -- "
+            "set true to match a SUT deployed with STN_DELAY_SIGN=neg."
         ),
     )
     def StartScan(self, args_json):
@@ -358,6 +364,12 @@ class StationBeamSimulator(stb.BaseInterface):
             tone_sources.append(request)
 
         noise_std = float(args.get("noise_std", 0.05))
+        # negate_delay: mirrors CBF's own ska-low-cbf-proc Processor
+        # device STN_DELAY_SIGN setting ("pos"/"neg", default "pos") --
+        # set true to match a SUT deployed with STN_DELAY_SIGN=neg
+        # without touching CBF's own config (see
+        # synth.StreamerConfig.NegateDelay's doc comment on the Go side).
+        negate_delay = bool(args.get("negate_delay", False))
         scan_request = simulator_pb2.StartScanRequest(
             obs_time_epoch_s=args["obs_time_epoch_s"],
             scan_duration_s=args["scan_duration_s"],
@@ -368,10 +380,12 @@ class StationBeamSimulator(stb.BaseInterface):
             start_channel=int(args["start_channel"]),
             tone_sources=tone_sources,
             noise=simulator_pb2.NoiseConfig(std=noise_std, seed=self.station_id),
+            negate_delay=negate_delay,
         )
         self.logger.info(
             "Starting scan %s with %d channels starting at channel %d, "
-            "%d tone sources, obs_time=%s, duration=%s, noise_std=%s",
+            "%d tone sources, obs_time=%s, duration=%s, noise_std=%s, "
+            "negate_delay=%s",
             scan_request.scan_id,
             scan_request.num_channels,
             scan_request.start_channel,
@@ -379,6 +393,7 @@ class StationBeamSimulator(stb.BaseInterface):
             scan_request.obs_time_epoch_s,
             scan_request.scan_duration_s,
             noise_std,
+            negate_delay,
         )
         try:
             response = self._stub.StartScan(scan_request)

@@ -62,6 +62,22 @@ type StreamerConfig struct {
 	// respects a Kubernetes pod's CPU request/limit, unlike a hardcoded
 	// constant would.
 	NumWorkers int
+
+	// NegateDelay flips the sign of every tone source's delay
+	// polynomial coefficients before evaluating delay (NOT
+	// ypol_offset_ns) -- mirrors CBF's own ska-low-cbf-proc Processor
+	// device STN_DELAY_SIGN setting ("pos"/"neg", default "pos"), which
+	// negates a station's delay-poly coefficients the same way before
+	// programming FPGA delay-tracking hardware. Exists because the
+	// delay-poly producer (CBF's delaypoly emulator) and consumer (this
+	// simulator, for a tone source's OWN geometric delay) must agree on
+	// which physical direction a positive coefficient shifts the
+	// signal, and that convention isn't guaranteed to match across
+	// independently-built systems -- false (the default) matches CBF's
+	// own "pos" default, coefficients used as received. Set true to
+	// match a SUT deployed with STN_DELAY_SIGN=neg without touching
+	// CBF's own config.
+	NegateDelay bool
 }
 
 // DirectSynthesisStreamer is the numeric core: direct, per-channel
@@ -75,6 +91,7 @@ type DirectSynthesisStreamer struct {
 	channelWidthHz    float64
 	channelOutputRate float64
 	obsTimeRef        float64
+	negateDelay       bool
 
 	toneCfgs []ToneSourceConfig
 
@@ -190,6 +207,7 @@ func NewDirectSynthesisStreamer(cfg StreamerConfig) (*DirectSynthesisStreamer, e
 		channelWidthHz:            channelWidthHz,
 		channelOutputRate:         channelOutputRate,
 		obsTimeRef:                cfg.ObsTimeRef,
+		negateDelay:               cfg.NegateDelay,
 		toneCfgs:                  cfg.ToneSources,
 		noiseCfg:                  cfg.Noise,
 		banks:                     make(map[string][]complex64),
@@ -424,6 +442,7 @@ func (s *DirectSynthesisStreamer) GenerateNextTick(t float64, nSamples int, dst 
 				poly.XYPolCoeffsNs,
 				polyTRelStart,
 				poly.YPolOffsetNs,
+				s.negateDelay,
 				p.isHPol,
 				tLocalRelStart,
 				s.channelOutputRate,

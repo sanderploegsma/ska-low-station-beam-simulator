@@ -21,7 +21,7 @@ func TestSynthToneChannel_LandsInCorrectChannel(t *testing.T) {
 	gotIdx, samples := synthToneChannel(
 		freqHz, 1.0, baseFreqHz, channelWidthHz,
 		[]float64{0.0}, // zero delay
-		0.0, 0.0, false,
+		0.0, 0.0, false, false,
 		0.0, 925_925.925925926, 2048,
 	)
 
@@ -50,11 +50,11 @@ func TestSynthToneChannel_DelayMatchesAnalyticPhaseShift(t *testing.T) {
 
 	_, zeroDelay := synthToneChannel(
 		freqHz, 1.0, baseFreqHz, channelWidthHz,
-		[]float64{0.0}, 0.0, 0.0, false, 0.0, 925_925.925925926, 8,
+		[]float64{0.0}, 0.0, 0.0, false, false, 0.0, 925_925.925925926, 8,
 	)
 	_, withDelay := synthToneChannel(
 		freqHz, 1.0, baseFreqHz, channelWidthHz,
-		[]float64{tauNs}, 0.0, 0.0, false, 0.0, 925_925.925925926, 8,
+		[]float64{tauNs}, 0.0, 0.0, false, false, 0.0, 925_925.925925926, 8,
 	)
 
 	expectedShift := -2.0 * math.Pi * freqHz * (tauNs * 1e-9)
@@ -76,9 +76,9 @@ func TestSynthToneChannel_HPolOffsetAppliesOnlyToHPol(t *testing.T) {
 	const channelWidthHz = 781_250.0
 	freqHz := baseFreqHz + 3*channelWidthHz
 
-	_, vSamples := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 50.0, false, 0.0, 925_925.925925926, 4)
-	_, hSamplesNoOffset := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 0.0, true, 0.0, 925_925.925925926, 4)
-	_, hSamplesWithOffset := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 50.0, true, 0.0, 925_925.925925926, 4)
+	_, vSamples := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 50.0, false, false, 0.0, 925_925.925925926, 4)
+	_, hSamplesNoOffset := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 0.0, false, true, 0.0, 925_925.925925926, 4)
+	_, hSamplesWithOffset := synthToneChannel(freqHz, 1.0, baseFreqHz, channelWidthHz, []float64{0.0}, 0.0, 50.0, false, true, 0.0, 925_925.925925926, 4)
 
 	for i := range vSamples {
 		if cmplx.Abs(complex128(vSamples[i]-hSamplesNoOffset[i])) > 1e-12 {
@@ -86,6 +86,47 @@ func TestSynthToneChannel_HPolOffsetAppliesOnlyToHPol(t *testing.T) {
 		}
 		if cmplx.Abs(complex128(hSamplesWithOffset[i]-hSamplesNoOffset[i])) < 1e-9 {
 			t.Fatalf("sample %d: H-pol with a nonzero ypol_offset_ns should differ from zero-offset H-pol, got equal values %v", i, hSamplesWithOffset[i])
+		}
+	}
+}
+
+// TestSynthToneChannel_NegateDelay verifies negateDelay=true with
+// coefficients C produces the exact same samples as negateDelay=false
+// with coefficients -C, and that it does NOT affect ypolOffsetNs --
+// mirroring CBF's own ska-low-cbf-proc STN_DELAY_SIGN negation, which
+// likewise negates only xypol_coeffs_ns, never ypol_offset_ns (see
+// cor_state_machine.py).
+func TestSynthToneChannel_NegateDelay(t *testing.T) {
+	const baseFreqHz = 50.0e6
+	const channelWidthHz = 781_250.0
+	freqHz := baseFreqHz + 5*channelWidthHz + 12345.0
+	tauNs := 137.5
+
+	_, negated := synthToneChannel(
+		freqHz, 1.0, baseFreqHz, channelWidthHz,
+		[]float64{tauNs}, 0.0, 0.0, true, false, 0.0, 925_925.925925926, 8,
+	)
+	_, withMinusTau := synthToneChannel(
+		freqHz, 1.0, baseFreqHz, channelWidthHz,
+		[]float64{-tauNs}, 0.0, 0.0, false, false, 0.0, 925_925.925925926, 8,
+	)
+	for i := range negated {
+		if diff := cmplx.Abs(complex128(negated[i] - withMinusTau[i])); diff > 1e-9 {
+			t.Fatalf("sample %d: negateDelay=true with coeff=%v should equal negateDelay=false with coeff=%v, got %v vs %v (diff %v)", i, tauNs, -tauNs, negated[i], withMinusTau[i], diff)
+		}
+	}
+
+	_, hWithOffset := synthToneChannel(
+		freqHz, 1.0, baseFreqHz, channelWidthHz,
+		[]float64{0.0}, 0.0, 50.0, false, true, 0.0, 925_925.925925926, 4,
+	)
+	_, hWithOffsetNegated := synthToneChannel(
+		freqHz, 1.0, baseFreqHz, channelWidthHz,
+		[]float64{0.0}, 0.0, 50.0, true, true, 0.0, 925_925.925925926, 4,
+	)
+	for i := range hWithOffset {
+		if diff := cmplx.Abs(complex128(hWithOffset[i] - hWithOffsetNegated[i])); diff > 1e-9 {
+			t.Fatalf("sample %d: ypolOffsetNs should be unaffected by negateDelay (zero delay coeffs), got %v vs %v (diff %v)", i, hWithOffset[i], hWithOffsetNegated[i], diff)
 		}
 	}
 }

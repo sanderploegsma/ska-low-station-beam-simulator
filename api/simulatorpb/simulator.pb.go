@@ -235,14 +235,30 @@ type StartScanRequest struct {
 	NumChannels   int32                  `protobuf:"varint,6,opt,name=num_channels,json=numChannels,proto3" json:"num_channels,omitempty"` // 0 means "use MaxNumChannels (384)"
 	ToneSources   []*ToneSourceConfig    `protobuf:"bytes,7,rep,name=tone_sources,json=toneSources,proto3" json:"tone_sources,omitempty"`
 	Noise         *NoiseConfig           `protobuf:"bytes,8,opt,name=noise,proto3" json:"noise,omitempty"` // omit entirely for no noise
-	// 0-based offset, in coarse channels, from the band's first channel
-	// (global channel 64 / 50MHz). Combined with num_channels, selects
-	// which sub-band of the 384-channel band this scan generates: channel
-	// 0 of this scan is global channel 64+start_channel. Must be >= 0, and
-	// start_channel+num_channels must be <= 384 (MaxNumChannels) -- there
-	// is no wraparound. 0 (the default) starts at the band's first
-	// channel, matching this field's pre-existing absence.
-	StartChannel  int32 `protobuf:"varint,9,opt,name=start_channel,json=startChannel,proto3" json:"start_channel,omitempty"`
+	// Global coarse channel ID of the first channel this scan generates --
+	// the SAME channel numbering CBF/SPS use, where the lowest channel in
+	// the band is channel 64 (50MHz centre frequency), not a 0-based
+	// offset. Combined with num_channels, selects which sub-band of the
+	// full band this scan generates: e.g. start_channel=64,
+	// num_channels=384 covers the full band, channels 64-447 inclusive.
+	// Required -- there is no default, and 0 is not a valid channel, so
+	// an unset/zero value fails validation. Must be >= 64, and
+	// start_channel+num_channels must be <= 448 (64+MaxNumChannels) --
+	// there is no wraparound.
+	StartChannel int32 `protobuf:"varint,9,opt,name=start_channel,json=startChannel,proto3" json:"start_channel,omitempty"`
+	// Negates every tone source's delay polynomial coefficients (NOT
+	// ypol_offset_ns) before evaluating delay -- mirrors CBF's own
+	// ska-low-cbf-proc Processor device STN_DELAY_SIGN setting
+	// ("pos"/"neg", default "pos"), which negates a station's delay-poly
+	// coefficients the same way before programming FPGA delay-tracking
+	// hardware, for exactly the same reason: the delay-poly producer and
+	// consumer must agree on which physical direction a positive
+	// coefficient shifts the signal, and that convention is not
+	// guaranteed to match across independently-built systems. false (the
+	// default) matches CBF's own "pos" default -- coefficients are used
+	// as received, unmodified. Set true to match a SUT deployed with
+	// STN_DELAY_SIGN=neg, without needing to touch CBF's own config.
+	NegateDelay   bool `protobuf:"varint,10,opt,name=negate_delay,json=negateDelay,proto3" json:"negate_delay,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -338,6 +354,13 @@ func (x *StartScanRequest) GetStartChannel() int32 {
 		return x.StartChannel
 	}
 	return 0
+}
+
+func (x *StartScanRequest) GetNegateDelay() bool {
+	if x != nil {
+		return x.NegateDelay
+	}
+	return false
 }
 
 type StartScanResponse struct {
@@ -745,7 +768,7 @@ const file_simulator_proto_rawDesc = "" +
 	"\tamplitude\x18\x03 \x01(\x01R\tamplitude\"3\n" +
 	"\vNoiseConfig\x12\x10\n" +
 	"\x03std\x18\x01 \x01(\x01R\x03std\x12\x12\n" +
-	"\x04seed\x18\x02 \x01(\x03R\x04seed\"\xf2\x02\n" +
+	"\x04seed\x18\x02 \x01(\x03R\x04seed\"\x95\x03\n" +
 	"\x10StartScanRequest\x12'\n" +
 	"\x10obs_time_epoch_s\x18\x01 \x01(\x01R\robsTimeEpochS\x12&\n" +
 	"\x0fscan_duration_s\x18\x02 \x01(\x01R\rscanDurationS\x12\x17\n" +
@@ -756,7 +779,9 @@ const file_simulator_proto_rawDesc = "" +
 	"\fnum_channels\x18\x06 \x01(\x05R\vnumChannels\x12A\n" +
 	"\ftone_sources\x18\a \x03(\v2\x1e.simulator.v1.ToneSourceConfigR\vtoneSources\x12/\n" +
 	"\x05noise\x18\b \x01(\v2\x19.simulator.v1.NoiseConfigR\x05noise\x12#\n" +
-	"\rstart_channel\x18\t \x01(\x05R\fstartChannel\"=\n" +
+	"\rstart_channel\x18\t \x01(\x05R\fstartChannel\x12!\n" +
+	"\fnegate_delay\x18\n" +
+	" \x01(\bR\vnegateDelay\"=\n" +
 	"\x11StartScanResponse\x12\x0e\n" +
 	"\x02ok\x18\x01 \x01(\bR\x02ok\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\"\x11\n" +

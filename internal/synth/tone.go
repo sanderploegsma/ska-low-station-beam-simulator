@@ -47,6 +47,7 @@ func synthToneChannel(
 	freqHz, amplitude, baseFreqHz, channelWidthHz float64,
 	delayCoeffs []float64,
 	polyTRelStart, ypolOffsetNs float64,
+	negateDelay bool,
 	isHPol bool,
 	tLocalRelStart, sampleRatePerChannel float64,
 	nSamples int,
@@ -60,6 +61,14 @@ func synthToneChannel(
 		tLocal := tLocalRelStart + float64(i)/sampleRatePerChannel
 		tPoly := polyTRelStart + float64(i)/sampleRatePerChannel
 		tauNs := evalDelayPolyNs(delayCoeffs, tPoly)
+		// Mirrors CBF's own ska-low-cbf-proc Processor device
+		// STN_DELAY_SIGN setting -- negates only the polynomial-derived
+		// delay, NOT ypolOffsetNs, matching cor_state_machine.py's own
+		// negation, which likewise leaves ypol_offset_ns untouched (see
+		// StreamerConfig.NegateDelay's doc comment for why this exists).
+		if negateDelay {
+			tauNs = -tauNs
+		}
 		if isHPol {
 			tauNs += ypolOffsetNs
 		}

@@ -39,7 +39,7 @@ class NoiseConfig(_message.Message):
     def __init__(self, std: _Optional[float] = ..., seed: _Optional[int] = ...) -> None: ...
 
 class StartScanRequest(_message.Message):
-    __slots__ = ("obs_time_epoch_s", "scan_duration_s", "scan_id", "subarray_id", "beam_id", "num_channels", "tone_sources", "noise", "start_channel")
+    __slots__ = ("obs_time_epoch_s", "scan_duration_s", "scan_id", "subarray_id", "beam_id", "num_channels", "tone_sources", "noise", "start_channel", "negate_delay")
     OBS_TIME_EPOCH_S_FIELD_NUMBER: _ClassVar[int]
     SCAN_DURATION_S_FIELD_NUMBER: _ClassVar[int]
     SCAN_ID_FIELD_NUMBER: _ClassVar[int]
@@ -49,6 +49,7 @@ class StartScanRequest(_message.Message):
     TONE_SOURCES_FIELD_NUMBER: _ClassVar[int]
     NOISE_FIELD_NUMBER: _ClassVar[int]
     START_CHANNEL_FIELD_NUMBER: _ClassVar[int]
+    NEGATE_DELAY_FIELD_NUMBER: _ClassVar[int]
     obs_time_epoch_s: float
     scan_duration_s: float
     scan_id: int
@@ -58,7 +59,8 @@ class StartScanRequest(_message.Message):
     tone_sources: _containers.RepeatedCompositeFieldContainer[ToneSourceConfig]
     noise: NoiseConfig
     start_channel: int
-    def __init__(self, obs_time_epoch_s: _Optional[float] = ..., scan_duration_s: _Optional[float] = ..., scan_id: _Optional[int] = ..., subarray_id: _Optional[int] = ..., beam_id: _Optional[int] = ..., num_channels: _Optional[int] = ..., tone_sources: _Optional[_Iterable[_Union[ToneSourceConfig, _Mapping]]] = ..., noise: _Optional[_Union[NoiseConfig, _Mapping]] = ..., start_channel: _Optional[int] = ...) -> None: ...
+    negate_delay: bool
+    def __init__(self, obs_time_epoch_s: _Optional[float] = ..., scan_duration_s: _Optional[float] = ..., scan_id: _Optional[int] = ..., subarray_id: _Optional[int] = ..., beam_id: _Optional[int] = ..., num_channels: _Optional[int] = ..., tone_sources: _Optional[_Iterable[_Union[ToneSourceConfig, _Mapping]]] = ..., noise: _Optional[_Union[NoiseConfig, _Mapping]] = ..., start_channel: _Optional[int] = ..., negate_delay: _Optional[bool] = ...) -> None: ...
 
 class StartScanResponse(_message.Message):
     __slots__ = ("ok", "message")
